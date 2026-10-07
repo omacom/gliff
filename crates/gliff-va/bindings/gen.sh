@@ -18,12 +18,15 @@ TYPES="$TYPES|VAEncSequenceParameterBufferH264|VAEncPictureParameterBufferH264|V
 TYPES="$TYPES|VAEncMiscParameterBuffer|VAEncMiscParameterRateControl|VAEncMiscParameterFrameRate|VAEncMiscParameterHRD"
 TYPES="$TYPES|VAEncPackedHeaderParameterBuffer|VACodedBufferSegment"
 TYPES="$TYPES|VAPictureParameterBufferH264|VAIQMatrixBufferH264|VASliceParameterBufferH264|VAPictureH264"
+TYPES="$TYPES|VAEncSequenceParameterBufferHEVC|VAEncPictureParameterBufferHEVC|VAEncSliceParameterBufferHEVC"
+TYPES="$TYPES|VAPictureParameterBufferHEVC|VASliceParameterBufferHEVC|VAIQMatrixBufferHEVC|VAPictureHEVC"
+TYPES="$TYPES|VAConfigAttribValEncHEVCFeatures|VAConfigAttribValEncHEVCBlockSizes"
 TYPES="$TYPES|VAImage|VAImageFormat|VAConfigAttrib|VAProfile|VAEntrypoint|VABufferType|VAStatus|VADisplay"
 TYPES="$TYPES|VAEncPackedHeaderType|VASurfaceStatus|VAGenericValue|VAGenericValueType|VASurfaceAttribType"
 bindgen wrapper.h \
     --allowlist-function "($FUNCS)" \
     --allowlist-type "_?($TYPES)" \
-    --allowlist-var 'VA_(PROGRESSIVE|TIMEOUT_INFINITE|STATUS|RT_FORMAT|FOURCC|SURFACE_ATTRIB|EXPORT_SURFACE|RC|ENC_PACKED_HEADER|PICTURE_H264|INVALID|ATTRIB|PADDING|SLICE_TYPE|CODED_BUF|ENC_SLICE_TYPE|FRAME_PICTURE|TOP_FIELD|BOTTOM_FIELD)_?.*' \
+    --allowlist-var 'VA_(PROGRESSIVE|TIMEOUT_INFINITE|STATUS|RT_FORMAT|FOURCC|SURFACE_ATTRIB|EXPORT_SURFACE|RC|ENC_PACKED_HEADER|PICTURE_H264|PICTURE_HEVC|INVALID|ATTRIB|PADDING|SLICE_TYPE|CODED_BUF|ENC_SLICE_TYPE|FRAME_PICTURE|TOP_FIELD|BOTTOM_FIELD)_?.*' \
     --no-layout-tests \
     --no-doc-comments \
     --no-prepend-enum-name \
