@@ -80,7 +80,8 @@ button: a stop square disconnects a running machine, and an X forgets one
 that is not running. Drag the tabs to reorder them. The + after the tabs
 opens the address bar; type `user@host` and press Enter to add a machine.
 A bare `gliff` opens the window with a tab for each machine you have used,
-or with the address bar ready when there are none.
+and connects again to the ones that were connected when you closed it; with
+no machines yet, it opens with the address bar ready.
 
 **Keyboard.** Click the picture to send everything to the remote machine,
 window-manager shortcuts included. Press `Shift+Esc` to get your own

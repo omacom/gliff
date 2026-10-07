@@ -429,10 +429,24 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
     }
 
     window.present();
-    for endpoint in endpoints_from_cli(cli) {
-        open_session(&ui, endpoint);
+    // Reconnect the machines that were connected when the window last
+    // closed, then any named on the command line, which is shown first.
+    let config = Config::load(&ui.config_path);
+    let from_cli = endpoints_from_cli(cli);
+    for machine in &config.open {
+        open_session(&ui, ssh_endpoint(cli, machine));
     }
-    let first = ui.sessions.borrow().first().cloned();
+    for endpoint in from_cli.iter().cloned() {
+        if find_session(&ui, machine_name(&endpoint)).is_none() {
+            open_session(&ui, endpoint);
+        }
+    }
+    let first = from_cli
+        .first()
+        .map(|e| machine_name(e).to_string())
+        .or(config.shown)
+        .and_then(|name| find_session(&ui, &name))
+        .or_else(|| ui.sessions.borrow().first().cloned());
     match first {
         Some(first) => show_session(&ui, &first),
         None if ui.tabs.first_child().is_none() => {
@@ -759,6 +773,11 @@ fn show_session(ui: &Rc<App>, s: &Rc<Session>) {
     if !is_active(ui, s) {
         release_pressed_keys(ui);
         *ui.active.borrow_mut() = Some(s.clone());
+        if matches!(s.endpoint, Endpoint::Ssh(_)) {
+            let mut config = Config::load(&ui.config_path);
+            config.shown = Some(s.name.clone());
+            save_config(ui, &config);
+        }
     }
     ui.window.set_title(Some(&window_title(&s.endpoint)));
     ui.status.set_text(&s.status.borrow());
@@ -805,6 +824,12 @@ fn stop_session(ui: &Rc<App>, name: &str) {
     s.generation.set(s.generation.get() + 1);
     s.input_tx.borrow_mut().take();
     s.last_frame.borrow_mut().take();
+    // A machine stopped by hand stays stopped when the window reopens.
+    if matches!(s.endpoint, Endpoint::Ssh(_)) {
+        let mut config = Config::load(&ui.config_path);
+        config.set_open(&s.name, false);
+        save_config(ui, &config);
+    }
     let names = tab_names(ui);
     ui.sessions.borrow_mut().retain(|o| !Rc::ptr_eq(o, &s));
     if !was_active {
@@ -916,14 +941,16 @@ fn start_session(ui: Rc<App>, s: Rc<Session>) {
 
 const MAX_RETRIES: u32 = 5;
 
-/// Add the session's machine to the remembered list, once per session. The
-/// connected status repeats on every stream reconfigure, such as a resize.
+/// Add the session's machine to the remembered list, and to the ones to
+/// reconnect when the window opens again, once per session. The connected
+/// status repeats on every stream reconfigure, such as a resize.
 fn remember_machine(ui: &Rc<App>, s: &Session) {
     if !matches!(s.endpoint, Endpoint::Ssh(_)) || s.remembered.replace(true) {
         return;
     }
     let mut config = Config::load(&ui.config_path);
     config.remember(&s.name);
+    config.set_open(&s.name, true);
     save_config(ui, &config);
     refresh_tabs(ui);
 }
