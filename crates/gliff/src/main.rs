@@ -608,6 +608,12 @@ fn machine_tab(ui: &Rc<App>, name: &str) -> gtk::Box {
     // The slot on the right shows whether the machine is connected, and
     // turns into its button while the pointer is on the tab.
     let connected = session.as_ref().is_some_and(|s| s.connected.get());
+    let status_tip = if connected {
+        "Connected"
+    } else {
+        "Not connected"
+    };
+    let action_tip = if running { "Disconnect" } else { "Forget" };
     let dot = gtk::Box::builder()
         .css_classes(["status-dot"])
         .halign(gtk::Align::Center)
@@ -624,7 +630,7 @@ fn machine_tab(ui: &Rc<App>, name: &str) -> gtk::Box {
     );
     let action = gtk::Button::builder()
         .child(&slot)
-        .tooltip_text(if connected { "Connected" } else { "Not connected" })
+        .tooltip_text(status_tip)
         .css_classes(["tab-action"])
         .valign(gtk::Align::Center)
         .focusable(false)
@@ -643,7 +649,7 @@ fn machine_tab(ui: &Rc<App>, name: &str) -> gtk::Box {
         let (action, slot) = (action.clone(), slot.clone());
         hover.connect_enter(move |_, _, _| {
             slot.set_visible_child_name("action");
-            action.set_tooltip_text(Some(if running { "Disconnect" } else { "Forget" }));
+            action.set_tooltip_text(Some(action_tip));
             action.set_can_target(true);
         });
     }
@@ -651,7 +657,7 @@ fn machine_tab(ui: &Rc<App>, name: &str) -> gtk::Box {
         let (action, slot) = (action.clone(), slot.clone());
         hover.connect_leave(move |_| {
             slot.set_visible_child_name("status");
-            action.set_tooltip_text(Some(if connected { "Connected" } else { "Not connected" }));
+            action.set_tooltip_text(Some(status_tip));
             action.set_can_target(false);
         });
     }
