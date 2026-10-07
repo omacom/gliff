@@ -1,0 +1,50 @@
+#!/usr/bin/env python3
+"""Register this checkout in the current user's application launcher."""
+import hashlib
+import os
+from pathlib import Path
+import shutil
+import subprocess
+
+
+def desktop_string(value):
+    return str(value).replace("\\", "\\\\").replace("\n", "\\n").replace("\r", "\\r")
+
+
+def exec_argument(value):
+    # Desktop entries unescape values before parsing quoted Exec arguments.
+    value = str(value).replace("%", "%%")
+    for character in ("\\", '"', "`", "$"):
+        value = value.replace(character, "\\" + character)
+    return '"' + desktop_string(value) + '"'
+
+
+root = Path(__file__).resolve().parent.parent
+data_home = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share")
+applications = data_home / "applications"
+applications.mkdir(parents=True, exist_ok=True)
+# Launchers cache icons by path, so a changed icon at the same path keeps showing the old
+# one. Install a copy named after its contents and point the entry at that.
+source_icon = root / "pkgbuild/gliff.svg"
+icons = data_home / "icons"
+icons.mkdir(parents=True, exist_ok=True)
+icon = icons / f"gliff-dev-{hashlib.sha1(source_icon.read_bytes()).hexdigest()[:8]}.svg"
+for stale in icons.glob("gliff-dev-*.svg"):
+    if stale != icon:
+        stale.unlink()
+shutil.copyfile(source_icon, icon)
+entry = applications / "gliff-dev.desktop"
+entry.write_text(
+    "[Desktop Entry]\n"
+    "Type=Application\n"
+    "Name=Gliff (Development)\n"
+    "Comment=Build and launch Gliff from the development checkout\n"
+    f"Exec={exec_argument(root / 'bin/dev')}\n"
+    f"Icon={desktop_string(icon)}\n"
+    "Terminal=false\n"
+    "Categories=Network;RemoteAccess;\n"
+    "StartupNotify=true\n"
+)
+if shutil.which("update-desktop-database"):
+    subprocess.run(["update-desktop-database", str(applications)], check=True)
+print(f"Installed {entry}")
