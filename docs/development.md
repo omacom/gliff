@@ -7,8 +7,14 @@ design is in `docs/architecture.md`; driver-specific behaviour is in
 ## Build
 
 ```
-cargo build --release
+bin/build
 ```
+
+`bin/build` runs `cargo build --release --locked`, and the binaries land in
+`target/release/`. For a launcher entry that rebuilds this checkout when
+opened, run `bin/install-dev` and choose **Gliff (Development)**; build
+failures raise a notification and are logged to `target/dev-build.log`. The
+remote end of an SSH session still runs the `gliff-server` installed there.
 
 Needs Rust, a C++ toolchain (the vendored OpenH264 build; nasm speeds it up),
 and the runtime libraries in the `pkgbuild/PKGBUILD` `depends`. The GPU tier
@@ -92,10 +98,11 @@ tiers independently, so every pairing can be tested on one machine.
 ## Packaging
 
 `pkgbuild/` holds the launcher entry, the icon, and a `PKGBUILD` that builds
-the checkout; `bin/install` builds and installs that package. The package in
-the [Omarchy Package Repository](https://github.com/omacom/omarchy-pkgs) has
-its own recipe, `pkgbuilds/gliff`, which builds a release tag and installs
-the launcher entry and the icon from `pkgbuild/`.
+the checkout with `bin/build`; `bin/install` builds and installs that
+package. The package in the [Omarchy Package
+Repository](https://github.com/omacom/omarchy-pkgs) has its own recipe,
+`pkgbuilds/gliff`, which builds a release tag and installs the launcher
+entry and the icon from `pkgbuild/`.
 
 ## Release
 

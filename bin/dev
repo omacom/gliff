@@ -1,0 +1,20 @@
+#!/bin/sh
+set -eu
+
+GLIFF_ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+mkdir -p "$GLIFF_ROOT/target"
+
+# Serialize builds when the launcher is activated more than once.
+exec 9>"$GLIFF_ROOT/target/dev-build.lock"
+flock 9
+if ! "$GLIFF_ROOT/bin/build" >"$GLIFF_ROOT/target/dev-build.log" 2>&1; then
+    printf 'Gliff build failed. See %s\n' "$GLIFF_ROOT/target/dev-build.log" >&2
+    notify-send --app-name="Gliff (Development)" --icon="$GLIFF_ROOT/pkgbuild/gliff.svg" \
+        --urgency=critical "Gliff build failed" \
+        "See $GLIFF_ROOT/target/dev-build.log" || true
+    exit 1
+fi
+exec 9>&-
+
+cd "$GLIFF_ROOT"
+exec "$GLIFF_ROOT/target/release/gliff" "$@" >>"$GLIFF_ROOT/target/dev-run.log" 2>&1
