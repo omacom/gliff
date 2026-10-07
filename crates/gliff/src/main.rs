@@ -283,7 +283,7 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         .icon_name("utilities-system-monitor-symbolic")
         .tooltip_text("Show stats")
         .build();
-    let tabs = gtk::Box::builder().spacing(4).build();
+    let tabs = gtk::Box::builder().spacing(6).build();
     let tabs_scroller = gtk::ScrolledWindow::builder()
         .child(&tabs)
         .hscrollbar_policy(gtk::PolicyType::Automatic)
@@ -391,9 +391,15 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         ".stats { background: rgba(0,0,0,0.6); color: #fff; padding: 6px; margin: 6px; border-radius: 6px; font-family: monospace; }",
         ".transfers { margin: 6px; }",
         ".transfer { background: rgba(0,0,0,0.7); color: #fff; padding: 6px 8px; border-radius: 6px; }",
-        ".machine-tab { border-radius: 6px; }",
-        ".machine-tab.active { background: alpha(currentColor, 0.12); }",
-        ".machine-tab .tab-action { min-width: 24px; min-height: 24px; padding: 0; margin-right: 4px; }",
+        // A tab is one pill: the name and its stop/forget icon carry no
+        // backgrounds of their own, only the icon brightens under the pointer.
+        ".machine-tab { border-radius: 8px; }",
+        ".machine-tab:hover { background: alpha(currentColor, 0.07); }",
+        ".machine-tab.active { background: alpha(currentColor, 0.14); }",
+        ".machine-tab > button { background: none; box-shadow: none; min-height: 0; }",
+        ".machine-tab > button.tab-label { padding: 5px 2px 5px 12px; }",
+        ".machine-tab > button.tab-action { padding: 0; min-width: 22px; min-height: 22px; margin-right: 4px; color: alpha(currentColor, 0.55); -gtk-icon-size: 12px; }",
+        ".machine-tab > button.tab-action:hover { color: currentColor; }",
     ));
     if let Some(display) = gdk::Display::default() {
         gtk::style_context_add_provider_for_display(
@@ -580,7 +586,7 @@ fn machine_tab(ui: &Rc<App>, name: &str) -> gtk::Box {
     let running = session.is_some();
     let label = gtk::Button::builder()
         .label(name)
-        .css_classes(["flat"])
+        .css_classes(["tab-label"])
         .build();
     if !running {
         label.add_css_class("dim-label");
@@ -588,7 +594,7 @@ fn machine_tab(ui: &Rc<App>, name: &str) -> gtk::Box {
     let action = gtk::Button::builder()
         .icon_name(if running { STOP_ICON } else { FORGET_ICON })
         .tooltip_text(if running { "Disconnect" } else { "Forget" })
-        .css_classes(["flat", "circular", "tab-action"])
+        .css_classes(["tab-action"])
         .valign(gtk::Align::Center)
         .focus_on_click(false)
         .opacity(0.0)
