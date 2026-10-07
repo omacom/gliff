@@ -211,8 +211,7 @@ Every crate with `unsafe` documents the safety requirements at each block.
   resolution), so the client asks the decoder for that integer zoom and the
   recombine shader, or a CPU row copy, replicates each pixel into a zoom x zoom
   block; GTK then draws the device-sized texture 1:1. In fullscreen the header
-  and status bars leave the layout and slide in over the picture at the top
-  and bottom edges.
+  leaves the layout and slides in over the picture at the top edge.
 
 - **Theme.** `theme.rs` reads Omarchy 4's `colors.toml` with the same lenient
   line parser and fallback chain as `omarchy-theme-color`, and emits a `:root`

@@ -83,9 +83,10 @@ A bare `gliff` opens the window with a tab for each machine you have used,
 and connects again to the ones that were connected when you closed it; with
 no machines yet, it opens with the address bar ready.
 
-**Keyboard.** Click the picture to send everything to the remote machine,
-window-manager shortcuts included. Press `Shift+Esc` to get your own
-shortcuts back. `--release-hotkey` changes that key (`ctrl+alt+q`,
+**Keyboard.** While the pointer is over the picture, everything you type goes
+to the remote machine, window-manager shortcuts included; move the pointer
+off it to get your own back. Press `Shift+Esc` to get your shortcuts back
+without moving the pointer. `--release-hotkey` changes that key (`ctrl+alt+q`,
 `double-escape`, or `none`).
 
 **Clipboard.** Copy on one machine and paste on the other. Nothing is sent
