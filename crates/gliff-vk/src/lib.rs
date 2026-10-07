@@ -29,6 +29,6 @@ pub mod image;
 pub mod pipeline;
 
 pub use device::Gpu;
-pub use gliff_va::EncoderSettings;
+pub use gliff_va::{EncoderSettings, VaCodec};
 pub use image::{DmabufPlane, ExportedDmabuf};
 pub use pipeline::{split_into_surface, Decoder, DisplayFrame, EncodedFrame, Encoder, SurfacePath};

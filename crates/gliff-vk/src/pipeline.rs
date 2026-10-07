@@ -1,7 +1,9 @@
 //! The two ends of the stream as one object each.
 //!
-//! Server: captured dmabuf -> (import) -> split compute -> H.264 encode x2.
-//! Client: H.264 decode x2 -> recombine compute -> BGRA dmabuf for display.
+//! Server: captured dmabuf -> (import) -> split compute -> encode x2.
+//! Client: decode x2 -> recombine compute -> BGRA dmabuf for display.
+//!
+//! The codec is H.264, or HEVC for pictures larger than H.264 allows.
 //!
 //! Both use `Dual420` (main + aux streams, full 4:4:4) or `Single420` (main
 //! only). Compute and video work are ordered on the GPU with a timeline
@@ -20,7 +22,7 @@ use crate::compute::{Recombine, Split};
 use crate::device::{Commands, Gpu, Timeline};
 use crate::image::{DmabufPlane, ExportedDmabuf, HostBuffer, Image};
 use crate::Result;
-use gliff_va::{EncoderSettings, H264Decoder, H264Encoder};
+use gliff_va::{EncoderSettings, VaCodec, VideoDecoder, VideoEncoder};
 
 pub struct EncodedFrame {
     pub main: Vec<u8>,
@@ -28,10 +30,10 @@ pub struct EncodedFrame {
     pub keyframe: bool,
 }
 
-/// One H.264 stream: the VA-API encoder and its input surface as the
+/// One video stream: the VA-API encoder and its input surface as the
 /// split shader sees it.
 struct Stream {
-    enc: H264Encoder,
+    enc: VideoEncoder,
     /// The encoder's input surface, imported into Vulkan.
     target: Image,
     /// A Vulkan-owned image the shader writes when the driver refused
@@ -40,8 +42,8 @@ struct Stream {
 }
 
 impl Stream {
-    fn new(gpu: &Arc<Gpu>, settings: &EncoderSettings) -> Result<Self> {
-        let enc = H264Encoder::new(&gpu.va, &gpu.va_caps, settings.clone())?;
+    fn new(gpu: &Arc<Gpu>, settings: &EncoderSettings, codec: VaCodec) -> Result<Self> {
+        let enc = VideoEncoder::new(&gpu.va, gpu.caps(codec), settings.clone())?;
         let desc = enc.input().export()?;
         let (target, scratch) = match Image::import_nv12(gpu, &desc, true) {
             Ok(img) => (img, None),
@@ -100,15 +102,20 @@ pub struct Encoder {
 }
 
 impl Encoder {
-    /// The largest size the device encodes, as (width, height).
-    pub fn max_size(gpu: &Gpu) -> Result<(u32, u32)> {
-        Ok(H264Encoder::max_coded_extent(&gpu.va_caps))
+    /// The largest size the device encodes with `codec`, as (width, height).
+    pub fn max_size(gpu: &Gpu, codec: VaCodec) -> Result<(u32, u32)> {
+        Ok(VideoEncoder::max_coded_extent(gpu.caps(codec)))
     }
 
-    pub fn new(gpu: &Arc<Gpu>, settings: EncoderSettings, dual: bool) -> Result<Self> {
-        let main = Stream::new(gpu, &settings)?;
+    pub fn new(
+        gpu: &Arc<Gpu>,
+        settings: EncoderSettings,
+        dual: bool,
+        codec: VaCodec,
+    ) -> Result<Self> {
+        let main = Stream::new(gpu, &settings, codec)?;
         let aux = if dual {
-            Some(Stream::new(gpu, &settings)?)
+            Some(Stream::new(gpu, &settings, codec)?)
         } else {
             None
         };
@@ -126,6 +133,10 @@ impl Encoder {
 
     pub fn settings(&self) -> &EncoderSettings {
         &self.settings
+    }
+
+    pub fn codec(&self) -> VaCodec {
+        self.main.enc.codec()
     }
 
     /// Change the target bitrate of both streams from the next frame on.
@@ -284,7 +295,13 @@ pub struct Decoder {
 }
 
 impl Decoder {
-    pub fn new(gpu: &Arc<Gpu>, dual: bool, width: u32, height: u32) -> Result<Self> {
+    pub fn new(
+        gpu: &Arc<Gpu>,
+        dual: bool,
+        width: u32,
+        height: u32,
+        codec: VaCodec,
+    ) -> Result<Self> {
         let (release_tx, release_rx) = channel();
         let outputs = Self::output_ring(gpu, width, height)?;
         Ok(Self {
@@ -292,9 +309,9 @@ impl Decoder {
             timeline: Timeline::new(gpu)?,
             compute: Commands::new(gpu, gpu.families.compute, gpu.compute_queue)?,
             recombine: Recombine::new(gpu)?,
-            main: DecodeStream::new(gpu)?,
+            main: DecodeStream::new(gpu, codec)?,
             aux: if dual {
-                Some(DecodeStream::new(gpu)?)
+                Some(DecodeStream::new(gpu, codec)?)
             } else {
                 None
             },
@@ -538,20 +555,20 @@ impl Decoder {
     }
 }
 
-/// One H.264 stream on the client: the VA-API decoder and its output
+/// One video stream on the client: the VA-API decoder and its output
 /// surfaces as the recombine shader sees them.
 struct DecodeStream {
     gpu: Arc<Gpu>,
-    dec: H264Decoder,
+    dec: VideoDecoder,
     images: Vec<Image>,
     generation: u64,
 }
 
 impl DecodeStream {
-    fn new(gpu: &Arc<Gpu>) -> Result<Self> {
+    fn new(gpu: &Arc<Gpu>, codec: VaCodec) -> Result<Self> {
         Ok(Self {
             gpu: gpu.clone(),
-            dec: H264Decoder::new(&gpu.va, &gpu.va_caps)?,
+            dec: VideoDecoder::new(&gpu.va, gpu.caps(codec))?,
             images: Vec::new(),
             generation: 0,
         })

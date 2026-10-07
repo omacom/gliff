@@ -179,6 +179,14 @@ impl VaCodec {
 
     pub fn name(self) -> &'static str {
         match self {
+            Self::H264 => "H.264",
+            Self::Hevc => "HEVC",
+        }
+    }
+
+    /// The codec and the profile gliff uses.
+    pub fn profile_name(self) -> &'static str {
+        match self {
             Self::H264 => "H.264 High",
             Self::Hevc => "HEVC Main",
         }
@@ -279,7 +287,7 @@ impl Caps {
     /// encoder writes its own headers; the HEVC one leaves them to the
     /// driver.
     pub fn can_encode(&self) -> Result<()> {
-        let name = self.codec.name();
+        let name = self.codec.profile_name();
         let Some(entrypoint) = self.encode_entrypoint else {
             return Err(Error::Unsupported(format!("no {name} encode entrypoint")));
         };
@@ -308,7 +316,7 @@ impl Caps {
         } else {
             Err(Error::Unsupported(format!(
                 "no {} decode entrypoint",
-                self.codec.name()
+                self.codec.profile_name()
             )))
         }
     }

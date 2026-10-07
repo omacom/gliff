@@ -73,17 +73,19 @@ tiers independently, so every pairing can be tested on one machine.
   `gpu` (the Vulkan device and the VA-API codec capabilities),
   `surfaces` (a VA-API surface written by the split shader and read back
   through the driver), `roundtrip` (synthetic BGRA → encode → decode → PSNR
-  against the CPU reference), `capture`, `input`, `pipeline` (a captured
+  against the CPU reference; `--hevc` for HEVC), `capture`, `input`, `pipeline` (a captured
   dmabuf through the exact server and client pipelines), `serve-test` (a
   headless protocol client), `stream-bench` (startup milestones, fps,
-  latency, interval and size statistics, `--timeline`, `--csv`), `clipboard`
+  latency, interval and size statistics, `--timeline`, `--csv`, `--hevc`
+  to offer HEVC with `--width`/`--height` beyond 4096), `clipboard`
   and `keymap` (watch what the compositor serves), `bench` (the CPU
   reference conversion), and `all` (every non-interactive check). Run it under
   `VK_LAYER_KHRONOS_validation` after touching `gliff-vk`, and with
   `RUST_LOG=libva=debug` to see the driver's own messages.
 - **`scripts/e2e.sh`** boots a nested Hyprland and asserts PASS across the probe
   checks, the capture pipeline, both Dual420 and Single420 server-plus-client
-  streams, the CPU tier matrix (cpu<->cpu and each mixed pairing), the
+  streams, the CPU tier matrix (cpu<->cpu and each mixed pairing), a 6K
+  HEVC round trip and session (when the GPU has HEVC), the
   clipboard in both directions (as text, as a 1 MiB binary item and as a
   copied directory tree), a mirrored-output resize, and a keymap sent
   mid-session. It needs a Hyprland session, so it is not a CI unit test; run

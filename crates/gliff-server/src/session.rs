@@ -21,7 +21,7 @@ use gliff_sw::VideoMode;
 use gliff_transport::clipboard::progress::Jobs;
 use gliff_transport::clipboard::{outbound_channel, Side, Transfers};
 use gliff_transport::Framed;
-use gliff_vk::{DmabufPlane, EncodedFrame, Encoder, EncoderSettings, Gpu};
+use gliff_vk::{DmabufPlane, EncodedFrame, Encoder, EncoderSettings, Gpu, VaCodec};
 
 use crate::rate::{Ladder, LinkEstimator, RateController};
 use crate::writer::Writer;
@@ -103,7 +103,8 @@ where
     tracing::info!(output = %output.name, output.width, output.height, headless = output.is_headless(), "session output ready");
 
     let video = VideoTier::open(cfg.video, &cfg.render_node);
-    let codec = Codec::H264;
+    // HEVC carries pictures larger than H.264 allows, when both ends have it.
+    let hevc = caps.codecs.contains(&Codec::H265);
     writer
         .write_msg(&ServerMsg::HelloAck {
             version: PROTOCOL_VERSION,
@@ -145,7 +146,7 @@ where
     writer.write_msg(&ServerMsg::Ping { t: now_ms() }).await?;
     writer
         .write_msg(&stream_config(
-            codec,
+            encoder.codec(),
             chroma,
             video.pipeline(),
             &output,
@@ -214,7 +215,7 @@ where
         caps,
         link: LinkEstimator::new(),
         ctl,
-        codec,
+        hevc,
         chroma,
         settings,
         encoder,
@@ -419,7 +420,8 @@ struct Session {
     client_extent: (u32, u32),
     link: LinkEstimator,
     ctl: RateController,
-    codec: Codec,
+    /// The client decodes HEVC, so streams larger than H.264 allows use it.
+    hevc: bool,
     chroma: ChromaMode,
     settings: EncoderSettings,
     encoder: VideoEncoder,
@@ -940,7 +942,7 @@ impl Session {
         self.sent_fps_cap = self.fps_cap();
         self.writer.send(
             stream_config(
-                self.codec,
+                self.encoder.codec(),
                 self.chroma,
                 self.video.pipeline(),
                 &self.output,
@@ -980,7 +982,12 @@ impl Session {
             self.fps_cmd,
             self.ctl.vbv_ms(self.fps_cmd),
         );
-        match VideoEncoder::new(&self.video, &settings, chroma == ChromaMode::Dual420) {
+        match VideoEncoder::new(
+            &self.video,
+            &settings,
+            chroma == ChromaMode::Dual420,
+            self.hevc,
+        ) {
             Ok(encoder) => {
                 tracing::info!(
                     width = want.0,
@@ -1060,6 +1067,7 @@ impl Session {
                     &self.video,
                     &self.settings,
                     self.chroma == ChromaMode::Dual420,
+                    false,
                 )?;
                 self.send_config();
                 self.encoder.encode(frame, self.stream, true)?
@@ -1155,9 +1163,11 @@ impl VideoTier {
         }
     }
 
-    fn encoder_max(&self) -> Result<(u32, u32)> {
+    /// The largest stream this tier encodes: HEVC's limit when `hevc` (the
+    /// client decodes it) and the GPU encodes it, else H.264's.
+    fn encoder_max(&self, hevc: bool) -> Result<(u32, u32)> {
         match self {
-            Self::Gpu(gpu) => Ok(Encoder::max_size(gpu)?),
+            Self::Gpu(gpu) => Ok(Encoder::max_size(gpu, gpu_codec(gpu, None, hevc))?),
             Self::Cpu => Ok(gliff_sw::Encoder::MAX_SIZE),
         }
     }
@@ -1167,6 +1177,25 @@ impl VideoTier {
             Self::Gpu(_) => VideoPipeline::Gpu,
             Self::Cpu => VideoPipeline::Cpu,
         }
+    }
+}
+
+/// The GPU codec for a stream of `size` (or the largest one, for `None`):
+/// H.264 while it fits, which every client decodes; HEVC beyond that when
+/// the client decodes it (`hevc`) and the GPU encodes it.
+fn gpu_codec(gpu: &Gpu, size: Option<(u32, u32)>, hevc: bool) -> VaCodec {
+    if !hevc || gpu.caps(VaCodec::Hevc).can_encode().is_err() {
+        return VaCodec::H264;
+    }
+    let Some((w, h)) = size else {
+        return VaCodec::Hevc;
+    };
+    let (max_w, max_h) = Encoder::max_size(gpu, VaCodec::H264).unwrap_or((4096, 4096));
+    let fits = |v: u32, max: u32| v.div_ceil(16) * 16 <= max;
+    if fits(w, max_w) && fits(h, max_h) {
+        VaCodec::H264
+    } else {
+        VaCodec::Hevc
     }
 }
 
@@ -1203,7 +1232,8 @@ impl VideoStart {
         } else {
             ChromaMode::Dual420
         };
-        let encoder_max = video.encoder_max().context("query encoder limits")?;
+        let hevc = caps.codecs.contains(&Codec::H265);
+        let encoder_max = video.encoder_max(hevc).context("query encoder limits")?;
         let stream = EncoderSettings::fit_extent(output.width, output.height, encoder_max);
         if stream != (output.width, output.height) {
             tracing::info!(
@@ -1226,7 +1256,7 @@ impl VideoStart {
             fps,
             ctl.vbv_ms(fps),
         );
-        let encoder = VideoEncoder::new(&video, &settings, chroma == ChromaMode::Dual420)
+        let encoder = VideoEncoder::new(&video, &settings, chroma == ChromaMode::Dual420, hevc)
             .context("create encoder")?;
         Ok(Self {
             video,
@@ -1246,13 +1276,26 @@ enum VideoEncoder {
 }
 
 impl VideoEncoder {
-    fn new(tier: &VideoTier, settings: &EncoderSettings, dual: bool) -> Result<Self> {
+    /// An encoder for `settings`. On the GPU, HEVC when `hevc` allows it
+    /// and the picture is too large for H.264; H.264 otherwise.
+    fn new(tier: &VideoTier, settings: &EncoderSettings, dual: bool, hevc: bool) -> Result<Self> {
         match tier {
-            VideoTier::Gpu(gpu) => Ok(Self::Gpu(Box::new(Encoder::new(
-                gpu,
-                settings.clone(),
-                dual,
-            )?))),
+            VideoTier::Gpu(gpu) => {
+                let codec = gpu_codec(gpu, Some((settings.width, settings.height)), hevc);
+                if codec == VaCodec::Hevc {
+                    tracing::info!(
+                        width = settings.width,
+                        height = settings.height,
+                        "the stream is larger than H.264 allows; encoding HEVC"
+                    );
+                }
+                Ok(Self::Gpu(Box::new(Encoder::new(
+                    gpu,
+                    settings.clone(),
+                    dual,
+                    codec,
+                )?)))
+            }
             VideoTier::Cpu => Ok(Self::Cpu(Box::new(gliff_sw::Encoder::new(
                 gliff_sw::EncoderSettings {
                     width: settings.width,
@@ -1262,6 +1305,14 @@ impl VideoEncoder {
                 },
                 dual,
             )?))),
+        }
+    }
+
+    /// The codec on the wire.
+    fn codec(&self) -> Codec {
+        match self {
+            Self::Gpu(enc) if enc.codec() == VaCodec::Hevc => Codec::H265,
+            _ => Codec::H264,
         }
     }
 

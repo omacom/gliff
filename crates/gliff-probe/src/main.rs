@@ -16,7 +16,7 @@ use wayland_client::{Connection, Dispatch, QueueHandle};
 
 use gliff_proto::color::{bgra_to_yuv444, downscale_bgra, psnr, yuv444_to_bgra};
 use gliff_sw::VideoMode;
-use gliff_vk::{Decoder, DmabufPlane, EncodedFrame, Encoder, EncoderSettings, Gpu};
+use gliff_vk::{Decoder, DmabufPlane, EncodedFrame, Encoder, EncoderSettings, Gpu, VaCodec};
 use hypr_capture::{CaptureConfig, CaptureEvent, Capturer};
 use hypr_input::{keys, Input, InputConfig, InputEvent};
 use hypr_wl::Target;
@@ -84,6 +84,9 @@ enum Cmd {
         /// restore it, to exercise the live rate-control update.
         #[arg(long)]
         adapt: bool,
+        /// Encode and decode HEVC instead of H.264.
+        #[arg(long)]
+        hevc: bool,
     },
     /// Capture one frame of an output and write it as PNG
     Capture {
@@ -139,6 +142,9 @@ enum Cmd {
         /// Print a per-second table of fps, kbit/s, keyframes and reconfigs.
         #[arg(long)]
         timeline: bool,
+        /// Offer HEVC, so a stream larger than H.264 allows comes as HEVC.
+        #[arg(long)]
+        hevc: bool,
     },
     /// Watch or set the compositor's text clipboard (ext-data-control)
     Clipboard {
@@ -193,7 +199,13 @@ fn main() -> Result<()> {
             single,
             bitrate,
             adapt,
-        } => roundtrip(&node, width, height, frames, !single, bitrate, adapt, video)?,
+            hevc,
+        } => {
+            let codec = if hevc { VaCodec::Hevc } else { VaCodec::H264 };
+            roundtrip(
+                &node, width, height, frames, !single, bitrate, adapt, video, codec,
+            )?
+        }
         Cmd::Capture {
             output,
             png,
@@ -214,6 +226,7 @@ fn main() -> Result<()> {
             no_decode,
             csv,
             timeline,
+            hevc,
         } => stream_bench(
             &node,
             &connect,
@@ -223,6 +236,7 @@ fn main() -> Result<()> {
             csv.as_deref(),
             timeline,
             video,
+            hevc,
         )?,
         Cmd::Clipboard { set, secs } => clipboard(&target, set, secs)?,
         Cmd::Keymap { secs, caps } => keymap(&target, secs, caps)?,
@@ -242,14 +256,34 @@ fn main() -> Result<()> {
                 }
             };
             if gpu_ok && video == VideoMode::Gpu {
-                if let Err(e) = roundtrip(&node, 640, 360, 10, true, None, false, VideoMode::Gpu) {
+                if let Err(e) = roundtrip(
+                    &node,
+                    640,
+                    360,
+                    10,
+                    true,
+                    None,
+                    false,
+                    VideoMode::Gpu,
+                    VaCodec::H264,
+                ) {
                     status(
                         false,
                         &format!("GPU round trip failed ({e:#}); the CPU pipeline will be used"),
                     );
                 }
             }
-            roundtrip(&node, 640, 360, 10, true, None, false, VideoMode::Cpu)?;
+            roundtrip(
+                &node,
+                640,
+                360,
+                10,
+                true,
+                None,
+                false,
+                VideoMode::Cpu,
+                VaCodec::H264,
+            )?;
         }
     }
     Ok(())
@@ -544,7 +578,7 @@ fn serve_test(node: &std::path::Path, addr: &str, frames: usize, video: VideoMod
             VideoMode::Gpu => Some(Gpu::open(Some(node))?),
             VideoMode::Cpu => None,
         };
-        let mut decoder = serve_decoder(&gpu, chroma != ChromaMode::Single420, w as u32, h as u32)?;
+        let mut decoder = serve_decoder(&gpu, Codec::H264, chroma != ChromaMode::Single420, w as u32, h as u32)?;
         let mut got = 0usize;
         let mut keyframes = 0usize;
         let mut scaled = false;
@@ -637,7 +671,7 @@ fn serve_test(node: &std::path::Path, addr: &str, frames: usize, video: VideoMod
                     // A pace-only reconfig comes without a keyframe; reset
                     // the decoder only when the coded stream changes.
                     if (width as usize, height as usize, c) != (w, h, chroma) {
-                        decoder = serve_decoder(&gpu, c != ChromaMode::Single420, width, height)?;
+                        decoder = serve_decoder(&gpu, Codec::H264, c != ChromaMode::Single420, width, height)?;
                     }
                     w = width as usize; h = height as usize; chroma = c;
                     eprintln!("  reconfig to {w}x{h} scale {scale_milli}");
@@ -780,6 +814,7 @@ fn stream_bench(
     csv: Option<&std::path::Path>,
     timeline: bool,
     video: VideoMode,
+    hevc: bool,
 ) -> Result<()> {
     use gliff_proto::{ChromaMode, ClientCaps, ClientMsg, Codec, ServerMsg};
     use gliff_transport::Framed;
@@ -800,22 +835,23 @@ fn stream_bench(
         let (rd, wr) = tokio::io::split(stream);
         let mut reader = Framed::new(rd);
         let mut writer = Framed::new(wr);
-        let caps = ClientCaps { codecs: vec![Codec::H264], max_width: 3840, max_height: 2160, chroma: vec![ChromaMode::Dual420, ChromaMode::Single420], features: gliff_proto::features() };
+        let (codecs, max) = if hevc { (vec![Codec::H264, Codec::H265], (8192, 4352)) } else { (vec![Codec::H264], (3840, 2160)) };
+        let caps = ClientCaps { codecs, max_width: max.0, max_height: max.1, chroma: vec![ChromaMode::Dual420, ChromaMode::Single420], features: gliff_proto::features() };
         writer.write_msg(&ClientMsg::Hello { version: gliff_proto::PROTOCOL_VERSION, keymap: String::new(), caps }).await?;
         let ack = reader.read_msg::<ServerMsg>().await?;
         let ServerMsg::HelloAck { session, .. } = ack else { bail!("expected HelloAck, got {ack:?}") };
         milestone("hello_ack");
         // A Ping may arrive before the StreamConfig; answer it right away
         // (it seeds the server's round-trip estimate).
-        let (mut w, mut h, mut chroma) = loop {
+        let (mut codec, mut w, mut h, mut chroma) = loop {
             match reader.read_msg::<ServerMsg>().await? {
                 ServerMsg::Ping { t } => writer.write_msg(&ClientMsg::Pong { t }).await?,
-                ServerMsg::StreamConfig { width, height, chroma, .. } => break (width, height, chroma),
+                ServerMsg::StreamConfig { codec, width, height, chroma, .. } => break (codec, width, height, chroma),
                 o => bail!("expected StreamConfig, got {o:?}"),
             }
         };
         milestone("stream_config");
-        println!("  connected: headless={} output={} stream {w}x{h} {chroma:?}", session.headless, session.output);
+        println!("  connected: headless={} output={} stream {w}x{h} {chroma:?} {codec:?}", session.headless, session.output);
         if size.0 > 0 && size.1 > 0 {
             writer.write_msg(&ClientMsg::Resize { width: size.0, height: size.1, scale: 1.0 }).await?;
         }
@@ -823,7 +859,7 @@ fn stream_bench(
             VideoMode::Gpu => Some(Gpu::open(Some(node))?),
             VideoMode::Cpu => None,
         };
-        let mut decoder = if no_decode { None } else { Some(serve_decoder(&gpu, chroma != ChromaMode::Single420, w, h)?) };
+        let mut decoder = if no_decode { None } else { Some(serve_decoder(&gpu, codec, chroma != ChromaMode::Single420, w, h)?) };
         let mut csv_out = match csv { Some(p) => Some(std::io::BufWriter::new(std::fs::File::create(p)?)), None => None };
         if let Some(c) = csv_out.as_mut() { writeln!(c, "t_ms,frame_id,key,bytes,latency_ms,decode_ms")?; }
 
@@ -942,18 +978,18 @@ fn stream_bench(
                         writeln!(c, "{:.1},{frame_id},{},{total},{lat_recv:.2},{dec:.2}", arrived.duration_since(start).as_secs_f64() * 1000.0, keyframe as u8)?;
                     }
                 }
-                ServerMsg::StreamConfig { width, height, chroma: c, scale_milli, fps_cap, .. } => {
+                ServerMsg::StreamConfig { codec: k, width, height, chroma: c, scale_milli, fps_cap, .. } => {
                     // A pace-only reconfig comes without a keyframe; reset
                     // the decoder only when the coded stream changes.
-                    if (width, height, c) != (w, h, chroma) {
-                        if decoder.is_some() { decoder = Some(serve_decoder(&gpu, c != ChromaMode::Single420, width, height)?); }
+                    if (k, width, height, c) != (codec, w, h, chroma) {
+                        if decoder.is_some() { decoder = Some(serve_decoder(&gpu, k, c != ChromaMode::Single420, width, height)?); }
                         last_arrival = None;
                     }
-                    w = width; h = height; chroma = c;
+                    codec = k; w = width; h = height; chroma = c;
                     reconfigs += 1;
                     bucket(Instant::now(), 3, 1);
                     milestone("reconfig");
-                    println!("  reconfig to {w}x{h} {chroma:?} scale {scale_milli} fps_cap {fps_cap}");
+                    println!("  reconfig to {w}x{h} {chroma:?} {codec:?} scale {scale_milli} fps_cap {fps_cap}");
                 }
                 ServerMsg::Pong { t, server_now_ms } => {
                     let rtt = bench_now_ms().saturating_sub(t) as f64;
@@ -1146,13 +1182,16 @@ fn gpu_info(node: &std::path::Path) -> Result<()> {
         gpu.va.vendor, gpu.va.version.0, gpu.va.version.1
     );
     print_caps(&gpu.va_caps);
+    print_caps(&gpu.hevc_caps);
     Ok(())
 }
 
 fn print_caps(caps: &gliff_va::Caps) {
+    let name = caps.codec.name();
+    let profile = caps.codec.profile_name();
     if let Some(e) = caps.encode_entrypoint {
         println!(
-            "  H.264 encode: entrypoint {}, rate control {}, packed headers {:#x}, maximum {}x{}",
+            "  {profile} encode: entrypoint {}, rate control {}, packed headers {:#x}, maximum {}x{}",
             gliff_va::display::entrypoint_name(e),
             gliff_va::display::rate_control_names(caps.rate_control).join("|"),
             caps.packed_headers,
@@ -1160,13 +1199,28 @@ fn print_caps(caps: &gliff_va::Caps) {
             caps.max_height
         );
     }
+    if caps.decode {
+        println!(
+            "  {profile} decode: maximum {}x{}",
+            caps.decode_max_width, caps.decode_max_height
+        );
+    }
+    // HEVC only carries pictures larger than H.264 allows; its absence is
+    // a missing extra, not a failure.
+    let report = |ok: bool, what: String| {
+        if ok || caps.codec == VaCodec::H264 {
+            status(ok, &what);
+        } else {
+            println!("SKIP {what}");
+        }
+    };
     match caps.can_encode() {
-        Ok(()) => status(true, "VA-API H.264 encode"),
-        Err(e) => status(false, &format!("VA-API H.264 encode: {e}")),
+        Ok(()) => report(true, format!("VA-API {name} encode")),
+        Err(e) => report(false, format!("VA-API {name} encode: {e}")),
     }
     match caps.can_decode() {
-        Ok(()) => status(true, "VA-API H.264 decode"),
-        Err(e) => status(false, &format!("VA-API H.264 decode: {e}")),
+        Ok(()) => report(true, format!("VA-API {name} decode")),
+        Err(e) => report(false, format!("VA-API {name} decode: {e}")),
     }
 }
 
@@ -1254,6 +1308,7 @@ fn roundtrip(
     bitrate: Option<u32>,
     adapt: bool,
     video: VideoMode,
+    codec: VaCodec,
 ) -> Result<()> {
     let bitrate = bitrate.unwrap_or(4 * EncoderSettings::default_bitrate(width, height, 60));
     let settings = EncoderSettings {
@@ -1266,17 +1321,25 @@ fn roundtrip(
     let (mut encoder, mut decoder) = match video {
         VideoMode::Gpu => {
             let gpu = Gpu::open(Some(node))?;
-            println!("  {} ({}) dual={dual}", gpu.name, gpu.driver);
+            println!(
+                "  {} ({}) dual={dual} codec={}",
+                gpu.name,
+                gpu.driver,
+                codec.name()
+            );
             (
                 ProbeEncoder::Gpu(Box::new(
-                    Encoder::new(&gpu, settings, dual).context("vulkan encoder")?,
+                    Encoder::new(&gpu, settings, dual, codec).context("vulkan encoder")?,
                 )),
                 ProbeDecoder::Gpu(Box::new(
-                    Decoder::new(&gpu, dual, width, height).context("vulkan decoder")?,
+                    Decoder::new(&gpu, dual, width, height, codec).context("vulkan decoder")?,
                 )),
             )
         }
         VideoMode::Cpu => {
+            if codec != VaCodec::H264 {
+                bail!("the CPU tier encodes H.264 only");
+            }
             println!("  cpu (OpenH264) dual={dual}");
             (
                 ProbeEncoder::Cpu(Box::new(
@@ -1422,13 +1485,21 @@ enum ProbeDecoder {
 
 fn serve_decoder(
     gpu: &Option<std::sync::Arc<Gpu>>,
+    codec: gliff_proto::Codec,
     dual: bool,
     width: u32,
     height: u32,
 ) -> Result<ProbeDecoder> {
+    let codec = match codec {
+        gliff_proto::Codec::H265 => VaCodec::Hevc,
+        _ => VaCodec::H264,
+    };
     Ok(match gpu {
-        Some(gpu) => ProbeDecoder::Gpu(Box::new(Decoder::new(gpu, dual, width, height)?)),
-        None => ProbeDecoder::Cpu(Box::new(gliff_sw::Decoder::new(dual)?)),
+        Some(gpu) => ProbeDecoder::Gpu(Box::new(Decoder::new(gpu, dual, width, height, codec)?)),
+        None if codec == VaCodec::H264 => {
+            ProbeDecoder::Cpu(Box::new(gliff_sw::Decoder::new(dual)?))
+        }
+        None => bail!("an HEVC stream needs the GPU tier"),
     })
 }
 
@@ -1528,7 +1599,7 @@ fn pipeline(
         VideoMode::Cpu => None,
     };
     let encoder_max = match &gpu {
-        Some(gpu) => Encoder::max_size(gpu).context("encoder limits")?,
+        Some(gpu) => Encoder::max_size(gpu, VaCodec::H264).context("encoder limits")?,
         None => gliff_sw::Encoder::MAX_SIZE,
     };
     let (sw, sh) = EncoderSettings::fit_extent(w, h, encoder_max);
@@ -1549,10 +1620,10 @@ fn pipeline(
     let (mut encoder, mut decoder) = match &gpu {
         Some(gpu) => (
             ProbeEncoder::Gpu(Box::new(
-                Encoder::new(gpu, settings, true).context("encoder")?,
+                Encoder::new(gpu, settings, true, VaCodec::H264).context("encoder")?,
             )),
             ProbeDecoder::Gpu(Box::new(
-                Decoder::new(gpu, true, sw, sh).context("decoder")?,
+                Decoder::new(gpu, true, sw, sh, VaCodec::H264).context("decoder")?,
             )),
         ),
         None => (

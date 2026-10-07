@@ -14,6 +14,7 @@ pub mod h264;
 pub mod hevc;
 pub mod settings;
 pub mod surface;
+pub mod video;
 
 pub use decoder::H264Decoder;
 pub use display::{Caps, Display, VaCodec};
@@ -22,6 +23,7 @@ pub use hevc::decoder::HevcDecoder;
 pub use hevc::encoder::HevcEncoder;
 pub use settings::EncoderSettings;
 pub use surface::{PrimeDescriptor, PrimePlane, Surface, UsageHint};
+pub use video::{VideoDecoder, VideoEncoder};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

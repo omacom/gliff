@@ -20,7 +20,7 @@ use gliff_sw::VideoMode;
 use gliff_transport::clipboard::progress::Progress;
 use gliff_transport::clipboard::{outbound_channel, Side, Transfers};
 use gliff_transport::{spawn_ssh, Framed, SshTarget};
-use gliff_vk::{Decoder, DisplayFrame, Gpu};
+use gliff_vk::{Decoder, DisplayFrame, Gpu, VaCodec};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc::{self, unbounded_channel, UnboundedReceiver};
 
@@ -211,15 +211,34 @@ fn open_gpu(mode: VideoMode) -> Option<Arc<Gpu>> {
     }
 }
 
+/// Whether the GPU decodes HEVC, which streams larger than H.264 allows
+/// arrive in.
+fn decodes_hevc(gpu: &Option<Arc<Gpu>>) -> bool {
+    gpu.as_ref()
+        .is_some_and(|g| g.caps(VaCodec::Hevc).can_decode().is_ok())
+}
+
 fn new_decoder(
     gpu: &Option<Arc<Gpu>>,
+    codec: Codec,
     chroma: ChromaMode,
     width: u32,
     height: u32,
 ) -> anyhow::Result<VideoDecoder> {
     let dual = chroma != ChromaMode::Single420;
+    if codec == Codec::H265 {
+        // Only the GPU decodes HEVC; the server sends it only when offered.
+        let gpu = gpu.as_ref().context("HEVC stream without a GPU decoder")?;
+        return Ok(VideoDecoder::Gpu(Box::new(Decoder::new(
+            gpu,
+            dual,
+            width,
+            height,
+            VaCodec::Hevc,
+        )?)));
+    }
     if let Some(gpu) = gpu {
-        match Decoder::new(gpu, dual, width, height) {
+        match Decoder::new(gpu, dual, width, height, VaCodec::H264) {
             Ok(d) => return Ok(VideoDecoder::Gpu(Box::new(d))),
             Err(e) => {
                 tracing::warn!(error = %e, "cannot create the GPU decoder; falling back to the CPU pipeline");
@@ -240,12 +259,13 @@ impl VideoDecoder {
 
 /// The tiers in use, server then client, as the stats line shows them:
 /// "GPU→GPU".
-fn tier_label(pipeline: Option<VideoPipeline>, decoder: &VideoDecoder) -> String {
+fn tier_label(pipeline: Option<VideoPipeline>, decoder: &VideoDecoder, codec: Codec) -> String {
     let server = pipeline.map_or("?", |p| match p {
         VideoPipeline::Gpu => "GPU",
         VideoPipeline::Cpu => "CPU",
     });
-    format!("{server}→{}", decoder.label())
+    let codec = if codec == Codec::H265 { " HEVC" } else { "" };
+    format!("{server}→{}{codec}", decoder.label())
 }
 
 async fn session<R, W>(
@@ -265,10 +285,24 @@ where
     let mut writer = Framed::new(wr);
 
     let gpu = open_gpu(video);
+    // With HEVC the server may send up to what the decoder takes (8192
+    // wide on AMD); H.264 alone stays within 4K.
+    let hevc = decodes_hevc(&gpu);
+    let (max_width, max_height) = match &gpu {
+        Some(g) if hevc => {
+            let c = g.caps(VaCodec::Hevc);
+            (c.decode_max_width.max(3840), c.decode_max_height.max(2160))
+        }
+        _ => (3840, 2160),
+    };
     let caps = ClientCaps {
-        codecs: vec![Codec::H264],
-        max_width: 3840,
-        max_height: 2160,
+        codecs: if hevc {
+            vec![Codec::H264, Codec::H265]
+        } else {
+            vec![Codec::H264]
+        },
+        max_width,
+        max_height,
         // The CPU tier asks for one 4:2:0 stream so it decodes one stream,
         // not two; the recombine also costs CPU on this side.
         chroma: if gpu.is_some() {
@@ -296,7 +330,16 @@ where
     // it before anything else (even GPU setup) so the server's round-trip
     // estimate is seeded ahead of the first frame ack.
     let mut got_ack = false;
-    let (mut width, mut height, mut chroma, mut scale_milli, pipeline, mut view, mut fps_cap) = loop {
+    let (
+        mut codec,
+        mut width,
+        mut height,
+        mut chroma,
+        mut scale_milli,
+        pipeline,
+        mut view,
+        mut fps_cap,
+    ) = loop {
         match reader.read_msg::<ServerMsg>().await? {
             ServerMsg::HelloAck {
                 version, features, ..
@@ -311,6 +354,7 @@ where
             }
             ServerMsg::Ping { t } => writer.write_msg(&ClientMsg::Pong { t }).await?,
             ServerMsg::StreamConfig {
+                codec,
                 width,
                 height,
                 chroma,
@@ -322,6 +366,7 @@ where
                 ..
             } if got_ack => {
                 break (
+                    codec,
                     width,
                     height,
                     chroma,
@@ -340,8 +385,8 @@ where
             other => anyhow::bail!("unexpected message before StreamConfig: {other:?}"),
         }
     };
-    let mut decoder = new_decoder(&gpu, chroma, width, height)?;
-    let mut video_label = tier_label(pipeline, &decoder);
+    let mut decoder = new_decoder(&gpu, codec, chroma, width, height)?;
+    let mut video_label = tier_label(pipeline, &decoder, codec);
     let _ = status.send(Status::Connected {
         video: video_label.clone(),
         view_width: view.0,
@@ -647,6 +692,7 @@ where
                 }
             }
             ServerMsg::StreamConfig {
+                codec: k,
                 width: w,
                 height: h,
                 chroma: c,
@@ -660,14 +706,14 @@ where
                 // A pace-only change (fps cap) must not reset the decoder;
                 // a coded-stream change does, and drops the frame waiting
                 // for the UI with it.
-                if (w, h, c) != (width, height, chroma) {
-                    decoder = new_decoder(&gpu, c, w, h)?;
+                if (k, w, h, c) != (codec, width, height, chroma) {
+                    decoder = new_decoder(&gpu, k, c, w, h)?;
                     undelivered = None;
                     in_decoder.clear();
                 }
-                (width, height, chroma, scale_milli) = (w, h, c, s);
+                (codec, width, height, chroma, scale_milli) = (k, w, h, c, s);
                 (view, fps_cap) = ((view_width, view_height), f);
-                video_label = tier_label(pipeline, &decoder);
+                video_label = tier_label(pipeline, &decoder, codec);
                 let _ = status.send(Status::Connected {
                     video: video_label.clone(),
                     view_width,
