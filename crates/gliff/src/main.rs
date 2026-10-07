@@ -606,7 +606,7 @@ fn machine_tab(ui: &Rc<App>, name: &str) -> gtk::Box {
         label.add_css_class("dim-label");
     }
     // The slot on the right shows whether the machine is connected, and
-    // turns into its button while the pointer is on the tab.
+    // turns into its button while the pointer is on it.
     let connected = session.as_ref().is_some_and(|s| s.connected.get());
     let status_tip = if connected {
         "Connected"
@@ -634,7 +634,6 @@ fn machine_tab(ui: &Rc<App>, name: &str) -> gtk::Box {
         .css_classes(["tab-action"])
         .valign(gtk::Align::Center)
         .focusable(false)
-        .can_target(false)
         .build();
     let tab = gtk::Box::builder().css_classes(["machine-tab"]).build();
     if session.as_ref().is_some_and(|s| is_active(ui, s)) {
@@ -643,25 +642,28 @@ fn machine_tab(ui: &Rc<App>, name: &str) -> gtk::Box {
     tab.append(&label);
     tab.append(&action);
 
-    // The button can be clicked only while it shows.
+    // The dot turns into its button only under the pointer, so a click on
+    // it always lands on what it shows.
     let hover = gtk::EventControllerMotion::new();
     {
-        let (action, slot) = (action.clone(), slot.clone());
-        hover.connect_enter(move |_, _, _| {
+        let slot = slot.clone();
+        hover.connect_enter(move |c, _, _| {
             slot.set_visible_child_name("action");
-            action.set_tooltip_text(Some(action_tip));
-            action.set_can_target(true);
+            if let Some(button) = c.widget() {
+                button.set_tooltip_text(Some(action_tip));
+            }
         });
     }
     {
-        let (action, slot) = (action.clone(), slot.clone());
-        hover.connect_leave(move |_| {
+        let slot = slot.clone();
+        hover.connect_leave(move |c| {
             slot.set_visible_child_name("status");
-            action.set_tooltip_text(Some(status_tip));
-            action.set_can_target(false);
+            if let Some(button) = c.widget() {
+                button.set_tooltip_text(Some(status_tip));
+            }
         });
     }
-    tab.add_controller(hover);
+    action.add_controller(hover);
 
     // The handlers rebuild the tabs, so they run once the click is done
     // with the widget that received it. The action button claims its own
