@@ -118,6 +118,10 @@ struct App {
     /// Evdev codes currently held on the remote, so they can all be released
     /// when the keyboard is handed back to the local compositor.
     pressed_keys: RefCell<BTreeSet<u32>>,
+    /// Set by the release hotkey: the pointer is over the picture but the
+    /// keyboard stays local until the pointer leaves, or the picture is
+    /// clicked.
+    released: Cell<bool>,
     /// The last endpoint, kept so a dropped connection can be retried.
     endpoint: RefCell<Option<Endpoint>>,
     /// Consecutive failed connection attempts, reset on a successful connect.
@@ -202,7 +206,12 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         .default_height(760)
         .build();
 
-    let header = adw::HeaderBar::builder().show_title(false).build();
+    let header = adw::HeaderBar::builder()
+        .show_title(false)
+        // No window buttons: closing is the compositor's job, and a stray
+        // click on an X in the middle of a remote session is a bad surprise.
+        .decoration_layout("")
+        .build();
     let entry = gtk::Entry::builder()
         .placeholder_text("user@host")
         .width_chars(32)
@@ -305,6 +314,7 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         zoom: Cell::new(1),
         input_tx: RefCell::new(None),
         pressed_keys: RefCell::new(BTreeSet::new()),
+        released: Cell::new(false),
         endpoint: RefCell::new(None),
         retries: Cell::new(0),
         session: Cell::new(0),
@@ -1024,7 +1034,21 @@ fn key_from_name(name: &str) -> Result<gdk::Key, String> {
 
 /// Give the keyboard back to the local compositor by dropping video focus,
 /// which fires the focus-leave handler that restores system shortcuts.
+/// True while the address bar is in use: it holds the focus, or its
+/// recent-machines drop-down is up. GTK4 focuses the text inside the entry,
+/// so ask the window for the focus widget and walk up.
+fn address_bar_in_use(
+    window: &adw::ApplicationWindow,
+    entry: &gtk::Entry,
+    recent_popover: &gtk::Popover,
+) -> bool {
+    recent_popover.is_visible()
+        || gtk::prelude::GtkWindowExt::focus(window)
+            .is_some_and(|f| f == *entry || f.is_ancestor(entry))
+}
+
 fn release_capture(ui: &App, window: &adw::ApplicationWindow) {
+    ui.released.set(true);
     gtk::prelude::GtkWindowExt::set_focus(window, gtk::Widget::NONE);
     ui.status
         .set_text("Shortcuts released — click the screen to capture again");
@@ -1067,8 +1091,11 @@ fn install_input_handlers(
     video.set_focusable(true);
     video.set_can_focus(true);
 
-    // Keyboard: hardware keycode minus 8 is the evdev code.
+    // Keyboard: hardware keycode minus 8 is the evdev code. The controller
+    // runs in the capture phase so that while the picture has the keyboard
+    // every key goes to the remote, ahead of any local handling.
     let key = gtk::EventControllerKey::new();
+    key.set_propagation_phase(gtk::PropagationPhase::Capture);
     let last_tap: Rc<RefCell<Option<Instant>>> = Rc::new(RefCell::new(None));
     {
         let ui = ui.clone();
@@ -1112,13 +1139,37 @@ fn install_input_handlers(
     }
     video.add_controller(key);
 
-    // Pointer motion.
+    // Pointer motion, and the capture itself: the remote gets the keyboard
+    // only while the pointer is over the picture, so the header bar and
+    // anything else outside it stay local.
     let motion = gtk::EventControllerMotion::new();
     {
         let ui = ui.clone();
         motion.connect_motion(move |_, x, y| {
             let (rx, ry) = to_remote(&ui, x, y);
             send(&ui, ClientMsg::PointerMotion { x: rx, y: ry });
+        });
+    }
+    {
+        let ui = ui.clone();
+        let video = video.clone();
+        motion.connect_enter(move |_, _, _| {
+            if !ui.released.get() && !address_bar_in_use(&ui.window, &ui.entry, &ui.recent_popover)
+            {
+                video.grab_focus();
+            }
+        });
+    }
+    {
+        let ui = ui.clone();
+        let window = window.clone();
+        motion.connect_leave(move |_| {
+            // A deliberate release lasts only as long as the pointer rests on
+            // the picture; leaving and coming back captures again.
+            ui.released.set(false);
+            if gtk::prelude::GtkWindowExt::focus(&window).is_some_and(|f| f == ui.video) {
+                gtk::prelude::GtkWindowExt::set_focus(&window, gtk::Widget::NONE);
+            }
         });
     }
     video.add_controller(motion);
@@ -1130,6 +1181,7 @@ fn install_input_handlers(
         let ui = ui.clone();
         let video = video.clone();
         click.connect_pressed(move |g, _, _, _| {
+            ui.released.set(false);
             video.grab_focus();
             send(
                 &ui,
@@ -1200,6 +1252,13 @@ fn install_input_handlers(
             tracing::debug!("video focused; inhibiting system shortcuts");
             if let Some(toplevel) = window.surface().and_downcast::<gdk::Toplevel>() {
                 toplevel.inhibit_system_shortcuts(None::<&gdk::Event>);
+                // The compositor answers asynchronously, and may refuse.
+                toplevel.connect_shortcuts_inhibited_notify(|t| {
+                    tracing::info!(
+                        inhibited = t.is_shortcuts_inhibited(),
+                        "compositor shortcut inhibit"
+                    );
+                });
             }
             if let Some(hint) = &hint {
                 ui.status.set_text(hint);
@@ -1236,15 +1295,9 @@ fn install_fullscreen_bars(
     entry: &gtk::Entry,
     recent_popover: &gtk::Popover,
 ) {
-    // GTK4 focuses the text inside the entry, so ask for the focus widget
-    // and walk up.
     let address_bar_in_use = {
         let (window, entry, popover) = (window.clone(), entry.clone(), recent_popover.clone());
-        Rc::new(move || {
-            popover.is_visible()
-                || gtk::prelude::GtkWindowExt::focus(&window)
-                    .is_some_and(|f| f == entry || f.is_ancestor(&entry))
-        })
+        Rc::new(move || address_bar_in_use(&window, &entry, &popover))
     };
     let top = gtk::Revealer::builder()
         .transition_type(gtk::RevealerTransitionType::SlideDown)
