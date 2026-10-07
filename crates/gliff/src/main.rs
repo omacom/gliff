@@ -1091,8 +1091,11 @@ fn install_input_handlers(
     video.set_focusable(true);
     video.set_can_focus(true);
 
-    // Keyboard: hardware keycode minus 8 is the evdev code.
+    // Keyboard: hardware keycode minus 8 is the evdev code. The controller
+    // runs in the capture phase so that while the picture has the keyboard
+    // every key goes to the remote, ahead of any local handling.
     let key = gtk::EventControllerKey::new();
+    key.set_propagation_phase(gtk::PropagationPhase::Capture);
     let last_tap: Rc<RefCell<Option<Instant>>> = Rc::new(RefCell::new(None));
     {
         let ui = ui.clone();
@@ -1249,6 +1252,13 @@ fn install_input_handlers(
             tracing::debug!("video focused; inhibiting system shortcuts");
             if let Some(toplevel) = window.surface().and_downcast::<gdk::Toplevel>() {
                 toplevel.inhibit_system_shortcuts(None::<&gdk::Event>);
+                // The compositor answers asynchronously, and may refuse.
+                toplevel.connect_shortcuts_inhibited_notify(|t| {
+                    tracing::info!(
+                        inhibited = t.is_shortcuts_inhibited(),
+                        "compositor shortcut inhibit"
+                    );
+                });
             }
             if let Some(hint) = &hint {
                 ui.status.set_text(hint);
