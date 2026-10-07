@@ -1878,7 +1878,11 @@ fn request_resize(ui: &App) {
     let Some(s) = active(ui) else {
         return;
     };
-    let size = ui.view_size.get();
+    let (size, scale) = remote_mode(
+        ui.view_size.get(),
+        ui.video.scale_factor(),
+        ui.cli.headless && ui.window.is_fullscreen(),
+    );
     if size.0 < 64 || size.1 < 64 || size == s.server_view.get() || size == s.resize_requested.get()
     {
         return;
@@ -1889,9 +1893,23 @@ fn request_resize(ui: &App) {
         ClientMsg::Resize {
             width: size.0,
             height: size.1,
-            scale: ui.video.scale_factor() as f32,
+            scale: scale as f32,
         },
     );
+}
+
+/// The size and scale to ask of a private remote screen for a picture of
+/// `size` device pixels at `scale`. A fullscreen picture larger than the
+/// biggest stream (a 6K display, say) gets a screen of half the pixels at
+/// half the scale: the remote lays out the same, and the client doubles
+/// every pixel exactly, rather than showing a 4K screen in a black border.
+fn remote_mode(size: (u32, u32), scale: i32, fullscreen_private: bool) -> ((u32, u32), i32) {
+    let too_big = size.0 > net::MAX_STREAM.0 || size.1 > net::MAX_STREAM.1;
+    if fullscreen_private && too_big && scale >= 2 {
+        (((size.0 / 2) & !1, (size.1 / 2) & !1), scale / 2)
+    } else {
+        (size, scale)
+    }
 }
 
 /// GTK button number to evdev `BTN_*`.
@@ -1910,6 +1928,19 @@ fn evdev_button(n: u32) -> u32 {
 mod tests {
     use super::*;
     use std::cell::RefCell;
+
+    #[test]
+    fn remote_mode_halves_only_a_fullscreen_private_screen_beyond_4k() {
+        // A 6K display at scale 2, fullscreen on a private screen.
+        assert_eq!(remote_mode((6016, 3384), 2, true), ((3008, 1692), 1));
+        // Windowed, mirrored, or within the stream limit: as it is.
+        assert_eq!(remote_mode((6016, 3384), 2, false), ((6016, 3384), 2));
+        assert_eq!(remote_mode((3840, 2160), 2, true), ((3840, 2160), 2));
+        // At scale 1 the remote would have to go to scale 0.5.
+        assert_eq!(remote_mode((6016, 3384), 1, true), ((6016, 3384), 1));
+        // Halves stay even.
+        assert_eq!(remote_mode((5122, 2882), 2, true), ((2560, 1440), 1));
+    }
 
     #[test]
     fn visible_shape_needs_alpha_and_contrast() {

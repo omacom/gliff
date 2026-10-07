@@ -114,6 +114,10 @@ pub enum Frame {
     Bgra(gliff_sw::PooledFrame),
 }
 
+/// The largest stream the client asks for, in physical pixels; the server
+/// keeps a private screen within it.
+pub const MAX_STREAM: (u32, u32) = (3840, 2160);
+
 pub struct Worker {
     pub endpoint: Endpoint,
     pub video: VideoMode,
@@ -267,8 +271,8 @@ where
     let gpu = open_gpu(video);
     let caps = ClientCaps {
         codecs: vec![Codec::H264],
-        max_width: 3840,
-        max_height: 2160,
+        max_width: MAX_STREAM.0,
+        max_height: MAX_STREAM.1,
         // The CPU tier asks for one 4:2:0 stream so it decodes one stream,
         // not two; the recombine also costs CPU on this side.
         chroma: if gpu.is_some() {

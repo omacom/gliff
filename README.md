@@ -71,7 +71,10 @@ gliff --headless user@host      # a private remote screen, sized and
 
 A mirrored screen keeps its own size and is fitted into the window. A private
 screen follows the window as you resize it, and is removed when you
-disconnect.
+disconnect. Fullscreen on a display larger than 4K, such as a 6K one, a
+private screen runs at half the resolution and half the scale and every
+pixel is doubled, so it fills the display sharply instead of sitting in a
+border.
 
 Every machine you connect to gets a tab in the title bar. Click a tab to
 connect to that machine, or to switch to it: each connection keeps running
