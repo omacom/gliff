@@ -573,7 +573,13 @@ fn refresh_tabs(ui: &Rc<App>) {
     for name in tab_names(ui) {
         ui.tabs.append(&machine_tab(ui, &name));
     }
-    if ui.tabs.first_child().is_none() {
+    // An empty scroller still claims its minimum width, which would push
+    // the address bar away from where the first tab starts.
+    let has_tabs = ui.tabs.first_child().is_some();
+    if let Some(scroller) = ui.tabs.ancestor(gtk::ScrolledWindow::static_type()) {
+        scroller.set_visible(has_tabs);
+    }
+    if !has_tabs {
         show_address_bar(ui, true);
     }
 }
