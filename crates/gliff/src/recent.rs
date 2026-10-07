@@ -1,17 +1,15 @@
-//! The machines this client has connected to, most recent first, kept in
-//! `$XDG_CONFIG_HOME/gliff/config.toml` so the address bar can offer them again.
+//! The machines this client has connected to, in the order they were first
+//! connected, kept in `$XDG_CONFIG_HOME/gliff/config.toml` so the header can
+//! offer them again as tabs.
 
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-/// How many machines the address bar remembers.
-pub const MAX_RECENT: usize = 6;
-
 #[derive(Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct Config {
-    #[serde(default, rename = "recent_machines")]
-    pub recent: Vec<String>,
+    #[serde(default, alias = "recent_machines")]
+    pub machines: Vec<String>,
 }
 
 impl Config {
@@ -53,21 +51,39 @@ impl Config {
 
     fn parse(text: &str) -> Result<Self, toml::de::Error> {
         let mut config: Self = toml::from_str(text)?;
-        config.recent.retain(|m| !m.trim().is_empty());
-        config.recent.truncate(MAX_RECENT);
+        config.machines.retain(|m| !m.trim().is_empty());
+        let mut seen = std::collections::HashSet::new();
+        config.machines.retain(|m| seen.insert(m.clone()));
         Ok(config)
     }
 
-    /// Move `machine` to the top of the list, adding it if it is new, and
-    /// drop the oldest entry beyond `MAX_RECENT`.
-    pub fn touch(&mut self, machine: &str) {
+    /// Add `machine` at the end of the list unless it is already there, so
+    /// the tabs keep their places as machines are reconnected.
+    pub fn remember(&mut self, machine: &str) {
         let machine = machine.trim();
-        if machine.is_empty() {
+        if machine.is_empty() || self.machines.iter().any(|m| m == machine) {
             return;
         }
-        self.recent.retain(|m| m != machine);
-        self.recent.insert(0, machine.to_string());
-        self.recent.truncate(MAX_RECENT);
+        self.machines.push(machine.to_string());
+    }
+
+    pub fn forget(&mut self, machine: &str) {
+        self.machines.retain(|m| m != machine);
+    }
+
+    /// Move `machine` to just before `target`, or just after it with
+    /// `after`. False when either is not in the list, or they are the same.
+    pub fn move_machine(&mut self, machine: &str, target: &str, after: bool) -> bool {
+        if machine == target || !self.machines.iter().any(|m| m == target) {
+            return false;
+        }
+        let Some(from) = self.machines.iter().position(|m| m == machine) else {
+            return false;
+        };
+        let moved = self.machines.remove(from);
+        let to = self.machines.iter().position(|m| m == target).unwrap() + usize::from(after);
+        self.machines.insert(to, moved);
+        true
     }
 }
 
@@ -76,44 +92,78 @@ mod tests {
     use super::*;
 
     #[test]
-    fn touch_moves_to_top_and_caps_the_list() {
+    fn remember_appends_new_machines_once() {
         let mut c = Config::default();
-        for i in 0..MAX_RECENT + 3 {
-            c.touch(&format!("host{i}"));
-        }
-        assert_eq!(c.recent.len(), MAX_RECENT);
-        assert_eq!(c.recent[0], format!("host{}", MAX_RECENT + 2));
-        assert!(!c.recent.contains(&"host0".to_string()));
-
-        c.touch("host5");
-        assert_eq!(c.recent[0], "host5");
-        assert_eq!(c.recent.iter().filter(|m| *m == "host5").count(), 1);
-        assert_eq!(c.recent.len(), MAX_RECENT);
+        c.remember("a");
+        c.remember("b");
+        c.remember("a");
+        assert_eq!(c.machines, vec!["a", "b"]);
     }
 
     #[test]
-    fn touch_trims_and_ignores_blank() {
+    fn remember_trims_and_ignores_blank() {
         let mut c = Config::default();
-        c.touch("  ");
-        c.touch(" user@host ");
-        assert_eq!(c.recent, vec!["user@host"]);
+        c.remember("  ");
+        c.remember(" user@host ");
+        assert_eq!(c.machines, vec!["user@host"]);
+    }
+
+    #[test]
+    fn forget_removes_the_machine() {
+        let mut c = Config::default();
+        c.remember("a");
+        c.remember("b");
+        c.forget("a");
+        c.forget("missing");
+        assert_eq!(c.machines, vec!["b"]);
+    }
+
+    #[test]
+    fn move_machine_places_before_or_after_the_target() {
+        let mut c = Config::default();
+        for m in ["a", "b", "c", "d"] {
+            c.remember(m);
+        }
+        assert!(c.move_machine("d", "b", false));
+        assert_eq!(c.machines, vec!["a", "d", "b", "c"]);
+        assert!(c.move_machine("a", "c", true));
+        assert_eq!(c.machines, vec!["d", "b", "c", "a"]);
+        assert!(c.move_machine("a", "d", false));
+        assert_eq!(c.machines, vec!["a", "d", "b", "c"]);
+    }
+
+    #[test]
+    fn move_machine_ignores_unknown_and_self() {
+        let mut c = Config::default();
+        c.remember("a");
+        c.remember("b");
+        assert!(!c.move_machine("a", "a", true));
+        assert!(!c.move_machine("x", "a", false));
+        assert!(!c.move_machine("a", "x", false));
+        assert_eq!(c.machines, vec!["a", "b"]);
     }
 
     #[test]
     fn round_trips_through_toml() {
         let mut c = Config::default();
-        c.touch("b");
-        c.touch("a");
+        c.remember("b");
+        c.remember("a");
         let text = toml::to_string(&c).unwrap();
         assert_eq!(Config::parse(&text).unwrap(), c);
     }
 
     #[test]
-    fn parse_tolerates_missing_key_and_drops_blanks() {
+    fn parse_tolerates_missing_key_and_drops_blanks_and_duplicates() {
         assert_eq!(Config::parse("").unwrap(), Config::default());
-        let c = Config::parse("recent_machines = [\"a\", \"\", \"b\"]").unwrap();
-        assert_eq!(c.recent, vec!["a", "b"]);
-        assert!(Config::parse("recent_machines = 3").is_err());
+        let c = Config::parse("machines = [\"a\", \"\", \"b\", \"a\"]").unwrap();
+        assert_eq!(c.machines, vec!["a", "b"]);
+        assert!(Config::parse("machines = 3").is_err());
+    }
+
+    #[test]
+    fn parse_reads_the_old_recent_machines_key() {
+        let c = Config::parse("recent_machines = [\"a\", \"b\"]").unwrap();
+        assert_eq!(c.machines, vec!["a", "b"]);
     }
 
     #[test]
@@ -123,7 +173,7 @@ mod tests {
         assert_eq!(Config::load(&path), Config::default());
 
         let mut c = Config::default();
-        c.touch("user@host");
+        c.remember("user@host");
         c.save(&path).unwrap();
         assert_eq!(Config::load(&path), c);
 

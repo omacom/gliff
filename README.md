@@ -73,9 +73,14 @@ A mirrored screen keeps its own size and is fitted into the window. A private
 screen follows the window as you resize it, and is removed when you
 disconnect.
 
-The address bar in the title bar holds the machine. Type another one and
-press Enter to switch to it, or pick one of the six you used last from the
-drop-down. A bare `gliff` opens the window with the address bar ready.
+Every machine you connect to gets a tab in the title bar. Click a tab to
+connect to that machine, or to switch to it: each connection keeps running
+while you look at another, so switching is instant. Hover a tab for its
+button: a stop square disconnects a running machine, and an X forgets one
+that is not running. Drag the tabs to reorder them. The + after the tabs
+opens the address bar; type `user@host` and press Enter to add a machine.
+A bare `gliff` opens the window with a tab for each machine you have used,
+or with the address bar ready when there are none.
 
 **Keyboard.** Click the picture to send everything to the remote machine,
 window-manager shortcuts included. Press `Shift+Esc` to get your own

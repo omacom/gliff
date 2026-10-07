@@ -40,13 +40,14 @@ fn holds_remote_offer(cb: &gdk::Clipboard) -> bool {
     cb.content().is_some_and(|p| p.is::<RemoteProvider>())
 }
 
-/// Report every change of the local clipboard to the worker, except changes
-/// made by our own proxy provider.
-pub fn watch_local(sender: impl Fn() -> Option<UnboundedSender<ToWorker>> + 'static) {
+/// Report every change of the local clipboard to the workers, except changes
+/// made by our own proxy provider. Every running session gets the offer, so
+/// any of them can paste it after a switch; nothing is sent until one does.
+pub fn watch_local(senders: impl Fn() -> Vec<UnboundedSender<ToWorker>> + 'static) {
     let Some(cb) = clipboard() else {
         return;
     };
-    let sender = Rc::new(sender);
+    let senders = Rc::new(senders);
     // Bumped per change so a slow file listing for a stale one is dropped.
     let selection_gen = Rc::new(Cell::new(0u64));
     cb.connect_changed(move |cb| {
@@ -57,9 +58,10 @@ pub fn watch_local(sender: impl Fn() -> Option<UnboundedSender<ToWorker>> + 'sta
         if holds_remote_offer(cb) {
             return;
         }
-        let Some(tx) = sender() else {
+        let txs = senders();
+        if txs.is_empty() {
             return;
-        };
+        }
         let selection_gen = selection_gen.clone();
         let mimes: Vec<String> = cb
             .formats()
@@ -77,10 +79,12 @@ pub fn watch_local(sender: impl Fn() -> Option<UnboundedSender<ToWorker>> + 'sta
             if selection_gen.get() != gen {
                 return;
             }
-            let _ = tx.send(ToWorker::LocalOffer {
-                mime_types: forwardable_mimes(&mimes),
-                files,
-            });
+            for tx in txs {
+                let _ = tx.send(ToWorker::LocalOffer {
+                    mime_types: forwardable_mimes(&mimes),
+                    files: files.clone(),
+                });
+            }
         });
     });
 }

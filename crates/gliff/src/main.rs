@@ -48,12 +48,13 @@ const APP_NAME: &str = "gliff";
 )]
 struct Cli {
     /// `user@host` to ssh to and spawn gliff-server. Without it the window
-    /// opens with the address bar focused, offering the machines used most
-    /// recently.
+    /// opens with a tab for each machine connected to before, or with the
+    /// address bar focused when there are none.
     host: Option<String>,
-    /// Dev: connect directly to a `gliff-server --listen` address.
+    /// Dev: connect directly to a `gliff-server --listen` address. Repeat it
+    /// to open a tab for each.
     #[arg(long)]
-    connect: Option<String>,
+    connect: Vec<String>,
     /// Remote gliff-server path.
     #[arg(long, default_value = "gliff-server")]
     server_bin: String,
@@ -87,18 +88,55 @@ struct App {
     frame: paintable::FramePaintable,
     stats: gtk::Label,
     status: gtk::Label,
-    /// The address bar: shows the current machine; Enter connects to what
-    /// was typed instead.
+    /// A tab per machine, to the left of the address bar.
+    tabs: gtk::Box,
+    /// Expands into the address bar; hidden while the address bar shows.
+    add_btn: gtk::Button,
+    /// Holds the address bar, which shows only while adding a machine, or
+    /// while there are no tabs at all.
+    add_revealer: gtk::Revealer,
+    /// The address bar: Enter connects to the machine typed.
     entry: gtk::Entry,
-    /// Drops below the address bar with the recent machines while it has
-    /// focus.
-    recent_popover: gtk::Popover,
-    recent_list: gtk::ListBox,
     transfers: Rc<clipboard_ui::TransferBars>,
-    /// Size of the stream the server is sending, from the last painted frame.
+    /// Every running connection, in the order they were opened.
+    sessions: RefCell<Vec<Rc<Session>>>,
+    /// The session the window shows and sends input to.
+    active: RefCell<Option<Rc<Session>>>,
+    /// Size of the video widget in device pixels, rounded down to even.
+    view_size: Cell<(u32, u32)>,
+    /// Evdev codes currently held on the remote, so they can all be released
+    /// when the keyboard is handed back to the local compositor.
+    pressed_keys: RefCell<BTreeSet<u32>>,
+    /// Set by the release hotkey: the pointer is over the picture but the
+    /// keyboard stays local until the pointer leaves, or the picture is
+    /// clicked.
+    released: Cell<bool>,
+    config_path: PathBuf,
+    cli: Cli,
+    keymap: keymap::Keymap,
+}
+
+/// One connection to a machine. Every session keeps streaming while the
+/// window shows another, so switching tabs is instant; only the shown one
+/// gets input.
+struct Session {
+    /// The tab's name: `user@host`, or the address of a dev `--connect`.
+    name: String,
+    endpoint: Endpoint,
+    input_tx: RefCell<Option<OutSender>>,
+    /// Bumped by every `start_session` and by `stop_session`, so pollers and
+    /// delayed reconnects of an earlier worker can tell they are stale.
+    generation: Cell<u64>,
+    /// Consecutive failed connection attempts, reset on a successful connect.
+    retries: Cell<u32>,
+    /// Automatic reconnects have given up; selecting the tab tries again.
+    gave_up: Cell<bool>,
+    /// Recorded in the config on the first successful connect.
+    remembered: Cell<bool>,
+    /// Size of the stream the server is sending, from the last decoded frame.
     stream_size: Cell<(u32, u32)>,
     /// The full-quality fit size the stream is drawn into; equals the stream
-    /// size unless the server reduced the resolution. From the last painted
+    /// size unless the server reduced the resolution. From the last decoded
     /// frame, so pointer mapping always matches the picture on screen.
     stream_view: Cell<(u32, u32)>,
     /// The view from the last StreamConfig (which may not be painted yet);
@@ -108,37 +146,40 @@ struct App {
     fps_cap: Cell<u32>,
     /// The remote output's scale: pointer coordinates go in physical / scale.
     stream_scale: Cell<f32>,
-    /// Size of the video widget in device pixels, rounded down to even.
-    view_size: Cell<(u32, u32)>,
     /// The size last asked of the server, so a pending resize is not repeated.
     resize_requested: Cell<(u32, u32)>,
     /// The output zoom last asked of the decoder; a new worker starts at 1.
     zoom: Cell<u32>,
-    input_tx: RefCell<Option<OutSender>>,
-    /// Evdev codes currently held on the remote, so they can all be released
-    /// when the keyboard is handed back to the local compositor.
-    pressed_keys: RefCell<BTreeSet<u32>>,
-    /// Set by the release hotkey: the pointer is over the picture but the
-    /// keyboard stays local until the pointer leaves, or the picture is
-    /// clicked.
-    released: Cell<bool>,
-    /// The last endpoint, kept so a dropped connection can be retried.
-    endpoint: RefCell<Option<Endpoint>>,
-    /// Consecutive failed connection attempts, reset on a successful connect.
-    retries: Cell<u32>,
-    /// Bumped by every `start_session`, so pollers and delayed reconnects of
-    /// an earlier session can tell they are stale.
-    session: Cell<u64>,
-    /// Connects to the address bar's machine; turns into a Reconnect button
-    /// once automatic reconnects have given up.
-    connect_btn: gtk::Button,
-    /// The `user@host` in the address bar, recorded in the recent list on
-    /// the first successful connect; `None` for a dev `--connect` session.
-    machine: RefCell<Option<String>>,
-    remembered: Cell<bool>,
-    config_path: PathBuf,
-    cli: Cli,
-    keymap: keymap::Keymap,
+    /// The latest frame and its view, painted when the tab is shown.
+    last_frame: RefCell<Option<(gdk::Texture, (u32, u32))>>,
+    cursor: RefCell<Option<gdk::Cursor>>,
+    status: RefCell<String>,
+    stats: RefCell<String>,
+}
+
+impl Session {
+    fn new(endpoint: Endpoint) -> Self {
+        Self {
+            name: machine_name(&endpoint).to_string(),
+            endpoint,
+            input_tx: RefCell::new(None),
+            generation: Cell::new(0),
+            retries: Cell::new(0),
+            gave_up: Cell::new(false),
+            remembered: Cell::new(false),
+            stream_size: Cell::new((0, 0)),
+            stream_view: Cell::new((0, 0)),
+            server_view: Cell::new((0, 0)),
+            fps_cap: Cell::new(0),
+            stream_scale: Cell::new(1.0),
+            resize_requested: Cell::new((0, 0)),
+            zoom: Cell::new(1),
+            last_frame: RefCell::new(None),
+            cursor: RefCell::new(None),
+            status: RefCell::new(String::new()),
+            stats: RefCell::new(String::new()),
+        }
+    }
 }
 
 fn main() -> glib::ExitCode {
@@ -163,12 +204,15 @@ fn main() -> glib::ExitCode {
     app.run_with_args(&empty)
 }
 
-/// The endpoint named on the command line, if any.
-fn endpoint_from_cli(cli: &Cli) -> Option<Endpoint> {
-    if let Some(addr) = &cli.connect {
-        return Some(Endpoint::Tcp(addr.clone()));
+/// The endpoints named on the command line, if any.
+fn endpoints_from_cli(cli: &Cli) -> Vec<Endpoint> {
+    if !cli.connect.is_empty() {
+        return cli.connect.iter().cloned().map(Endpoint::Tcp).collect();
     }
-    cli.host.as_deref().map(|host| ssh_endpoint(cli, host))
+    cli.host
+        .iter()
+        .map(|host| ssh_endpoint(cli, host))
+        .collect()
 }
 
 fn ssh_endpoint(cli: &Cli, host: &str) -> Endpoint {
@@ -182,7 +226,7 @@ fn ssh_endpoint(cli: &Cli, host: &str) -> Endpoint {
     Endpoint::Ssh(t)
 }
 
-/// What the address bar shows for an endpoint.
+/// The tab name for an endpoint.
 fn machine_name(endpoint: &Endpoint) -> &str {
     match endpoint {
         Endpoint::Ssh(t) => t.host.as_str(),
@@ -196,8 +240,8 @@ fn window_title(endpoint: &Endpoint) -> String {
     format!("{} — Gliff", machine_name(endpoint))
 }
 
-/// The one window: a header with the machine address bar, the remote
-/// screen (black until connected), and a status line.
+/// The one window: a header with a tab per machine and the address bar, the
+/// remote screen (black until connected), and a status line.
 fn build_ui(app: &adw::Application, cli: &Cli) {
     let window = adw::ApplicationWindow::builder()
         .application(app)
@@ -223,6 +267,15 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
     let address_bar = gtk::Box::builder().css_classes(["linked"]).build();
     address_bar.append(&entry);
     address_bar.append(&connect_btn);
+    let add_revealer = gtk::Revealer::builder()
+        .transition_type(gtk::RevealerTransitionType::SlideRight)
+        .child(&address_bar)
+        .build();
+    let add_btn = gtk::Button::builder()
+        .icon_name("list-add-symbolic")
+        .tooltip_text("Connect to another machine")
+        .css_classes(["flat"])
+        .build();
     let fullscreen_btn = gtk::ToggleButton::builder()
         .icon_name("view-fullscreen-symbolic")
         .build();
@@ -230,22 +283,18 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         .icon_name("utilities-system-monitor-symbolic")
         .tooltip_text("Show stats")
         .build();
-    header.pack_start(&address_bar);
+    let tabs = gtk::Box::builder().spacing(4).build();
+    let tabs_scroller = gtk::ScrolledWindow::builder()
+        .child(&tabs)
+        .hscrollbar_policy(gtk::PolicyType::Automatic)
+        .vscrollbar_policy(gtk::PolicyType::Never)
+        .propagate_natural_width(true)
+        .build();
+    header.pack_start(&tabs_scroller);
+    header.pack_start(&add_btn);
+    header.pack_start(&add_revealer);
     header.pack_end(&fullscreen_btn);
     header.pack_end(&stats_btn);
-
-    // The recent machines drop below the address bar while it has focus.
-    let recent_list = gtk::ListBox::builder()
-        .selection_mode(gtk::SelectionMode::None)
-        .css_classes(["boxed-list"])
-        .build();
-    let recent_popover = gtk::Popover::builder()
-        .child(&recent_list)
-        .autohide(false)
-        .has_arrow(false)
-        .position(gtk::PositionType::Bottom)
-        .build();
-    recent_popover.set_parent(&entry);
 
     let stats = gtk::Label::builder()
         .halign(gtk::Align::Start)
@@ -291,7 +340,6 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         &status,
         &fullscreen_btn,
         &entry,
-        &recent_popover,
     );
 
     let ui = Rc::new(App {
@@ -300,27 +348,16 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         frame,
         stats: stats.clone(),
         status: status.clone(),
+        tabs,
+        add_btn,
+        add_revealer,
         entry: entry.clone(),
-        recent_popover: recent_popover.clone(),
-        recent_list: recent_list.clone(),
         transfers,
-        stream_size: Cell::new((0, 0)),
-        stream_view: Cell::new((0, 0)),
-        server_view: Cell::new((0, 0)),
-        fps_cap: Cell::new(0),
-        stream_scale: Cell::new(1.0),
+        sessions: RefCell::new(Vec::new()),
+        active: RefCell::new(None),
         view_size: Cell::new((0, 0)),
-        resize_requested: Cell::new((0, 0)),
-        zoom: Cell::new(1),
-        input_tx: RefCell::new(None),
         pressed_keys: RefCell::new(BTreeSet::new()),
         released: Cell::new(false),
-        endpoint: RefCell::new(None),
-        retries: Cell::new(0),
-        session: Cell::new(0),
-        connect_btn: connect_btn.clone(),
-        machine: RefCell::new(None),
-        remembered: Cell::new(false),
         config_path: Config::default_path(),
         cli: cli.clone(),
         keymap: keymap::watch(),
@@ -332,7 +369,8 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
     });
     install_input_handlers(&ui, &video, &window, hotkey);
     install_resize_handler(&ui);
-    install_address_bar(&ui);
+    install_address_bar(&ui, &connect_btn);
+    refresh_tabs(&ui);
 
     // Fullscreen toggle.
     {
@@ -353,6 +391,9 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         ".stats { background: rgba(0,0,0,0.6); color: #fff; padding: 6px; margin: 6px; border-radius: 6px; font-family: monospace; }",
         ".transfers { margin: 6px; }",
         ".transfer { background: rgba(0,0,0,0.7); color: #fff; padding: 6px 8px; border-radius: 6px; }",
+        ".machine-tab { border-radius: 6px; }",
+        ".machine-tab.active { background: alpha(currentColor, 0.12); }",
+        ".machine-tab .tab-action { min-width: 24px; min-height: 24px; padding: 0; margin-right: 4px; }",
     ));
     if let Some(display) = gdk::Display::default() {
         gtk::style_context_add_provider_for_display(
@@ -362,28 +403,40 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         );
     }
 
-    // Offer every local clipboard change to the server; our own proxy for
-    // the server's selection does not count as a change.
+    // Offer every local clipboard change to the servers; our own proxy for
+    // a server's selection does not count as a change.
     {
         let ui = ui.clone();
-        clipboard_ui::watch_local(move || ui.input_tx.borrow().clone());
+        clipboard_ui::watch_local(move || {
+            ui.sessions
+                .borrow()
+                .iter()
+                .filter_map(|s| s.input_tx.borrow().clone())
+                .collect()
+        });
     }
 
     window.present();
-    match endpoint_from_cli(cli) {
-        Some(endpoint) => connect_to(&ui, endpoint),
-        None => {
+    for endpoint in endpoints_from_cli(cli) {
+        open_session(&ui, endpoint);
+    }
+    let first = ui.sessions.borrow().first().cloned();
+    match first {
+        Some(first) => show_session(&ui, &first),
+        None if ui.tabs.first_child().is_none() => {
             entry.grab_focus();
         }
+        None => {}
     }
 }
 
 const CONNECT_ICON: &str = "go-next-symbolic";
-const RECONNECT_ICON: &str = "view-refresh-symbolic";
+const STOP_ICON: &str = "media-playback-stop-symbolic";
+const FORGET_ICON: &str = "window-close-symbolic";
 
-/// Wire the address bar: Enter connects to what was typed, Escape gives up
-/// the edit, and the recent machines drop down while it has focus.
-fn install_address_bar(ui: &Rc<App>) {
+/// Wire the address bar: the + expands it, Enter connects to what was
+/// typed, and Escape, or leaving it empty, folds it back into the +.
+fn install_address_bar(ui: &Rc<App>, connect_btn: &gtk::Button) {
     {
         let ui = ui.clone();
         ui.entry
@@ -392,54 +445,28 @@ fn install_address_bar(ui: &Rc<App>) {
     }
     {
         let ui = ui.clone();
-        ui.connect_btn
-            .clone()
-            .connect_clicked(move |_| connect_from_address_bar(&ui));
-    }
-    // The window may become active with the address bar already focused,
-    // as a bare `gliff` does, so the drop-down follows activation too.
-    {
-        let ui = ui.clone();
-        ui.window.clone().connect_is_active_notify(move |w| {
-            if !w.is_active() {
-                ui.recent_popover.popdown();
-                return;
-            }
-            let ui = ui.clone();
-            glib::idle_add_local_once(move || {
-                let in_entry = gtk::prelude::GtkWindowExt::focus(&ui.window)
-                    .is_some_and(|f| f.is_ancestor(&ui.entry));
-                if in_entry {
-                    show_recents(&ui);
-                }
-            });
-        });
+        connect_btn.connect_clicked(move |_| connect_from_address_bar(&ui));
     }
     {
         let ui = ui.clone();
-        ui.recent_list.clone().connect_row_activated(move |_, row| {
-            if let Some(row) = row.downcast_ref::<adw::ActionRow>() {
-                connect_to(&ui, ssh_endpoint(&ui.cli, &row.title()));
-            }
+        ui.add_btn.clone().connect_clicked(move |_| {
+            show_address_bar(&ui, true);
+            ui.entry.grab_focus();
         });
     }
 
     let focus = gtk::EventControllerFocus::new();
     {
         let ui = ui.clone();
-        focus.connect_enter(move |_| show_recents(&ui));
-    }
-    {
-        let ui = ui.clone();
-        // Focus may be moving into the drop-down itself (a click on a row, or
-        // the Down key), so decide once the new focus is known.
+        // Focus may be moving to the connect button, so decide once the new
+        // focus is known.
         focus.connect_leave(move |_| {
             let ui = ui.clone();
             glib::idle_add_local_once(move || {
-                let in_popover = gtk::prelude::GtkWindowExt::focus(&ui.window)
-                    .is_some_and(|w| w.is_ancestor(&ui.recent_popover));
-                if !in_popover {
-                    ui.recent_popover.popdown();
+                let in_bar = gtk::prelude::GtkWindowExt::focus(&ui.window)
+                    .is_some_and(|w| w.is_ancestor(&ui.add_revealer));
+                if !in_bar && ui.entry.text().trim().is_empty() {
+                    show_address_bar(&ui, false);
                 }
             });
         });
@@ -449,24 +476,7 @@ fn install_address_bar(ui: &Rc<App>) {
     let keys = gtk::EventControllerKey::new();
     {
         let ui = ui.clone();
-        keys.connect_key_pressed(move |_, keyval, _, _| match keyval {
-            gdk::Key::Escape => {
-                cancel_address_edit(&ui);
-                glib::Propagation::Stop
-            }
-            gdk::Key::Down if ui.recent_popover.is_visible() => {
-                ui.recent_list.child_focus(gtk::DirectionType::Down);
-                glib::Propagation::Stop
-            }
-            _ => glib::Propagation::Proceed,
-        });
-    }
-    ui.entry.add_controller(keys);
-
-    let list_keys = gtk::EventControllerKey::new();
-    {
-        let ui = ui.clone();
-        list_keys.connect_key_pressed(move |_, keyval, _, _| {
+        keys.connect_key_pressed(move |_, keyval, _, _| {
             if keyval == gdk::Key::Escape {
                 cancel_address_edit(&ui);
                 return glib::Propagation::Stop;
@@ -474,104 +484,364 @@ fn install_address_bar(ui: &Rc<App>) {
             glib::Propagation::Proceed
         });
     }
-    ui.recent_list.add_controller(list_keys);
+    ui.entry.add_controller(keys);
 }
 
-/// Connect to the machine in the address bar. The current machine's own
-/// endpoint is reused, so this also serves as Reconnect.
+/// Show the address bar in place of the +, or fold it back. With no tabs
+/// the address bar is all there is, so it stays.
+fn show_address_bar(ui: &App, show: bool) {
+    let show = show || ui.tabs.first_child().is_none();
+    ui.add_revealer.set_reveal_child(show);
+    ui.add_btn.set_visible(!show);
+}
+
+/// Connect to the machine in the address bar, or switch to its tab when it
+/// is already connected.
 fn connect_from_address_bar(ui: &Rc<App>) {
     let machine = ui.entry.text().trim().to_string();
     if machine.is_empty() {
         return;
     }
-    let current = ui.endpoint.borrow().clone();
-    let endpoint = match current {
-        Some(endpoint) if machine_name(&endpoint) == machine => endpoint,
-        _ => ssh_endpoint(&ui.cli, &machine),
-    };
-    connect_to(ui, endpoint);
+    ui.entry.set_text("");
+    match find_session(ui, &machine) {
+        Some(s) => show_session(ui, &s),
+        None => open_session(ui, ssh_endpoint(&ui.cli, &machine)),
+    }
+    show_address_bar(ui, false);
+    if active(ui).is_some() {
+        ui.video.grab_focus();
+    }
 }
 
-/// Fill the drop-down with the recent machines and show it under the
-/// address bar, unless there are none. Popping up under a window the
-/// compositor has not shown yet stalls GDK, so until the window is active
-/// this does nothing and `install_address_bar` retries on activation.
-fn show_recents(ui: &App) {
-    while let Some(row) = ui.recent_list.first_child() {
-        ui.recent_list.remove(&row);
+/// Give up the edit: empty the address bar, fold it back into the +, and
+/// hand focus back to the remote screen when there is one.
+fn cancel_address_edit(ui: &App) {
+    ui.entry.set_text("");
+    show_address_bar(ui, false);
+    if active(ui).is_some() {
+        ui.video.grab_focus();
+    } else if ui.add_revealer.reveals_child() {
+        ui.entry.grab_focus();
+    } else {
+        gtk::prelude::GtkWindowExt::set_focus(&ui.window, gtk::Widget::NONE);
     }
-    let recent = Config::load(&ui.config_path).recent;
-    if recent.is_empty() || !ui.window.is_active() {
-        ui.recent_popover.popdown();
+}
+
+fn active(ui: &App) -> Option<Rc<Session>> {
+    ui.active.borrow().clone()
+}
+
+fn is_active(ui: &App, s: &Rc<Session>) -> bool {
+    ui.active
+        .borrow()
+        .as_ref()
+        .is_some_and(|a| Rc::ptr_eq(a, s))
+}
+
+fn find_session(ui: &App, name: &str) -> Option<Rc<Session>> {
+    ui.sessions
+        .borrow()
+        .iter()
+        .find(|s| s.name == name)
+        .cloned()
+}
+
+/// The tabs, in order: the remembered machines as arranged, then any session
+/// not remembered yet (a first connect still in progress, or a dev
+/// `--connect`).
+fn tab_names(ui: &App) -> Vec<String> {
+    let mut names = Config::load(&ui.config_path).machines;
+    for s in ui.sessions.borrow().iter() {
+        if !names.contains(&s.name) {
+            names.push(s.name.clone());
+        }
+    }
+    names
+}
+
+/// Rebuild the tabs from the config and the running sessions.
+fn refresh_tabs(ui: &Rc<App>) {
+    while let Some(tab) = ui.tabs.first_child() {
+        ui.tabs.remove(&tab);
+    }
+    for name in tab_names(ui) {
+        ui.tabs.append(&machine_tab(ui, &name));
+    }
+    if ui.tabs.first_child().is_none() {
+        show_address_bar(ui, true);
+    }
+}
+
+/// A machine's tab: its name, which shows that machine, and a button that
+/// appears on hover: stop for a running session, forget for the rest. Tabs
+/// can be dragged into a new order.
+fn machine_tab(ui: &Rc<App>, name: &str) -> gtk::Box {
+    let session = find_session(ui, name);
+    let running = session.is_some();
+    let label = gtk::Button::builder()
+        .label(name)
+        .css_classes(["flat"])
+        .build();
+    if !running {
+        label.add_css_class("dim-label");
+    }
+    let action = gtk::Button::builder()
+        .icon_name(if running { STOP_ICON } else { FORGET_ICON })
+        .tooltip_text(if running { "Disconnect" } else { "Forget" })
+        .css_classes(["flat", "circular", "tab-action"])
+        .valign(gtk::Align::Center)
+        .focus_on_click(false)
+        .opacity(0.0)
+        .can_target(false)
+        .build();
+    let tab = gtk::Box::builder().css_classes(["machine-tab"]).build();
+    if session.as_ref().is_some_and(|s| is_active(ui, s)) {
+        tab.add_css_class("active");
+    }
+    tab.append(&label);
+    tab.append(&action);
+
+    // The action stays allocated while hidden, so the tabs do not shift
+    // under the pointer, but cannot be clicked until it shows.
+    let hover = gtk::EventControllerMotion::new();
+    {
+        let action = action.clone();
+        hover.connect_enter(move |_, _, _| {
+            action.set_opacity(1.0);
+            action.set_can_target(true);
+        });
+    }
+    {
+        let action = action.clone();
+        hover.connect_leave(move |_| {
+            action.set_opacity(0.0);
+            action.set_can_target(false);
+        });
+    }
+    tab.add_controller(hover);
+
+    // The handlers rebuild the tabs, so they run once the click is done
+    // with the widget that received it.
+    {
+        let ui = ui.clone();
+        let name = name.to_string();
+        label.connect_clicked(move |_| {
+            let (ui, name) = (ui.clone(), name.clone());
+            glib::idle_add_local_once(move || select_tab(&ui, &name));
+        });
+    }
+    {
+        let ui = ui.clone();
+        let name = name.to_string();
+        action.connect_clicked(move |_| {
+            let (ui, name) = (ui.clone(), name.clone());
+            glib::idle_add_local_once(move || {
+                if running {
+                    stop_session(&ui, &name);
+                } else {
+                    forget_machine(&ui, &name);
+                }
+            });
+        });
+    }
+
+    // Drag to reorder. The source runs in the capture phase so a drag
+    // starting on the name wins over the button's click and the header's
+    // window move.
+    let drag = gtk::DragSource::builder()
+        .actions(gdk::DragAction::MOVE)
+        .propagation_phase(gtk::PropagationPhase::Capture)
+        .build();
+    {
+        let name = name.to_string();
+        drag.connect_prepare(move |source, x, y| {
+            if let Some(tab) = source.widget() {
+                let icon = gtk::WidgetPaintable::new(Some(&tab));
+                source.set_icon(Some(&icon), x as i32, y as i32);
+            }
+            Some(gdk::ContentProvider::for_value(&name.to_value()))
+        });
+    }
+    tab.add_controller(drag);
+
+    let drop = gtk::DropTarget::new(String::static_type(), gdk::DragAction::MOVE);
+    {
+        let ui = ui.clone();
+        let name = name.to_string();
+        drop.connect_drop(move |target, value, x, _| {
+            let Ok(dragged) = value.get::<String>() else {
+                return false;
+            };
+            let after = target.widget().is_some_and(|w| x > w.width() as f64 / 2.0);
+            let (ui, name) = (ui.clone(), name.clone());
+            glib::idle_add_local_once(move || move_tab(&ui, &dragged, &name, after));
+            true
+        });
+    }
+    tab.add_controller(drop);
+    tab
+}
+
+/// Show a machine's tab: switch to its running session, retrying one whose
+/// reconnects gave up, or connect to it.
+fn select_tab(ui: &Rc<App>, name: &str) {
+    match find_session(ui, name) {
+        Some(s) => {
+            if s.gave_up.get() {
+                s.retries.set(0);
+                s.gave_up.set(false);
+                start_session(ui.clone(), s.clone());
+            }
+            show_session(ui, &s);
+        }
+        None => open_session(ui, ssh_endpoint(&ui.cli, name)),
+    }
+}
+
+/// Connect to `endpoint` in a new session and show it.
+fn open_session(ui: &Rc<App>, endpoint: Endpoint) {
+    let s = Rc::new(Session::new(endpoint));
+    ui.sessions.borrow_mut().push(s.clone());
+    start_session(ui.clone(), s.clone());
+    show_session(ui, &s);
+}
+
+/// Make `s` the session the window shows and sends input to.
+fn show_session(ui: &Rc<App>, s: &Rc<Session>) {
+    if !is_active(ui, s) {
+        release_pressed_keys(ui);
+        *ui.active.borrow_mut() = Some(s.clone());
+    }
+    ui.window.set_title(Some(&window_title(&s.endpoint)));
+    ui.status.set_text(&s.status.borrow());
+    ui.stats.set_text(&s.stats.borrow());
+    match &*s.last_frame.borrow() {
+        Some((texture, view)) => {
+            ui.frame
+                .set_frame(texture.clone(), ui.video.scale_factor(), *view)
+        }
+        None => ui.frame.clear(),
+    }
+    ui.video.set_cursor(s.cursor.borrow().as_ref());
+    // A background session kept the size the window had when it was last
+    // shown.
+    request_resize(ui);
+    request_zoom(ui);
+    refresh_tabs(ui);
+}
+
+/// Show no session: a black screen, as on a fresh window.
+fn show_nothing(ui: &Rc<App>) {
+    release_pressed_keys(ui);
+    ui.active.borrow_mut().take();
+    ui.window.set_title(Some("Gliff"));
+    ui.status.set_text("Not connected");
+    ui.stats.set_text("");
+    ui.frame.clear();
+    ui.video.set_cursor(None);
+    refresh_tabs(ui);
+}
+
+/// End a machine's session. When it was the one shown, the window moves to
+/// the nearest running tab, to the right first.
+fn stop_session(ui: &Rc<App>, name: &str) {
+    let Some(s) = find_session(ui, name) else {
+        return;
+    };
+    let was_active = is_active(ui, &s);
+    if was_active {
+        release_pressed_keys(ui);
+    }
+    // Bumping the generation stops its pollers and pending reconnects, and
+    // dropping the sender closes the worker's input, which ends it.
+    s.generation.set(s.generation.get() + 1);
+    s.input_tx.borrow_mut().take();
+    s.last_frame.borrow_mut().take();
+    let names = tab_names(ui);
+    ui.sessions.borrow_mut().retain(|o| !Rc::ptr_eq(o, &s));
+    if !was_active {
+        refresh_tabs(ui);
         return;
     }
-    for machine in &recent {
-        let row = adw::ActionRow::builder()
-            .title(machine)
-            .activatable(true)
-            .build();
-        ui.recent_list.append(&row);
-    }
-    ui.recent_popover.set_size_request(ui.entry.width(), -1);
-    ui.recent_popover.popup();
-}
-
-/// Put the address bar back to the current machine and, when there is
-/// one, hand focus back to the remote screen.
-fn cancel_address_edit(ui: &App) {
-    let current = ui.endpoint.borrow().clone();
-    ui.entry.set_text(current.as_ref().map_or("", machine_name));
-    ui.recent_popover.popdown();
-    if current.is_some() {
-        ui.video.grab_focus();
-    } else {
-        ui.entry.grab_focus();
+    let at = names.iter().position(|n| *n == s.name).unwrap_or(0);
+    let next = names[at + 1..]
+        .iter()
+        .chain(names[..at].iter().rev())
+        .find_map(|n| find_session(ui, n));
+    match next {
+        Some(next) => show_session(ui, &next),
+        None => show_nothing(ui),
     }
 }
 
-/// Make `endpoint` the window's machine and connect to it, dropping any
-/// session in progress.
-fn connect_to(ui: &Rc<App>, endpoint: Endpoint) {
-    let name = machine_name(&endpoint).to_string();
-    ui.entry.set_text(&name);
-    ui.window.set_title(Some(&window_title(&endpoint)));
-    *ui.machine.borrow_mut() = match &endpoint {
-        Endpoint::Ssh(_) => Some(name),
-        Endpoint::Tcp(_) => None,
-    };
-    ui.remembered.set(false);
-    ui.retries.set(0);
-    ui.connect_btn.set_icon_name(CONNECT_ICON);
-    ui.connect_btn.set_tooltip_text(Some("Connect"));
-    show_disconnected(ui);
-    ui.video.grab_focus();
-    start_session(ui.clone(), endpoint);
+/// Drop a machine that is not running from the remembered list.
+fn forget_machine(ui: &Rc<App>, name: &str) {
+    let mut config = Config::load(&ui.config_path);
+    config.forget(name);
+    save_config(ui, &config);
+    refresh_tabs(ui);
+}
+
+/// Move the dragged tab next to the one it was dropped on. Only remembered
+/// machines have a place to keep.
+fn move_tab(ui: &Rc<App>, dragged: &str, target: &str, after: bool) {
+    let mut config = Config::load(&ui.config_path);
+    if config.move_machine(dragged, target, after) {
+        save_config(ui, &config);
+        refresh_tabs(ui);
+    }
+}
+
+fn save_config(ui: &App, config: &Config) {
+    if let Err(e) = config.save(&ui.config_path) {
+        tracing::warn!(path = %ui.config_path.display(), error = %e, "cannot save config");
+    }
+}
+
+/// Set a session's status line, showing it when the session is.
+fn set_status(ui: &App, s: &Rc<Session>, text: &str) {
+    *s.status.borrow_mut() = text.to_string();
+    if is_active(ui, s) {
+        ui.status.set_text(text);
+    }
+}
+
+fn set_stats(ui: &App, s: &Rc<Session>, text: &str) {
+    *s.stats.borrow_mut() = text.to_string();
+    if is_active(ui, s) {
+        ui.stats.set_text(text);
+    }
 }
 
 /// Go back to a black screen with no stream geometry.
-fn show_disconnected(ui: &App) {
-    ui.frame.clear();
-    ui.stream_size.set((0, 0));
-    ui.stream_view.set((0, 0));
-    ui.server_view.set((0, 0));
-    ui.stats.set_text("");
-    ui.video.set_cursor(None);
+fn show_disconnected(ui: &App, s: &Rc<Session>) {
+    s.last_frame.borrow_mut().take();
+    s.stream_size.set((0, 0));
+    s.stream_view.set((0, 0));
+    s.server_view.set((0, 0));
+    s.cursor.borrow_mut().take();
+    set_stats(ui, s, "");
+    if is_active(ui, s) {
+        ui.frame.clear();
+        ui.video.set_cursor(None);
+    }
 }
 
-/// Start a worker for `endpoint`. Each call is a new session generation;
-/// pollers and reconnects from an older generation stop themselves.
-fn start_session(ui: Rc<App>, endpoint: Endpoint) {
+/// Start a worker for the session. Each call is a new generation; pollers
+/// and reconnects from an older one stop themselves.
+fn start_session(ui: Rc<App>, s: Rc<Session>) {
     let (frame_tx, frame_rx) = sync_channel::<Picture>(2);
     let (status_tx, status_rx) = channel::<Status>();
     let (input_tx, input_rx) = unbounded_channel::<clipboard::ToWorker>();
     // Replacing the sender closes the old worker's input, which ends it.
-    *ui.input_tx.borrow_mut() = Some(input_tx);
-    *ui.endpoint.borrow_mut() = Some(endpoint.clone());
-    ui.zoom.set(1);
-    let session = ui.session.get() + 1;
-    ui.session.set(session);
-    ui.status.set_text("Connecting…");
+    *s.input_tx.borrow_mut() = Some(input_tx);
+    s.zoom.set(1);
+    s.resize_requested.set((0, 0));
+    let generation = s.generation.get() + 1;
+    s.generation.set(generation);
+    set_status(&ui, &s, "Connecting…");
 
+    let endpoint = s.endpoint.clone();
     let video = gliff_sw::VideoMode::resolve(ui.cli.video.as_deref());
     let keymap = ui.keymap.clone();
     std::thread::Builder::new()
@@ -589,60 +859,46 @@ fn start_session(ui: Rc<App>, endpoint: Endpoint) {
         })
         .expect("spawn network thread");
 
-    poll_frames(ui.clone(), frame_rx, session);
-    poll_status(ui, status_rx, session);
+    poll_frames(ui.clone(), s.clone(), frame_rx, generation);
+    poll_status(ui, s, status_rx, generation);
 }
 
 const MAX_RETRIES: u32 = 5;
 
-/// Put this window's machine at the top of the recent list, once per
-/// session. The connected status repeats on every stream reconfigure, such
-/// as a resize.
-fn remember_machine(ui: &App) {
-    let Some(machine) = ui.machine.borrow().clone() else {
-        return;
-    };
-    if ui.remembered.replace(true) {
+/// Add the session's machine to the remembered list, once per session. The
+/// connected status repeats on every stream reconfigure, such as a resize.
+fn remember_machine(ui: &Rc<App>, s: &Session) {
+    if !matches!(s.endpoint, Endpoint::Ssh(_)) || s.remembered.replace(true) {
         return;
     }
     let mut config = Config::load(&ui.config_path);
-    config.touch(&machine);
-    if let Err(e) = config.save(&ui.config_path) {
-        tracing::warn!(path = %ui.config_path.display(), error = %e, "cannot save config");
-    }
+    config.remember(&s.name);
+    save_config(ui, &config);
+    refresh_tabs(ui);
 }
 
 /// Schedule a reconnect after a short delay, unless we have exhausted retries.
-fn schedule_reconnect(ui: Rc<App>, session: u64) {
-    let n = ui.retries.get() + 1;
-    ui.retries.set(n);
+fn schedule_reconnect(ui: Rc<App>, s: Rc<Session>, generation: u64) {
+    let n = s.retries.get() + 1;
+    s.retries.set(n);
     if n > MAX_RETRIES {
-        ui.status
-            .set_text("Disconnected — press Reconnect to retry");
-        offer_reconnect(&ui);
+        set_status(&ui, &s, "Disconnected — click the tab to reconnect");
+        s.gave_up.set(true);
         return;
     }
-    let Some(endpoint) = ui.endpoint.borrow().clone() else {
-        return;
-    };
-    ui.status.set_text(&format!("Reconnecting… (attempt {n})"));
-    let ui2 = ui.clone();
+    set_status(&ui, &s, &format!("Reconnecting… (attempt {n})"));
     glib::timeout_add_local_once(Duration::from_millis(1500), move || {
-        if ui2.session.get() == session {
-            start_session(ui2, endpoint);
+        if s.generation.get() == generation {
+            start_session(ui, s);
         }
     });
 }
 
-fn offer_reconnect(ui: &App) {
-    ui.connect_btn.set_icon_name(RECONNECT_ICON);
-    ui.connect_btn.set_tooltip_text(Some("Reconnect"));
-}
-
-/// Pull decoded frames on the GTK main loop, latest-wins, and paint them.
-fn poll_frames(ui: Rc<App>, rx: Receiver<Picture>, session: u64) {
+/// Pull decoded frames on the GTK main loop, latest-wins. The shown session
+/// paints them; every session keeps its latest for when its tab is shown.
+fn poll_frames(ui: Rc<App>, s: Rc<Session>, rx: Receiver<Picture>, generation: u64) {
     glib::timeout_add_local(Duration::from_millis(8), move || {
-        if ui.session.get() != session {
+        if s.generation.get() != generation {
             return glib::ControlFlow::Break;
         }
         let mut latest = None;
@@ -663,10 +919,14 @@ fn poll_frames(ui: Rc<App>, rx: Receiver<Picture>, session: u64) {
                     // Geometry follows the frame that really paints, so the
                     // pointer never maps against a picture that is not on
                     // screen (a newer config, or a failed import).
-                    ui.stream_size.set(p.stream);
-                    ui.stream_view.set(p.view);
-                    ui.stream_scale.set((p.scale_milli.max(1) as f32) / 1000.0);
-                    ui.frame.set_frame(texture, ui.video.scale_factor(), p.view);
+                    s.stream_size.set(p.stream);
+                    s.stream_view.set(p.view);
+                    s.stream_scale.set((p.scale_milli.max(1) as f32) / 1000.0);
+                    if is_active(&ui, &s) {
+                        ui.frame
+                            .set_frame(texture.clone(), ui.video.scale_factor(), p.view);
+                    }
+                    *s.last_frame.borrow_mut() = Some((texture, p.view));
                 }
                 Err(e) => tracing::warn!(error = %e, "frame texture import failed"),
             }
@@ -720,15 +980,15 @@ fn dmabuf_texture(f: DisplayFrame) -> Result<gdk::Texture, glib::Error> {
     }
 }
 
-fn poll_status(ui: Rc<App>, rx: Receiver<Status>, session: u64) {
+fn poll_status(ui: Rc<App>, s: Rc<Session>, rx: Receiver<Status>, generation: u64) {
     glib::timeout_add_local(Duration::from_millis(100), move || {
-        if ui.session.get() != session {
+        if s.generation.get() != generation {
             return glib::ControlFlow::Break;
         }
-        while let Ok(s) = rx.try_recv() {
-            match s {
+        while let Ok(status) = rx.try_recv() {
+            match status {
                 // Pointer-mapping geometry (stream_size/view/scale) is not
-                // read from the config: it follows each painted frame, so a
+                // read from the config: it follows each decoded frame, so a
                 // new config never remaps clicks against the old picture.
                 Status::Connected {
                     video,
@@ -736,20 +996,23 @@ fn poll_status(ui: Rc<App>, rx: Receiver<Status>, session: u64) {
                     view_height,
                     fps_cap,
                 } => {
-                    ui.server_view.set((view_width, view_height));
-                    ui.fps_cap.set(fps_cap);
-                    ui.resize_requested.set((0, 0));
-                    ui.retries.set(0);
-                    ui.status
-                        .set_text(&format!("Connected — {view_width}x{view_height}"));
+                    s.server_view.set((view_width, view_height));
+                    s.fps_cap.set(fps_cap);
+                    s.resize_requested.set((0, 0));
+                    s.retries.set(0);
+                    s.gave_up.set(false);
+                    set_status(&ui, &s, &format!("Connected — {view_width}x{view_height}"));
                     // Visible before the first per-second stats arrive.
-                    ui.stats.set_text(&video);
-                    remember_machine(&ui);
+                    set_stats(&ui, &s, &video);
+                    remember_machine(&ui, &s);
                     // A fresh server starts at its own default size; a
                     // reconnect must bring it back to the window. The gate
                     // compares against the view, so a server-chosen
-                    // reduced-resolution stream never triggers one.
-                    request_resize(&ui);
+                    // reduced-resolution stream never triggers one. A
+                    // background session is resized when it is shown.
+                    if is_active(&ui, &s) {
+                        request_resize(&ui);
+                    }
                 }
                 Status::Stats {
                     fps,
@@ -757,17 +1020,21 @@ fn poll_status(ui: Rc<App>, rx: Receiver<Status>, session: u64) {
                     decode_ms,
                     video,
                 } => {
-                    let (sw, sh) = ui.stream_size.get();
-                    let (vw, vh) = ui.stream_view.get();
+                    let (sw, sh) = s.stream_size.get();
+                    let (vw, vh) = s.stream_view.get();
                     let stream = if (sw, sh) == (vw, vh) {
                         format!("{sw}x{sh}")
                     } else {
                         format!("{sw}x{sh} → {vw}x{vh}")
                     };
-                    let cap = ui.fps_cap.get();
-                    ui.stats.set_text(&format!(
-                        "{video}  {fps:.0} fps  {mbit:.1} Mbit/s  decode {decode_ms:.1} ms  {stream} @{cap}"
-                    ));
+                    let cap = s.fps_cap.get();
+                    set_stats(
+                        &ui,
+                        &s,
+                        &format!(
+                            "{video}  {fps:.0} fps  {mbit:.1} Mbit/s  decode {decode_ms:.1} ms  {stream} @{cap}"
+                        ),
+                    );
                 }
                 Status::Cursor {
                     width,
@@ -775,21 +1042,34 @@ fn poll_status(ui: Rc<App>, rx: Receiver<Status>, session: u64) {
                     hot_x,
                     hot_y,
                     argb,
-                } => set_remote_cursor(&ui, width, height, hot_x, hot_y, &argb),
+                } => set_remote_cursor(
+                    &ui,
+                    &s,
+                    CursorImage {
+                        width,
+                        height,
+                        hot_x,
+                        hot_y,
+                        argb: &argb,
+                    },
+                ),
+                // Only the shown machine may take over the local clipboard.
                 Status::ClipboardOffer {
                     serial,
                     mime_types,
                     files,
                 } => {
-                    if let Some(tx) = ui.input_tx.borrow().as_ref() {
-                        clipboard_ui::set_remote_offer(tx, serial, mime_types, files);
+                    if is_active(&ui, &s) {
+                        if let Some(tx) = s.input_tx.borrow().as_ref() {
+                            clipboard_ui::set_remote_offer(tx, serial, mime_types, files);
+                        }
                     }
                 }
                 Status::ClipboardRead { mime_type, reply } => {
                     clipboard_ui::read_local(mime_type, reply)
                 }
                 Status::ClipboardTransfer { id, progress } => {
-                    let cancel_via = ui.clone();
+                    let cancel_via = s.clone();
                     ui.transfers.update(id, &progress, move |id| {
                         if let Some(tx) = cancel_via.input_tx.borrow().clone() {
                             let _ = tx.send(clipboard::ToWorker::CancelTransfer(id));
@@ -797,22 +1077,22 @@ fn poll_status(ui: Rc<App>, rx: Receiver<Status>, session: u64) {
                     });
                 }
                 Status::Error(e) => {
-                    tracing::error!(error = %e, "connection failed");
-                    ui.status.set_text(&format!("Error: {e}"));
-                    show_disconnected(&ui);
-                    schedule_reconnect(ui.clone(), session);
+                    tracing::error!(machine = %s.name, error = %e, "connection failed");
+                    set_status(&ui, &s, &format!("Error: {e}"));
+                    show_disconnected(&ui, &s);
+                    schedule_reconnect(ui.clone(), s.clone(), generation);
                     return glib::ControlFlow::Break;
                 }
                 Status::Incompatible(message) => {
-                    tracing::error!(error = %message, "incompatible server");
-                    ui.status.set_text(&message);
-                    show_disconnected(&ui);
-                    offer_reconnect(&ui);
+                    tracing::error!(machine = %s.name, error = %message, "incompatible server");
+                    set_status(&ui, &s, &message);
+                    show_disconnected(&ui, &s);
+                    s.gave_up.set(true);
                     return glib::ControlFlow::Break;
                 }
                 Status::Closed => {
-                    show_disconnected(&ui);
-                    schedule_reconnect(ui.clone(), session);
+                    show_disconnected(&ui, &s);
+                    schedule_reconnect(ui.clone(), s.clone(), generation);
                     return glib::ControlFlow::Break;
                 }
             }
@@ -826,14 +1106,36 @@ fn poll_status(ui: Rc<App>, rx: Receiver<Status>, session: u64) {
 /// An image with no visible shape (fully transparent, or one flat colour as
 /// Hyprland sends when it has no cursor image to share) falls back to the
 /// default pointer so the user is never left without one.
-fn set_remote_cursor(ui: &App, width: u32, height: u32, hot_x: i32, hot_y: i32, argb: &[u8]) {
+fn set_remote_cursor(ui: &App, s: &Rc<Session>, image: CursorImage) {
+    let cursor = remote_cursor(image);
+    if is_active(ui, s) {
+        ui.video.set_cursor(cursor.as_ref());
+    }
+    *s.cursor.borrow_mut() = cursor;
+}
+
+struct CursorImage<'a> {
+    width: u32,
+    height: u32,
+    hot_x: i32,
+    hot_y: i32,
+    argb: &'a [u8],
+}
+
+fn remote_cursor(image: CursorImage) -> Option<gdk::Cursor> {
+    let CursorImage {
+        width,
+        height,
+        hot_x,
+        hot_y,
+        argb,
+    } = image;
     let needed = width as u64 * height as u64 * 4;
     if width == 0 || height == 0 || width > 1024 || height > 1024 || (argb.len() as u64) < needed {
-        return;
+        return None;
     }
     if !has_visible_shape(argb) {
-        ui.video.set_cursor(None);
-        return;
+        return None;
     }
     let bytes = glib::Bytes::from(argb);
     let texture = gdk::MemoryTexture::new(
@@ -843,8 +1145,7 @@ fn set_remote_cursor(ui: &App, width: u32, height: u32, hot_x: i32, hot_y: i32, 
         &bytes,
         width as usize * 4,
     );
-    let cursor = gdk::Cursor::from_texture(&texture, hot_x, hot_y, None);
-    ui.video.set_cursor(Some(&cursor));
+    Some(gdk::Cursor::from_texture(&texture, hot_x, hot_y, None))
 }
 
 fn has_visible_shape(argb: &[u8]) -> bool {
@@ -862,8 +1163,11 @@ fn has_visible_shape(argb: &[u8]) -> bool {
 /// (a reduced-resolution stream is stretched to the view box), then divide
 /// by the remote scale, which is what the virtual pointer expects.
 fn to_remote(ui: &App, x: f64, y: f64) -> (f64, f64) {
-    let (rw, rh) = ui.stream_size.get();
-    let (vw, vh) = ui.stream_view.get();
+    let Some(s) = active(ui) else {
+        return (0.0, 0.0);
+    };
+    let (rw, rh) = s.stream_size.get();
+    let (vw, vh) = s.stream_view.get();
     if rw == 0 || rh == 0 {
         return (0.0, 0.0);
     }
@@ -876,12 +1180,18 @@ fn to_remote(ui: &App, x: f64, y: f64) -> (f64, f64) {
     let vy = (y - l.y) / l.factor * device as f64;
     let px = (vx * rw as f64 / vw as f64).clamp(0.0, rw as f64);
     let py = (vy * rh as f64 / vh as f64).clamp(0.0, rh as f64);
-    let scale = ui.stream_scale.get().max(0.01) as f64;
+    let scale = s.stream_scale.get().max(0.01) as f64;
     (px / scale, py / scale)
 }
 
 fn send(ui: &App, msg: ClientMsg) {
-    if let Some(tx) = ui.input_tx.borrow().as_ref() {
+    if let Some(s) = active(ui) {
+        send_to(&s, msg);
+    }
+}
+
+fn send_to(s: &Session, msg: ClientMsg) {
+    if let Some(tx) = s.input_tx.borrow().as_ref() {
         let _ = tx.send(clipboard::ToWorker::Send(msg));
     }
 }
@@ -1034,17 +1344,10 @@ fn key_from_name(name: &str) -> Result<gdk::Key, String> {
 
 /// Give the keyboard back to the local compositor by dropping video focus,
 /// which fires the focus-leave handler that restores system shortcuts.
-/// True while the address bar is in use: it holds the focus, or its
-/// recent-machines drop-down is up. GTK4 focuses the text inside the entry,
-/// so ask the window for the focus widget and walk up.
-fn address_bar_in_use(
-    window: &adw::ApplicationWindow,
-    entry: &gtk::Entry,
-    recent_popover: &gtk::Popover,
-) -> bool {
-    recent_popover.is_visible()
-        || gtk::prelude::GtkWindowExt::focus(window)
-            .is_some_and(|f| f == *entry || f.is_ancestor(entry))
+/// True while the address bar holds the focus. GTK4 focuses the text inside
+/// the entry, so ask the window for the focus widget and walk up.
+fn address_bar_in_use(window: &adw::ApplicationWindow, entry: &gtk::Entry) -> bool {
+    gtk::prelude::GtkWindowExt::focus(window).is_some_and(|f| f == *entry || f.is_ancestor(entry))
 }
 
 fn release_capture(ui: &App, window: &adw::ApplicationWindow) {
@@ -1154,7 +1457,9 @@ fn install_input_handlers(
         let ui = ui.clone();
         let video = video.clone();
         motion.connect_enter(move |_, _, _| {
-            if !ui.released.get() && !address_bar_in_use(&ui.window, &ui.entry, &ui.recent_popover)
+            if active(&ui).is_some()
+                && !ui.released.get()
+                && !address_bar_in_use(&ui.window, &ui.entry)
             {
                 video.grab_focus();
             }
@@ -1281,10 +1586,8 @@ fn install_input_handlers(
 
 /// In fullscreen the header and status bars leave the layout, so the picture
 /// gets the whole screen, and slide in over it while the pointer is at the
-/// top or bottom edge. The header stays while the address bar is in use:
-/// its recent-machines popover is a separate surface, so the pointer moving
-/// into it looks like leaving the window.
-#[allow(clippy::too_many_arguments)]
+/// top or bottom edge. The header stays while the address bar is in use, so
+/// it does not slide away under a half-typed machine.
 fn install_fullscreen_bars(
     window: &adw::ApplicationWindow,
     content: &gtk::Box,
@@ -1293,11 +1596,10 @@ fn install_fullscreen_bars(
     status: &gtk::Label,
     fullscreen_btn: &gtk::ToggleButton,
     entry: &gtk::Entry,
-    recent_popover: &gtk::Popover,
 ) {
     let address_bar_in_use = {
-        let (window, entry, popover) = (window.clone(), entry.clone(), recent_popover.clone());
-        Rc::new(move || address_bar_in_use(&window, &entry, &popover))
+        let (window, entry) = (window.clone(), entry.clone());
+        Rc::new(move || address_bar_in_use(&window, &entry))
     };
     let top = gtk::Revealer::builder()
         .transition_type(gtk::RevealerTransitionType::SlideDown)
@@ -1382,9 +1684,9 @@ fn install_fullscreen_bars(
 
     // Keyboard dismissal (Escape, Enter) moves focus without a pointer
     // event; hide the header then, unless the pointer still rests on it.
-    let hide_when_free = {
+    {
         let (window, top, header) = (window.clone(), top.clone(), header.clone());
-        Rc::new(move || {
+        window.clone().connect_focus_widget_notify(move |_| {
             if !window.is_fullscreen() || address_bar_in_use() {
                 return;
             }
@@ -1396,13 +1698,8 @@ fn install_fullscreen_bars(
             if !pointer_on_header {
                 top.set_reveal_child(false);
             }
-        })
-    };
-    {
-        let hide = hide_when_free.clone();
-        window.connect_focus_widget_notify(move |_| hide());
+        });
     }
-    recent_popover.connect_hide(move |_| hide_when_free());
 }
 
 /// Ask the server to match the window, once the size has settled for 200 ms
@@ -1438,18 +1735,22 @@ fn install_resize_handler(ui: &Rc<App>) {
 /// differs from the last request. The view comes from the latest
 /// StreamConfig, falling back to the last painted frame.
 fn request_zoom(ui: &App) {
-    let mut view = ui.server_view.get();
+    let Some(s) = active(ui) else {
+        return;
+    };
+    let mut view = s.server_view.get();
     if view == (0, 0) {
-        view = ui.stream_view.get();
+        view = s.stream_view.get();
     }
     let device = ui.video.scale_factor().max(1);
     let (aw, ah) = (ui.video.width() as f64, ui.video.height() as f64);
     let want = paintable::layout(view, device, aw, ah).map_or(1, |l| l.zoom());
-    if want == ui.zoom.get() {
+    if want == s.zoom.get() {
         return;
     }
-    ui.zoom.set(want);
-    if let Some(tx) = ui.input_tx.borrow().as_ref() {
+    s.zoom.set(want);
+    let tx = s.input_tx.borrow().clone();
+    if let Some(tx) = tx {
         let _ = tx.send(clipboard::ToWorker::Zoom(want));
     }
 }
@@ -1459,17 +1760,17 @@ fn request_zoom(ui: &App) {
 /// chose to send at reduced resolution is not a size mismatch, and asking
 /// again would fight the server's own choice.
 fn request_resize(ui: &App) {
+    let Some(s) = active(ui) else {
+        return;
+    };
     let size = ui.view_size.get();
-    if size.0 < 64
-        || size.1 < 64
-        || size == ui.server_view.get()
-        || size == ui.resize_requested.get()
+    if size.0 < 64 || size.1 < 64 || size == s.server_view.get() || size == s.resize_requested.get()
     {
         return;
     }
-    ui.resize_requested.set(size);
-    send(
-        ui,
+    s.resize_requested.set(size);
+    send_to(
+        &s,
         ClientMsg::Resize {
             width: size.0,
             height: size.1,
