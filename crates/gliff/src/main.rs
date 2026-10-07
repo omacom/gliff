@@ -396,8 +396,8 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         ".machine-tab { border-radius: 8px; }",
         ".machine-tab:hover { background: alpha(currentColor, 0.07); }",
         ".machine-tab.active { background: alpha(currentColor, 0.14); }",
-        ".machine-tab > button { background: none; box-shadow: none; min-height: 0; }",
-        ".machine-tab > button.tab-label { padding: 5px 2px 5px 12px; }",
+        ".machine-tab > .tab-label { padding: 5px 2px 5px 12px; font-weight: bold; }",
+        ".machine-tab > button { background: none; border: none; outline: none; box-shadow: none; min-height: 0; }",
         ".machine-tab > button.tab-action { padding: 0; min-width: 22px; min-height: 22px; margin-right: 4px; color: alpha(currentColor, 0.55); -gtk-icon-size: 12px; }",
         ".machine-tab > button.tab-action:hover { color: currentColor; }",
     ));
@@ -584,7 +584,9 @@ fn refresh_tabs(ui: &Rc<App>) {
 fn machine_tab(ui: &Rc<App>, name: &str) -> gtk::Box {
     let session = find_session(ui, name);
     let running = session.is_some();
-    let label = gtk::Button::builder()
+    // The name is a plain label and the whole tab takes the click, so no
+    // part of a tab takes keyboard focus and grows a focus ring.
+    let label = gtk::Label::builder()
         .label(name)
         .css_classes(["tab-label"])
         .build();
@@ -596,7 +598,7 @@ fn machine_tab(ui: &Rc<App>, name: &str) -> gtk::Box {
         .tooltip_text(if running { "Disconnect" } else { "Forget" })
         .css_classes(["tab-action"])
         .valign(gtk::Align::Center)
-        .focus_on_click(false)
+        .focusable(false)
         .opacity(0.0)
         .can_target(false)
         .build();
@@ -628,14 +630,18 @@ fn machine_tab(ui: &Rc<App>, name: &str) -> gtk::Box {
 
     // The handlers rebuild the tabs, so they run once the click is done
     // with the widget that received it.
+    // The action button claims its own clicks, so this sees only the rest
+    // of the tab.
+    let click = gtk::GestureClick::builder().button(1).build();
     {
         let ui = ui.clone();
         let name = name.to_string();
-        label.connect_clicked(move |_| {
+        click.connect_released(move |_, _, _, _| {
             let (ui, name) = (ui.clone(), name.clone());
             glib::idle_add_local_once(move || select_tab(&ui, &name));
         });
     }
+    tab.add_controller(click);
     {
         let ui = ui.clone();
         let name = name.to_string();
