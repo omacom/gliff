@@ -87,7 +87,16 @@ struct App {
     /// What the picture shows: the latest frame at an integer scale.
     frame: paintable::FramePaintable,
     stats: gtk::Label,
+    /// Centred over the picture while the shown session is not streaming:
+    /// connecting, reconnecting, an error, or no session at all.
     status: gtk::Label,
+    /// A short-lived note near the bottom of the picture, such as how to
+    /// release the captured shortcuts.
+    hint: gtk::Label,
+    /// Bumped by every hint, so a newer one is not hidden by an older timer.
+    hint_generation: Cell<u64>,
+    /// The capture hint shows once per window, not on every pointer entry.
+    capture_hinted: Cell<bool>,
     /// A tab per machine, to the left of the address bar.
     tabs: gtk::Box,
     /// Expands into the address bar; hidden while the address bar shows.
@@ -245,7 +254,7 @@ fn window_title(endpoint: &Endpoint) -> String {
 }
 
 /// The one window: a header with a tab per machine and the address bar, the
-/// remote screen (black until connected), and a status line.
+/// remote screen (black until connected) with any status over it.
 fn build_ui(app: &adw::Application, cli: &Cli) {
     let window = adw::ApplicationWindow::builder()
         .application(app)
@@ -309,7 +318,22 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         .bind_property("active", &stats, "visible")
         .sync_create()
         .build();
-    let status = gtk::Label::builder().label("Not connected").build();
+    let status = gtk::Label::builder()
+        .label("Not connected")
+        .halign(gtk::Align::Center)
+        .valign(gtk::Align::Center)
+        .wrap(true)
+        .justify(gtk::Justification::Center)
+        .can_target(false)
+        .css_classes(["status-message"])
+        .build();
+    let hint = gtk::Label::builder()
+        .halign(gtk::Align::Center)
+        .valign(gtk::Align::End)
+        .visible(false)
+        .can_target(false)
+        .css_classes(["hint"])
+        .build();
 
     // The video is a plain Picture given the whole allocation (Fill); the
     // paintable places the frame itself at an integer scale, see
@@ -330,18 +354,18 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
     overlay.set_child(Some(&video));
     overlay.add_overlay(&stats);
     overlay.add_overlay(transfers.widget());
+    overlay.add_overlay(&status);
+    overlay.add_overlay(&hint);
 
     let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
     content.append(&header);
     content.append(&overlay);
-    content.append(&status);
     window.set_content(Some(&content));
     install_fullscreen_bars(
         &window,
         &content,
         &overlay,
         &header,
-        &status,
         &fullscreen_btn,
         &entry,
     );
@@ -352,6 +376,9 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         frame,
         stats: stats.clone(),
         status: status.clone(),
+        hint,
+        hint_generation: Cell::new(0),
+        capture_hinted: Cell::new(false),
         tabs,
         add_btn,
         add_revealer,
@@ -391,7 +418,8 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
     let css = gtk::CssProvider::new();
     css.load_from_string(concat!(
         ".video { background: #000; }",
-        ".floating-status { background: var(--headerbar-bg-color); padding: 4px; }",
+        ".status-message { color: rgba(255,255,255,0.7); font-size: 1.15em; margin: 24px; }",
+        ".hint { background: rgba(0,0,0,0.7); color: #fff; padding: 6px 14px; border-radius: 999px; margin-bottom: 24px; }",
         ".stats { background: rgba(0,0,0,0.6); color: #fff; padding: 6px; margin: 6px; border-radius: 6px; font-family: monospace; }",
         ".transfers { margin: 6px; }",
         ".transfer { background: rgba(0,0,0,0.7); color: #fff; padding: 6px 8px; border-radius: 6px; }",
@@ -441,6 +469,9 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
             open_session(&ui, endpoint);
         }
     }
+    // The address bar showed for the empty tabs; with sessions open it
+    // folds into the +.
+    show_address_bar(&ui, false);
     let first = from_cli
         .first()
         .map(|e| machine_name(e).to_string())
@@ -519,6 +550,11 @@ fn show_address_bar(ui: &App, show: bool) {
     let show = show || ui.tabs.first_child().is_none();
     ui.add_revealer.set_reveal_child(show);
     ui.add_btn.set_visible(!show);
+    // A folded address bar must not keep the focus GTK gave it when the
+    // window opened, or hovering the picture would never capture.
+    if !show && address_bar_in_use(&ui.window, &ui.entry) {
+        gtk::prelude::GtkWindowExt::set_focus(&ui.window, gtk::Widget::NONE);
+    }
 }
 
 /// Connect to the machine in the address bar, or switch to its tab when it
@@ -780,7 +816,7 @@ fn show_session(ui: &Rc<App>, s: &Rc<Session>) {
         }
     }
     ui.window.set_title(Some(&window_title(&s.endpoint)));
-    ui.status.set_text(&s.status.borrow());
+    show_status(ui, &s.status.borrow());
     ui.stats.set_text(&s.stats.borrow());
     match &*s.last_frame.borrow() {
         Some((texture, view)) => {
@@ -802,7 +838,7 @@ fn show_nothing(ui: &Rc<App>) {
     release_pressed_keys(ui);
     ui.active.borrow_mut().take();
     ui.window.set_title(Some("Gliff"));
-    ui.status.set_text("Not connected");
+    show_status(ui, "Not connected");
     ui.stats.set_text("");
     ui.frame.clear();
     ui.video.set_cursor(None);
@@ -871,12 +907,32 @@ fn save_config(ui: &App, config: &Config) {
     }
 }
 
-/// Set a session's status line, showing it when the session is.
+/// Set a session's status, showing it when the session is. A streaming
+/// session has none.
 fn set_status(ui: &App, s: &Rc<Session>, text: &str) {
     *s.status.borrow_mut() = text.to_string();
     if is_active(ui, s) {
-        ui.status.set_text(text);
+        show_status(ui, text);
     }
+}
+
+fn show_status(ui: &App, text: &str) {
+    ui.status.set_text(text);
+    ui.status.set_visible(!text.is_empty());
+}
+
+/// Show a note near the bottom of the picture for a few seconds.
+fn show_hint(ui: &Rc<App>, text: &str) {
+    let generation = ui.hint_generation.get() + 1;
+    ui.hint_generation.set(generation);
+    ui.hint.set_text(text);
+    ui.hint.set_visible(true);
+    let ui = ui.clone();
+    glib::timeout_add_local_once(Duration::from_millis(2500), move || {
+        if ui.hint_generation.get() == generation {
+            ui.hint.set_visible(false);
+        }
+    });
 }
 
 fn set_stats(ui: &App, s: &Rc<Session>, text: &str) {
@@ -1082,7 +1138,7 @@ fn poll_status(ui: Rc<App>, s: Rc<Session>, rx: Receiver<Status>, generation: u6
                     if !s.connected.replace(true) {
                         refresh_tabs(&ui);
                     }
-                    set_status(&ui, &s, &format!("Connected — {view_width}x{view_height}"));
+                    set_status(&ui, &s, "");
                     // Visible before the first per-second stats arrive.
                     set_stats(&ui, &s, &video);
                     remember_machine(&ui, &s);
@@ -1425,17 +1481,19 @@ fn key_from_name(name: &str) -> Result<gdk::Key, String> {
 
 /// Give the keyboard back to the local compositor by dropping video focus,
 /// which fires the focus-leave handler that restores system shortcuts.
-/// True while the address bar holds the focus. GTK4 focuses the text inside
-/// the entry, so ask the window for the focus widget and walk up.
+/// True while the address bar shows and holds the focus. GTK4 focuses the
+/// text inside the entry, so ask the window for the focus widget and walk
+/// up; a folded address bar is unmapped.
 fn address_bar_in_use(window: &adw::ApplicationWindow, entry: &gtk::Entry) -> bool {
-    gtk::prelude::GtkWindowExt::focus(window).is_some_and(|f| f == *entry || f.is_ancestor(entry))
+    entry.is_mapped()
+        && gtk::prelude::GtkWindowExt::focus(window)
+            .is_some_and(|f| f == *entry || f.is_ancestor(entry))
 }
 
-fn release_capture(ui: &App, window: &adw::ApplicationWindow) {
+fn release_capture(ui: &Rc<App>, window: &adw::ApplicationWindow) {
     ui.released.set(true);
     gtk::prelude::GtkWindowExt::set_focus(window, gtk::Widget::NONE);
-    ui.status
-        .set_text("Shortcuts released — click the screen to capture again");
+    show_hint(ui, "Shortcuts released — click the screen to capture again");
 }
 
 /// Release every key held on the remote. Once the video loses focus their
@@ -1648,7 +1706,9 @@ fn install_input_handlers(
                 });
             }
             if let Some(hint) = &hint {
-                ui.status.set_text(hint);
+                if !ui.capture_hinted.replace(true) {
+                    show_hint(&ui, hint);
+                }
             }
         });
     }
@@ -1666,16 +1726,14 @@ fn install_input_handlers(
     video.add_controller(focus);
 }
 
-/// In fullscreen the header and status bars leave the layout, so the picture
-/// gets the whole screen, and slide in over it while the pointer is at the
-/// top or bottom edge. The header stays while the address bar is in use, so
+/// In fullscreen the header leaves the layout, so the picture gets the whole
+/// screen, and slides in over it while the pointer is at the top edge. The header stays while the address bar is in use, so
 /// it does not slide away under a half-typed machine.
 fn install_fullscreen_bars(
     window: &adw::ApplicationWindow,
     content: &gtk::Box,
     overlay: &gtk::Overlay,
     header: &adw::HeaderBar,
-    status: &gtk::Label,
     fullscreen_btn: &gtk::ToggleButton,
     entry: &gtk::Entry,
 ) {
@@ -1687,16 +1745,11 @@ fn install_fullscreen_bars(
         .transition_type(gtk::RevealerTransitionType::SlideDown)
         .valign(gtk::Align::Start)
         .build();
-    let bottom = gtk::Revealer::builder()
-        .transition_type(gtk::RevealerTransitionType::SlideUp)
-        .valign(gtk::Align::End)
-        .build();
     overlay.add_overlay(&top);
-    overlay.add_overlay(&bottom);
 
     {
-        let (content, header, status) = (content.clone(), header.clone(), status.clone());
-        let (top, bottom, fullscreen_btn) = (top.clone(), bottom.clone(), fullscreen_btn.clone());
+        let (content, header) = (content.clone(), header.clone());
+        let (top, fullscreen_btn) = (top.clone(), fullscreen_btn.clone());
         window.connect_fullscreened_notify(move |w| {
             let full = w.is_fullscreen();
             if fullscreen_btn.is_active() != full {
@@ -1704,18 +1757,11 @@ fn install_fullscreen_bars(
             }
             if full {
                 content.remove(&header);
-                content.remove(&status);
                 top.set_child(Some(&header));
-                bottom.set_child(Some(&status));
-                status.add_css_class("floating-status");
             } else {
                 top.set_reveal_child(false);
-                bottom.set_reveal_child(false);
                 top.set_child(None::<&gtk::Widget>);
-                bottom.set_child(None::<&gtk::Widget>);
-                status.remove_css_class("floating-status");
                 content.prepend(&header);
-                content.append(&status);
             }
         });
     }
@@ -1724,19 +1770,12 @@ fn install_fullscreen_bars(
     const LEAVE_MARGIN: f64 = 8.0;
     let motion = gtk::EventControllerMotion::new();
     {
-        let (window, overlay, header, status) = (
-            window.clone(),
-            overlay.clone(),
-            header.clone(),
-            status.clone(),
-        );
-        let (top, bottom) = (top.clone(), bottom.clone());
+        let (window, header, top) = (window.clone(), header.clone(), top.clone());
         let address_bar_in_use = address_bar_in_use.clone();
         motion.connect_motion(move |_, _, y| {
             if !window.is_fullscreen() {
                 return;
             }
-            let h = overlay.height() as f64;
             if y <= EDGE {
                 top.set_reveal_child(true);
             } else if top.reveals_child()
@@ -1745,21 +1784,15 @@ fn install_fullscreen_bars(
             {
                 top.set_reveal_child(false);
             }
-            if y >= h - EDGE {
-                bottom.set_reveal_child(true);
-            } else if bottom.reveals_child() && y < h - status.height() as f64 - LEAVE_MARGIN {
-                bottom.set_reveal_child(false);
-            }
         });
     }
     {
-        let (top, bottom) = (top.clone(), bottom.clone());
+        let top = top.clone();
         let address_bar_in_use = address_bar_in_use.clone();
         motion.connect_leave(move |_| {
             if !address_bar_in_use() {
                 top.set_reveal_child(false);
             }
-            bottom.set_reveal_child(false);
         });
     }
     overlay.add_controller(motion);
