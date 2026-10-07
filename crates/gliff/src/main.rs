@@ -133,6 +133,9 @@ struct Session {
     gave_up: Cell<bool>,
     /// Recorded in the config on the first successful connect.
     remembered: Cell<bool>,
+    /// The server is streaming: set by its Connected status, cleared when
+    /// the connection drops.
+    connected: Cell<bool>,
     /// Size of the stream the server is sending, from the last decoded frame.
     stream_size: Cell<(u32, u32)>,
     /// The full-quality fit size the stream is drawn into; equals the stream
@@ -167,6 +170,7 @@ impl Session {
             retries: Cell::new(0),
             gave_up: Cell::new(false),
             remembered: Cell::new(false),
+            connected: Cell::new(false),
             stream_size: Cell::new((0, 0)),
             stream_view: Cell::new((0, 0)),
             server_view: Cell::new((0, 0)),
@@ -400,6 +404,8 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         ".machine-tab > button { background: none; border: none; outline: none; box-shadow: none; min-height: 0; }",
         ".machine-tab > button.tab-action { padding: 0; min-width: 22px; min-height: 22px; margin-right: 4px; color: alpha(currentColor, 0.55); -gtk-icon-size: 12px; }",
         ".machine-tab > button.tab-action:hover { color: currentColor; }",
+        ".status-dot { min-width: 6px; min-height: 6px; border-radius: 50%; border: 1.5px solid alpha(currentColor, 0.6); }",
+        ".status-dot.connected { background: var(--success-color); border-color: var(--success-color); }",
     ));
     if let Some(display) = gdk::Display::default() {
         gtk::style_context_add_provider_for_display(
@@ -599,13 +605,29 @@ fn machine_tab(ui: &Rc<App>, name: &str) -> gtk::Box {
     if !running {
         label.add_css_class("dim-label");
     }
+    // The slot on the right shows whether the machine is connected, and
+    // turns into its button while the pointer is on the tab.
+    let connected = session.as_ref().is_some_and(|s| s.connected.get());
+    let dot = gtk::Box::builder()
+        .css_classes(["status-dot"])
+        .halign(gtk::Align::Center)
+        .valign(gtk::Align::Center)
+        .build();
+    if connected {
+        dot.add_css_class("connected");
+    }
+    let slot = gtk::Stack::new();
+    slot.add_named(&dot, Some("status"));
+    slot.add_named(
+        &gtk::Image::from_icon_name(if running { STOP_ICON } else { FORGET_ICON }),
+        Some("action"),
+    );
     let action = gtk::Button::builder()
-        .icon_name(if running { STOP_ICON } else { FORGET_ICON })
-        .tooltip_text(if running { "Disconnect" } else { "Forget" })
+        .child(&slot)
+        .tooltip_text(if connected { "Connected" } else { "Not connected" })
         .css_classes(["tab-action"])
         .valign(gtk::Align::Center)
         .focusable(false)
-        .opacity(0.0)
         .can_target(false)
         .build();
     let tab = gtk::Box::builder().css_classes(["machine-tab"]).build();
@@ -615,29 +637,29 @@ fn machine_tab(ui: &Rc<App>, name: &str) -> gtk::Box {
     tab.append(&label);
     tab.append(&action);
 
-    // The action stays allocated while hidden, so the tabs do not shift
-    // under the pointer, but cannot be clicked until it shows.
+    // The button can be clicked only while it shows.
     let hover = gtk::EventControllerMotion::new();
     {
-        let action = action.clone();
+        let (action, slot) = (action.clone(), slot.clone());
         hover.connect_enter(move |_, _, _| {
-            action.set_opacity(1.0);
+            slot.set_visible_child_name("action");
+            action.set_tooltip_text(Some(if running { "Disconnect" } else { "Forget" }));
             action.set_can_target(true);
         });
     }
     {
-        let action = action.clone();
+        let (action, slot) = (action.clone(), slot.clone());
         hover.connect_leave(move |_| {
-            action.set_opacity(0.0);
+            slot.set_visible_child_name("status");
+            action.set_tooltip_text(Some(if connected { "Connected" } else { "Not connected" }));
             action.set_can_target(false);
         });
     }
     tab.add_controller(hover);
 
     // The handlers rebuild the tabs, so they run once the click is done
-    // with the widget that received it.
-    // The action button claims its own clicks, so this sees only the rest
-    // of the tab.
+    // with the widget that received it. The action button claims its own
+    // clicks, so this sees only the rest of the tab.
     let click = gtk::GestureClick::builder().button(1).build();
     {
         let ui = ui.clone();
@@ -832,7 +854,10 @@ fn set_stats(ui: &App, s: &Rc<Session>, text: &str) {
 }
 
 /// Go back to a black screen with no stream geometry.
-fn show_disconnected(ui: &App, s: &Rc<Session>) {
+fn show_disconnected(ui: &Rc<App>, s: &Rc<Session>) {
+    if s.connected.replace(false) {
+        refresh_tabs(ui);
+    }
     s.last_frame.borrow_mut().take();
     s.stream_size.set((0, 0));
     s.stream_view.set((0, 0));
@@ -1019,6 +1044,9 @@ fn poll_status(ui: Rc<App>, s: Rc<Session>, rx: Receiver<Status>, generation: u6
                     s.resize_requested.set((0, 0));
                     s.retries.set(0);
                     s.gave_up.set(false);
+                    if !s.connected.replace(true) {
+                        refresh_tabs(&ui);
+                    }
                     set_status(&ui, &s, &format!("Connected — {view_width}x{view_height}"));
                     // Visible before the first per-second stats arrive.
                     set_stats(&ui, &s, &video);
@@ -1447,6 +1475,7 @@ fn install_input_handlers(
         let ui = ui.clone();
         key.connect_key_released(move |_, _keyval, keycode, _state| {
             let code = keycode.saturating_sub(8);
+            tracing::debug!(code, "key released");
             if track_key(&ui, code, false) {
                 send(
                     &ui,
