@@ -283,9 +283,8 @@ impl Caps {
         | va::VA_ENC_PACKED_HEADER_PICTURE
         | va::VA_ENC_PACKED_HEADER_SLICE;
 
-    /// Whether the encoder can run the way gliff drives it. The H.264
-    /// encoder writes its own headers; the HEVC one leaves them to the
-    /// driver.
+    /// Whether the encoder can run the way gliff drives it. Both encoders
+    /// write their own parameter sets and slice headers.
     pub fn can_encode(&self) -> Result<()> {
         let name = self.codec.profile_name();
         let Some(entrypoint) = self.encode_entrypoint else {
@@ -298,11 +297,9 @@ impl Caps {
                 self.rate_control
             )));
         }
-        if self.codec == VaCodec::H264
-            && self.packed_headers & Self::PACKED_HEADERS != Self::PACKED_HEADERS
-        {
+        if self.packed_headers & Self::PACKED_HEADERS != Self::PACKED_HEADERS {
             return Err(Error::Unsupported(format!(
-                "{name} encode entrypoint {} does not take packed SPS/PPS/slice headers ({:#x})",
+                "{name} encode entrypoint {} does not take packed sequence/picture/slice headers ({:#x})",
                 entrypoint_name(entrypoint),
                 self.packed_headers
             )));

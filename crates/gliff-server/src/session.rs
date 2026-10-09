@@ -646,7 +646,7 @@ impl Session {
                 tracing::info!(
                     width = base.0,
                     height = base.1,
-                    "scaling the stream to the encoder maximum"
+                    "scaling the stream to the encoder or client maximum"
                 );
             }
             let old_base = self.base_stream;
@@ -1234,12 +1234,18 @@ impl VideoStart {
         };
         let hevc = caps.codecs.contains(&Codec::H265);
         let encoder_max = video.encoder_max(hevc).context("query encoder limits")?;
-        let stream = EncoderSettings::fit_extent(output.width, output.height, encoder_max);
+        // The client's limit is its decoder's: a mirrored output larger
+        // than either is scaled down before the first frame.
+        let stream_max = (
+            encoder_max.0.min(caps.max_width),
+            encoder_max.1.min(caps.max_height),
+        );
+        let stream = EncoderSettings::fit_extent(output.width, output.height, stream_max);
         if stream != (output.width, output.height) {
             tracing::info!(
                 width = stream.0,
                 height = stream.1,
-                "scaling the stream to the encoder maximum"
+                "scaling the stream to the encoder or client maximum"
             );
         }
         let streams = if chroma == ChromaMode::Dual420 { 2 } else { 1 };

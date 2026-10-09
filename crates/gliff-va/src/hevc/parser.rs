@@ -402,9 +402,8 @@ fn skip_profile_tier_level(r: &mut BitReader, max_sub_layers_minus1: u32) -> Res
 
 /// st_ref_pic_set(idx) (7.3.7), resolved to POC deltas against the sets
 /// already parsed (`earlier`), for the SPS (`idx < num`) or a slice
-/// (`idx == num`).
-fn parse_st_rps(r: &mut BitReader, idx: usize, earlier: &[StRps]) -> Result<StRps> {
-    let num = earlier.len();
+/// (`idx == num`), where `num` is the SPS's num_short_term_ref_pic_sets.
+fn parse_st_rps(r: &mut BitReader, idx: usize, num: usize, earlier: &[StRps]) -> Result<StRps> {
     let inter = idx != 0 && r.bit()?;
     if inter {
         let delta_idx = if idx == num { r.ue()? as usize + 1 } else { 1 };
@@ -559,7 +558,7 @@ pub fn parse_sps(nal: &[u8]) -> Result<Sps> {
         return Err(Error::Bitstream("too many short-term RPS"));
     }
     for i in 0..num_sets {
-        let set = parse_st_rps(&mut r, i, &s.st_rps)?;
+        let set = parse_st_rps(&mut r, i, num_sets, &s.st_rps)?;
         s.st_rps.push(set);
     }
     s.long_term_ref_pics_present = r.bit()?;
@@ -725,7 +724,7 @@ pub fn parse_slice_header(
         h.short_term_ref_pic_set_sps_flag = r.bit()?;
         if !h.short_term_ref_pic_set_sps_flag {
             let start = r.position();
-            h.st_rps = parse_st_rps(&mut r, sps.st_rps.len(), &sps.st_rps)?;
+            h.st_rps = parse_st_rps(&mut r, sps.st_rps.len(), sps.st_rps.len(), &sps.st_rps)?;
             h.st_rps_bits = (r.position() - start) as u32;
         } else {
             let idx = if sps.st_rps.len() > 1 {
@@ -953,10 +952,41 @@ mod tests {
         w.trailing_bits();
         let data = w.into_bytes();
         let mut r = BitReader::new(&data);
-        let first = parse_st_rps(&mut r, 0, &[]).unwrap();
-        let second = parse_st_rps(&mut r, 1, std::slice::from_ref(&first)).unwrap();
+        let first = parse_st_rps(&mut r, 0, 2, &[]).unwrap();
+        let second = parse_st_rps(&mut r, 1, 2, std::slice::from_ref(&first)).unwrap();
         assert_eq!(first.s0, vec![(-1, true)]);
         assert_eq!(second.s0, vec![(-1, true), (-2, true)]);
+    }
+
+    #[test]
+    fn slice_rps_prediction_reads_its_delta_idx() {
+        // SPS sets: one back, then two back. The slice's own set predicts
+        // from set 0 (delta_idx 2) with deltaRps -1, as in the SPS case
+        // above; only a slice-defined set carries delta_idx_minus1.
+        let mut w = BitWriter::new();
+        w.ue(1);
+        w.ue(0);
+        w.ue(0);
+        w.flag(true);
+        w.flag(false); // set 1 is explicit
+        w.ue(1);
+        w.ue(0);
+        w.ue(1);
+        w.flag(true);
+        w.flag(true); // inter_ref_pic_set_prediction_flag
+        w.ue(1); // delta_idx_minus1: predict from set 0
+        w.flag(true); // delta_rps_sign: negative
+        w.ue(0); // abs_delta_rps_minus1: deltaRps = -1
+        w.flag(true);
+        w.flag(true);
+        w.trailing_bits();
+        let data = w.into_bytes();
+        let mut r = BitReader::new(&data);
+        let mut sets = vec![parse_st_rps(&mut r, 0, 2, &[]).unwrap()];
+        sets.push(parse_st_rps(&mut r, 1, 2, &sets).unwrap());
+        assert_eq!(sets[1].s0, vec![(-2, true)]);
+        let slice = parse_st_rps(&mut r, 2, 2, &sets).unwrap();
+        assert_eq!(slice.s0, vec![(-1, true), (-2, true)]);
     }
 
     #[test]
