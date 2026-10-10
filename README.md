@@ -114,8 +114,9 @@ gliff --server-bin 'gliff-server --low-bandwidth' user@host
   through `--server-bin 'env XDG_RUNTIME_DIR=/run/user/1000 gliff-server'`.
 - To rule out a driver problem, force the CPU on your end with
   `gliff --video cpu user@host`.
-- Screens wider than 4096 pixels are streamed at a reduced size and scaled
-  back up.
+- Screens wider than 4096 pixels stream at full size as HEVC when both
+  machines' GPUs have it (AMD's do); otherwise they stream at a reduced size
+  and are scaled back up. `gliff-probe gpu` shows what each machine has.
 
 ## More
 

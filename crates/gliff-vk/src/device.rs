@@ -39,6 +39,8 @@ pub struct Gpu {
     /// The VA-API display on the same render node, and what it offers.
     pub va: Arc<gliff_va::Display>,
     pub va_caps: gliff_va::Caps,
+    /// HEVC Main, for pictures larger than H.264 allows.
+    pub hevc_caps: gliff_va::Caps,
     /// The queue family index that stands for VA-API in ownership
     /// transfers: FOREIGN when the driver has it, else EXTERNAL.
     pub(crate) foreign_family: u32,
@@ -59,7 +61,9 @@ impl Gpu {
         let node = render_node.unwrap_or(Path::new("/dev/dri/renderD128"));
         let va = gliff_va::Display::open(node)?;
         let va_caps = va.caps()?;
+        let hevc_caps = va.hevc_caps()?;
         tracing::info!(vendor = %va.vendor, ?va_caps, "va-api driver");
+        tracing::debug!(?hevc_caps, "va-api hevc");
         // SAFETY: loading libvulkan and creating an instance with valid,
         // NUL-terminated names; nothing outlives the entry it came from.
         unsafe {
@@ -168,6 +172,7 @@ impl Gpu {
                 driver,
                 va,
                 va_caps,
+                hevc_caps,
                 foreign_family,
                 families,
                 instance,
@@ -185,6 +190,14 @@ impl Gpu {
 
     pub fn can_decode(&self) -> bool {
         self.va_caps.can_decode().is_ok()
+    }
+
+    /// The capabilities of one codec.
+    pub fn caps(&self, codec: gliff_va::VaCodec) -> &gliff_va::Caps {
+        match codec {
+            gliff_va::VaCodec::H264 => &self.va_caps,
+            gliff_va::VaCodec::Hevc => &self.hevc_caps,
+        }
     }
 
     /// Index of a memory type allowed by `type_bits` with all of `flags`.

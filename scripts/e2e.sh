@@ -10,6 +10,8 @@
 #   4. server --listen --headless --low-bandwidth + serve-test (Single420, GPU)
 #   5. the CPU tier matrix: cpu<->cpu, gpu server -> cpu client, cpu server ->
 #      gpu client
+#   5b. HEVC beyond H.264's limit (when the GPU has it): a 6K 4:4:4 round
+#      trip, and a session resized to 6016x3384 that switches to HEVC
 #   6. text clipboard in both directions
 #   7. mirrored output resize
 #   8. a 1 MiB binary clipboard item in both directions (chunked)
@@ -132,6 +134,25 @@ run_server_test 9044 "cpu server -> cpu client" cpu --video cpu
 if [ "$HAS_GPU" = 1 ]; then
     run_server_test 9045 "gpu server -> cpu client" cpu
     run_server_test 9046 "cpu server -> gpu client" gpu --video cpu
+fi
+
+if [ "$HAS_GPU" = 1 ] && $PROBE gpu 2>/dev/null | grep -q "^PASS VA-API HEVC encode"; then
+    echo "== 4c. HEVC beyond H.264's limit =="
+    $PROBE roundtrip --hevc --width 6016 --height 3384 --frames 10 2>/dev/null \
+        | grep -q "^PASS min RGB PSNR" || fail "HEVC 6K codec round-trip"
+    "$SERVER" --listen 127.0.0.1:9043 --headless --instance "$NEST_SIG" >/tmp/gliff-e2e-server.log 2>&1 &
+    hsp=$!; PIDS+=("$hsp"); sleep 2
+    damage & hdp=$!; PIDS+=("$hdp")
+    hevc_out=$(timeout 40 $PROBE stream-bench --connect 127.0.0.1:9043 --seconds 4 \
+        --width 6016 --height 3384 --hevc 2>/dev/null)
+    kill "$hdp" "$hsp" 2>/dev/null; sleep 1
+    echo "$hevc_out" | grep -q "reconfig to 6016x3384 .* H265" || fail "6K session did not switch to HEVC"
+    fps=$(echo "$hevc_out" | sed -n 's/^RESULT fps=\([0-9.]*\).*/\1/p')
+    python3 -c "import sys; sys.exit(0 if float('${fps:-0}') >= 10 else 1)" \
+        || fail "6K HEVC session too slow (${fps:-no} fps)"
+    echo "   HEVC 6K PASS (${fps} fps)"
+else
+    echo "== 4c. HEVC checks skipped (no VA-API HEVC encoder) =="
 fi
 
 echo "== 6. text clipboard both directions =="

@@ -53,7 +53,7 @@ video, cursor and pongs flow server→client.
 | `hypr-wl` | shared Wayland plumbing (connect, globals, output/seat tracking, calloop runner) | none |
 | `hypr-capture` | output + cursor capture into GBM dmabufs on a calloop thread | none |
 | `hypr-input` | virtual keyboard (xkb state) + virtual pointer + clipboard bridge (mime types and pipes) on calloop threads | none |
-| `gliff-va` | libva display, H.264 encode/decode contexts on driver-owned surfaces, dmabuf export, the H.264 header parser and writer | yes, libva calls through committed bindgen output |
+| `gliff-va` | libva display, H.264 and HEVC encode/decode contexts on driver-owned surfaces, dmabuf export, the H.264 header parser and writer, the HEVC header parser | yes, libva calls through committed bindgen output |
 | `gliff-vk` | Vulkan device, dmabuf import/export, split/recombine compute, the pipeline that hands surfaces to `gliff-va` | yes, Vulkan API calls |
 | `gliff-sw` | CPU fallback with OpenH264 encode/decode, fused BGRA<->I420 conversion | the encoder trace level through the raw API, and the AVX2 row kernels (pointer loads and stores) |
 | `gliff-server` | ties capture+input+encoder to the protocol; `--stdio`/`--listen` | none |
@@ -143,6 +143,18 @@ Every crate with `unsafe` documents the safety requirements at each block.
   random-access point. The decoder parses only what the hardware does not
   (SPS, PPS, the slice header) and manages a two-slot DPB with
   sliding-window marking.
+
+- **HEVC beyond H.264's limit.** H.264 stops at 4096 wide on the target
+  GPUs; HEVC on the same engines reaches 8192x4352. When both ends have it
+  (the client lists `H265` in `ClientCaps.codecs` and raises its maximum to
+  its decoder's), a stream that does not fit H.264 is encoded as HEVC Main,
+  with the same low-delay layout, the same Dual420 split, and the codec
+  named in `StreamConfig`; anything that fits stays on H.264. The CPU tier
+  stays H.264. The encoder hands the driver packed VPS, SPS, PPS and slice
+  headers, which Mesa replaces with its own matched to what VCN codes, so
+  the decoder parses the driver's headers: SPS, PPS and slice segment
+  headers to the Main profile syntax VA-API needs, POCs, each picture's
+  short-term RPS applied to the DPB, and RefPicList0.
 
 - **Latest-wins, rate-paced.** The server keeps only the most recent captured
   frame and encodes it on one commanded cadence: the pace timer and the
@@ -317,20 +329,13 @@ NVIDIA has no VA-API encoder and is not a target for the GPU tier.
 
 Not yet built, roughly in priority order:
 
-1. **Optional AV1 for outputs above 4096 wide.** The VCN H.264 encoder
-   stops at 4096x4096 (the kernel amdgpu codec table, reported through
-   VA-API as the maximum picture size, which `gliff-probe gpu` prints), so
-   a 5K output streams at 4096x2304 today: the
-   server scales the stream to the encoder maximum and the client scales it
-   back up. AV1 and HEVC on the same engine reach 8192x4352. AV1 is the
-   preferred second codec: it is royalty-free, and hardware supports it for
-   encode on AMD VCN 4.0 (RDNA3, Ryzen 7040) and later, Intel Arc and
-   Meteor Lake and later, and NVIDIA RTX 40 and later; for decode on AMD
-   VCN 3.0 and later, Intel 11th generation and later, and NVIDIA RTX 30
-   and later. H.264 stays as the codec every GPU has. The server picks AV1
-   only when both ends list it in `ClientCaps.codecs`, and the size clamp
-   stays as the guard for whichever codec is chosen. A native 4:4:4 profile
-   on some driver would also retire the split.
+1. **Optional AV1 beside HEVC.** Outputs above 4096 wide go out as HEVC,
+   which every VCN encodes (the Granite Ridge VCN 3.1 has no AV1 encoder,
+   so HEVC came first). AV1 is royalty-free and encodes on AMD VCN 4.0
+   (RDNA3, Ryzen 7040) and later, Intel Arc and Meteor Lake and later;
+   it would slot in the same way, chosen only when both ends list it in
+   `ClientCaps.codecs`. A native 4:4:4 profile on some driver would also
+   retire the split.
 2. **First frame on a truly static screen.** The 700 ms `Recapture` rescue
    needs verifying against a locked, unchanging screen (the nested bench
    screens always produce damage); if the compositor still withholds the

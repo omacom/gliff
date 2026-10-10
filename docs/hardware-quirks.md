@@ -57,7 +57,26 @@ at once (`gliff-probe roundtrip --adapt`).
 
 ### Encode entrypoint and limits
 `VAEntrypointEncSlice` (the full-featured one), maximum 4096x4096 for both
-encode and decode. Larger outputs are scaled to fit.
+encode and decode. Larger outputs go out as HEVC, or are scaled to fit.
+
+### HEVC
+HEVC Main encodes and decodes up to 8192x4352 on VCN 3.1 (Granite Ridge)
+and VCN 4 (Strix Halo), with one reference and no temporal motion vector
+prediction. Mesa's radeonsi has three habits the encoder depends on:
+
+- It writes no VPS, SPS or PPS unless the frame also carries a packed slice
+  header; with one, it replaces the packed parameter sets with its own
+  (64x64 coding trees, a transform tree one level deeper than declared,
+  dependent slice segments enabled), so the decoder parses what comes back
+  rather than assuming the encoder's values.
+- Packed headers must be unescaped, with `has_emulation_bytes` 0. Escaped
+  ones are read as if unescaped, and the misparsed SPS hung the VCN encode
+  ring (the kernel reset just that ring).
+- The coded height is padded to 16 and cropped with a conformance window,
+  so a 6016x3384 stream codes 6016x3392.
+
+On a Radeon 8060S a 6016x3384 Dual420 stream encodes both pictures in
+about 25 ms and decodes in about 15 ms: roughly 50 fps end to end.
 
 ### Decode
 `VAEntrypointVLD` with one surface per DPB slot plus a spare; the decoder

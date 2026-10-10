@@ -41,6 +41,19 @@ pub struct PendingEncode {
     _buffers: Vec<Buffer>,
 }
 
+impl PendingEncode {
+    pub(crate) fn new(idr: bool, buffers: Vec<Buffer>) -> Self {
+        Self {
+            idr,
+            _buffers: buffers,
+        }
+    }
+
+    pub(crate) fn keyframe(&self) -> bool {
+        self.idr
+    }
+}
+
 pub struct H264Encoder {
     display: Arc<Display>,
     settings: EncoderSettings,
@@ -272,10 +285,7 @@ impl H264Encoder {
                 "encoder rate changed"
             );
         }
-        Ok(PendingEncode {
-            idr,
-            _buffers: buffers,
-        })
+        Ok(PendingEncode::new(idr, buffers))
     }
 
     /// Wait for a submitted encode and collect its access unit.
@@ -339,31 +349,7 @@ impl H264Encoder {
     }
 
     fn rate_params(&self) -> Result<Vec<Buffer>> {
-        let s = &self.settings;
-        // SAFETY: plain C structs; every field accepts zero.
-        let mut rc: va::VAEncMiscParameterRateControl = unsafe { std::mem::zeroed() };
-        rc.bits_per_second = s.bitrate;
-        rc.target_percentage = 100;
-        rc.window_size = s.vbv_ms;
-        // SAFETY: writing bitfields of a zeroed union member.
-        unsafe {
-            rc.rc_flags.bits.set_disable_frame_skip(1);
-            rc.rc_flags.bits.set_disable_bit_stuffing(1);
-        }
-        // SAFETY: as above.
-        let mut fr: va::VAEncMiscParameterFrameRate = unsafe { std::mem::zeroed() };
-        fr.framerate = s.framerate | (1 << 16);
-        let buffer_bits = (s.bitrate as u64 * s.vbv_ms as u64 / 1000).min(u32::MAX as u64) as u32;
-        let hrd = va::VAEncMiscParameterHRD {
-            initial_buffer_fullness: buffer_bits / 2,
-            buffer_size: buffer_bits,
-            va_reserved: [0; 4],
-        };
-        Ok(vec![
-            Buffer::misc(&self.context, va::VAEncMiscParameterTypeRateControl, &rc)?,
-            Buffer::misc(&self.context, va::VAEncMiscParameterTypeFrameRate, &fr)?,
-            Buffer::misc(&self.context, va::VAEncMiscParameterTypeHRD, &hrd)?,
-        ])
+        rate_params(&self.context, &self.settings)
     }
 
     fn picture(&self, slot: usize) -> va::VAPictureH264 {
@@ -460,6 +446,35 @@ impl Drop for H264Encoder {
     }
 }
 
+/// The CBR rate control, frame rate and HRD buffers for `s`, shared by the
+/// H.264 and HEVC encoders.
+pub(crate) fn rate_params(context: &Context, s: &EncoderSettings) -> Result<Vec<Buffer>> {
+    // SAFETY: plain C structs; every field accepts zero.
+    let mut rc: va::VAEncMiscParameterRateControl = unsafe { std::mem::zeroed() };
+    rc.bits_per_second = s.bitrate;
+    rc.target_percentage = 100;
+    rc.window_size = s.vbv_ms;
+    // SAFETY: writing bitfields of a zeroed union member.
+    unsafe {
+        rc.rc_flags.bits.set_disable_frame_skip(1);
+        rc.rc_flags.bits.set_disable_bit_stuffing(1);
+    }
+    // SAFETY: as above.
+    let mut fr: va::VAEncMiscParameterFrameRate = unsafe { std::mem::zeroed() };
+    fr.framerate = s.framerate | (1 << 16);
+    let buffer_bits = (s.bitrate as u64 * s.vbv_ms as u64 / 1000).min(u32::MAX as u64) as u32;
+    let hrd = va::VAEncMiscParameterHRD {
+        initial_buffer_fullness: buffer_bits / 2,
+        buffer_size: buffer_bits,
+        va_reserved: [0; 4],
+    };
+    Ok(vec![
+        Buffer::misc(context, va::VAEncMiscParameterTypeRateControl, &rc)?,
+        Buffer::misc(context, va::VAEncMiscParameterTypeFrameRate, &fr)?,
+        Buffer::misc(context, va::VAEncMiscParameterTypeHRD, &hrd)?,
+    ])
+}
+
 fn invalid_picture() -> va::VAPictureH264 {
     va::VAPictureH264 {
         picture_id: va::VA_INVALID_SURFACE,
@@ -474,7 +489,7 @@ fn invalid_picture() -> va::VAPictureH264 {
 /// The packed header parameter and data buffers for `nal` (start code
 /// included, unescaped). `bits` overrides the bit length for a slice header
 /// that stops before the trailing bits.
-fn packed_header(
+pub(crate) fn packed_header(
     ctx: &Context,
     kind: va::VAEncPackedHeaderType,
     nal: &[u8],

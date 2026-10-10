@@ -1,4 +1,4 @@
-//! VA-API (libva) H.264 encode and decode on surfaces the driver owns.
+//! VA-API (libva) H.264 and HEVC encode and decode on surfaces the driver owns.
 //!
 //! The surfaces are exported as dmabufs so the Vulkan compute stages in
 //! `gliff-vk` write the encoder's input and read the decoder's output in
@@ -11,14 +11,19 @@ pub mod decoder;
 pub mod display;
 pub mod encoder;
 pub mod h264;
+pub mod hevc;
 pub mod settings;
 pub mod surface;
+pub mod video;
 
 pub use decoder::H264Decoder;
-pub use display::{Caps, Display};
+pub use display::{Caps, Display, VaCodec};
 pub use encoder::{EncodedPacket, H264Encoder, PendingEncode};
+pub use hevc::decoder::HevcDecoder;
+pub use hevc::encoder::HevcEncoder;
 pub use settings::EncoderSettings;
 pub use surface::{PrimeDescriptor, PrimePlane, Surface, UsageHint};
+pub use video::{VideoDecoder, VideoEncoder};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

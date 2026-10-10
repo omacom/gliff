@@ -128,7 +128,12 @@ impl Display {
 
     /// What the driver offers for H.264 High profile.
     pub fn caps(&self) -> Result<Caps> {
-        Caps::query(self)
+        Caps::query(self, VaCodec::H264)
+    }
+
+    /// What the driver offers for HEVC Main profile.
+    pub fn hevc_caps(&self) -> Result<Caps> {
+        Caps::query(self, VaCodec::Hevc)
     }
 }
 
@@ -154,9 +159,44 @@ unsafe extern "C" fn log_info(_ctx: *mut c_void, message: *const c_char) {
     tracing::debug!(target: "libva", "{}", msg.trim_end());
 }
 
-/// The H.264 High profile capabilities gliff chooses its tiers from.
+/// A codec gliff drives through VA-API, at the one profile it uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VaCodec {
+    /// H.264 High: the codec every GPU tier has, up to the driver's
+    /// maximum (4096x4096 on AMD).
+    H264,
+    /// HEVC Main: for pictures larger than H.264 allows.
+    Hevc,
+}
+
+impl VaCodec {
+    pub fn profile(self) -> va::VAProfile {
+        match self {
+            Self::H264 => va::VAProfileH264High,
+            Self::Hevc => va::VAProfileHEVCMain,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::H264 => "H.264",
+            Self::Hevc => "HEVC",
+        }
+    }
+
+    /// The codec and the profile gliff uses.
+    pub fn profile_name(self) -> &'static str {
+        match self {
+            Self::H264 => "H.264 High",
+            Self::Hevc => "HEVC Main",
+        }
+    }
+}
+
+/// A codec's capabilities, which gliff chooses its tiers from.
 #[derive(Debug, Clone)]
 pub struct Caps {
+    pub codec: VaCodec,
     /// The encode entrypoint to use, when encode is possible at all:
     /// `VAEntrypointEncSlice` when offered, else the low-power one.
     pub encode_entrypoint: Option<va::VAEntrypoint>,
@@ -174,9 +214,11 @@ pub struct Caps {
 impl Caps {
     pub const PROFILE: va::VAProfile = va::VAProfileH264High;
 
-    pub fn query(display: &Display) -> Result<Self> {
+    pub fn query(display: &Display, codec: VaCodec) -> Result<Self> {
+        let profile = codec.profile();
         let profiles = display.profiles()?;
         let mut caps = Self {
+            codec,
             encode_entrypoint: None,
             decode: false,
             rate_control: 0,
@@ -186,14 +228,14 @@ impl Caps {
             decode_max_width: 0,
             decode_max_height: 0,
         };
-        if !profiles.contains(&Self::PROFILE) {
+        if !profiles.contains(&profile) {
             return Ok(caps);
         }
-        let entrypoints = display.entrypoints(Self::PROFILE)?;
+        let entrypoints = display.entrypoints(profile)?;
         caps.decode = entrypoints.contains(&va::VAEntrypointVLD);
         if caps.decode {
             let values = display.config_attribs(
-                Self::PROFILE,
+                profile,
                 va::VAEntrypointVLD,
                 &[
                     va::VAConfigAttribMaxPictureWidth,
@@ -211,7 +253,7 @@ impl Caps {
                 continue;
             }
             let values = display.config_attribs(
-                Self::PROFILE,
+                profile,
                 entrypoint,
                 &[
                     va::VAConfigAttribRateControl,
@@ -241,21 +283,23 @@ impl Caps {
         | va::VA_ENC_PACKED_HEADER_PICTURE
         | va::VA_ENC_PACKED_HEADER_SLICE;
 
-    /// Whether the encoder can run the way gliff drives it.
+    /// Whether the encoder can run the way gliff drives it. Both encoders
+    /// write their own parameter sets and slice headers.
     pub fn can_encode(&self) -> Result<()> {
+        let name = self.codec.profile_name();
         let Some(entrypoint) = self.encode_entrypoint else {
-            return Err(Error::Unsupported("no H.264 High encode entrypoint".into()));
+            return Err(Error::Unsupported(format!("no {name} encode entrypoint")));
         };
         if self.rate_control & va::VA_RC_CBR == 0 {
             return Err(Error::Unsupported(format!(
-                "H.264 encode entrypoint {} has no CBR (rate control modes {:#x})",
+                "{name} encode entrypoint {} has no CBR (rate control modes {:#x})",
                 entrypoint_name(entrypoint),
                 self.rate_control
             )));
         }
         if self.packed_headers & Self::PACKED_HEADERS != Self::PACKED_HEADERS {
             return Err(Error::Unsupported(format!(
-                "H.264 encode entrypoint {} does not take packed SPS/PPS/slice headers ({:#x})",
+                "{name} encode entrypoint {} does not take packed sequence/picture/slice headers ({:#x})",
                 entrypoint_name(entrypoint),
                 self.packed_headers
             )));
@@ -267,7 +311,10 @@ impl Caps {
         if self.decode {
             Ok(())
         } else {
-            Err(Error::Unsupported("no H.264 High decode entrypoint".into()))
+            Err(Error::Unsupported(format!(
+                "no {} decode entrypoint",
+                self.codec.profile_name()
+            )))
         }
     }
 }
