@@ -156,7 +156,16 @@ where
         .await?;
 
     let (cap_tx, mut cap_rx) = mpsc::unbounded_channel();
-    let capturer = start_capture(&cfg.target, &output.name, &cfg.render_node, cap_tx)?;
+    // The GPU tier imports the captured dmabuf, so it cannot take the wl_shm
+    // ring the CPU tier falls back to when no linear dmabuf is offered.
+    let allow_shm = !matches!(video, VideoTier::Gpu(_));
+    let capturer = start_capture(
+        &cfg.target,
+        &output.name,
+        &cfg.render_node,
+        allow_shm,
+        cap_tx,
+    )?;
 
     let input = start_input(&cfg.target, &output.name, &keymap)?;
     input.send(output.logical_extent()).ok();
@@ -1135,7 +1144,7 @@ impl VideoTier {
         }
         match Gpu::open(Some(render_node)) {
             Ok(gpu) if gpu.can_encode() => {
-                tracing::info!(gpu = %gpu.name, va = %gpu.va.vendor, "using the GPU video pipeline");
+                tracing::info!(gpu = %gpu.name, va = %gpu.va.vendor, encoder = gpu.encoder_api(), "using the GPU video pipeline");
                 Self::Gpu(gpu)
             }
             Ok(gpu) => {
@@ -1145,7 +1154,7 @@ impl VideoTier {
                     .err()
                     .map(|e| e.to_string())
                     .unwrap_or_default();
-                tracing::warn!(gpu = %gpu.name, %why, "no VA-API H.264 encoder; falling back to the CPU pipeline");
+                tracing::warn!(gpu = %gpu.name, %why, "no VA-API or Vulkan Video H.264 encoder; falling back to the CPU pipeline");
                 Self::Cpu
             }
             Err(e) => {
@@ -1296,6 +1305,11 @@ impl VideoEncoder {
     ) -> Result<EncodedFrame> {
         match self {
             Self::Gpu(enc) => {
+                anyhow::ensure!(
+                    !frame.buffer.is_shm(),
+                    "the GPU tier needs dmabuf capture, but the compositor offered no linear \
+                     dmabuf and capture fell back to wl_shm; run with --video cpu"
+                );
                 let info = &frame.buffer.info;
                 let fourcc = drm_fourcc::DrmFourcc::try_from(info.fourcc).map_err(|_| {
                     anyhow::anyhow!("capture fourcc {:#x} is not a DRM format", info.fourcc)
@@ -1505,11 +1519,13 @@ fn start_capture(
     target: &Target,
     output: &str,
     render_node: &std::path::Path,
+    allow_shm: bool,
     tx: UnboundedSender<Incoming>,
 ) -> Result<Capturer> {
     let mut cc = CaptureConfig::new(output.to_string());
     cc.target = target.clone();
     cc.render_node = render_node.to_path_buf();
+    cc.shm_fallback = allow_shm;
     cc.cursor = true;
     // One extra ring slot: the session pins the last sent frame for
     // still-picture refinement.

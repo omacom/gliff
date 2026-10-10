@@ -1,11 +1,12 @@
 //! The capture thread: Wayland dispatch, buffer ring, session state machine.
 
 use std::fs::File;
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::sync::{Arc, Mutex};
 
 use calloop::channel::{self, Sender};
 use drm_fourcc::{DrmFourcc, DrmModifier};
+use nix::sys::memfd::{memfd_create, MFdFlags};
 use gbm::{BufferObjectFlags, Device};
 use wayland_client::globals::GlobalListContents;
 use wayland_client::protocol::wl_buffer::WlBuffer;
@@ -14,7 +15,7 @@ use wayland_client::protocol::wl_output::{self, WlOutput};
 use wayland_client::protocol::wl_pointer::WlPointer;
 use wayland_client::protocol::wl_registry::WlRegistry;
 use wayland_client::protocol::wl_seat::{self, WlSeat};
-use wayland_client::protocol::wl_shm::WlShm;
+use wayland_client::protocol::wl_shm::{self, WlShm};
 use wayland_client::protocol::wl_shm_pool::WlShmPool;
 use wayland_client::{delegate_noop, Connection, Dispatch, QueueHandle};
 use wayland_protocols::ext::image_capture_source::v1::client::ext_image_capture_source_v1::ExtImageCaptureSourceV1;
@@ -36,8 +37,8 @@ use wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_dmabuf_v1::ZwpLi
 
 use crate::cursor::ShmBuffer;
 use crate::{
-    CaptureBuffer, CaptureConfig, CaptureEvent, CapturedFrame, DmabufInfo, Error, EventSink,
-    OutputInfo, Plane, Rect, Result,
+    Backing, CaptureBuffer, CaptureConfig, CaptureEvent, CapturedFrame, DmabufInfo, Error,
+    EventSink, OutputInfo, Plane, Rect, Result,
 };
 use hypr_wl::{LoopState, Outputs, Seat, Target};
 
@@ -63,7 +64,18 @@ enum Kind {
 struct RingSlot {
     buffer: Arc<CaptureBuffer>,
     wl_buffer: WlBuffer,
+    /// The pool behind a wl_shm buffer; `None` for dmabufs.
+    pool: Option<WlShmPool>,
     busy: bool,
+}
+
+impl RingSlot {
+    fn destroy(self) {
+        self.wl_buffer.destroy();
+        if let Some(pool) = self.pool {
+            pool.destroy();
+        }
+    }
 }
 
 #[derive(Default)]
@@ -342,7 +354,7 @@ impl State {
         }
         self.teardown_cursor();
         for slot in self.ring.drain(..) {
-            slot.wl_buffer.destroy();
+            slot.destroy();
         }
         if let Some(s) = self.session.take() {
             s.destroy();
@@ -381,8 +393,46 @@ impl State {
         None
     }
 
+    /// A 32-bit RGB wl_shm format the compositor offers, as (DRM fourcc,
+    /// wl_shm format), when the dmabuf formats leave the CPU nothing linear
+    /// to map.
+    fn choose_shm_format(&self) -> Option<(u32, wl_shm::Format)> {
+        if !self.cfg.prefer_linear || !self.cfg.shm_fallback || self.shm.is_none() {
+            return None;
+        }
+        let linear = u64::from(DrmModifier::Linear);
+        if let Some((_, mods)) = self.choose_format() {
+            if mods == [linear] {
+                return None;
+            }
+        }
+        [
+            (DrmFourcc::Xrgb8888, wl_shm::Format::Xrgb8888),
+            (DrmFourcc::Argb8888, wl_shm::Format::Argb8888),
+            (DrmFourcc::Xbgr8888, wl_shm::Format::Xbgr8888),
+            (DrmFourcc::Abgr8888, wl_shm::Format::Abgr8888),
+        ]
+        .into_iter()
+        .find(|(_, shm)| self.constraints.shm_formats.contains(&u32::from(*shm)))
+        .map(|(drm, shm)| (drm as u32, shm))
+    }
+
     fn allocate_ring(&mut self) -> Result<()> {
+        if self.constraints.width == 0 || self.constraints.height == 0 {
+            // A new headless output has no mode yet. Wait for the
+            // constraints that come with its first mode instead of
+            // allocating an empty ring (a zero-sized wl_shm pool is a
+            // protocol error that ends the connection).
+            for slot in self.ring.drain(..) {
+                slot.destroy();
+            }
+            tracing::debug!("output has no size yet; waiting before allocating the ring");
+            return Ok(());
+        }
         self.ring_generation += 1;
+        if let Some((fourcc, format)) = self.choose_shm_format() {
+            return self.allocate_shm_ring(fourcc, format);
+        }
         let (fourcc, modifiers) = self.choose_format().ok_or_else(|| {
             Error::Capture(format!(
                 "no usable dmabuf format offered (got {:x?})",
@@ -391,7 +441,7 @@ impl State {
         })?;
         let (w, h) = (self.constraints.width, self.constraints.height);
         for slot in self.ring.drain(..) {
-            slot.wl_buffer.destroy();
+            slot.destroy();
         }
         let format = DrmFourcc::try_from(fourcc).map_err(|e| Error::Gbm(e.to_string()))?;
         let mut chosen_modifier = None;
@@ -462,21 +512,76 @@ impl State {
                     modifier,
                     planes,
                 },
-                bo: Mutex::new(bo),
-                device: Arc::clone(&self.device),
+                backing: Backing::Gbm {
+                    bo: Mutex::new(bo),
+                    device: Arc::clone(&self.device),
+                },
             });
             self.ring.push(RingSlot {
                 buffer,
                 wl_buffer,
+                pool: None,
                 busy: false,
             });
         }
         let modifier = chosen_modifier.unwrap_or(0);
+        self.ring_ready(fourcc, modifier, "dmabuf");
+        Ok(())
+    }
+
+    /// A ring of wl_shm buffers over memfds: the compositor does the GPU
+    /// readback and the CPU path reads the pixels with `read_at`.
+    fn allocate_shm_ring(&mut self, fourcc: u32, format: wl_shm::Format) -> Result<()> {
+        let Some(shm) = self.shm.clone() else {
+            return Err(Error::Capture("wl_shm is not available".into()));
+        };
+        let (w, h) = (self.constraints.width, self.constraints.height);
+        for slot in self.ring.drain(..) {
+            slot.destroy();
+        }
+        let stride = w * 4;
+        let size = stride as u64 * h as u64;
+        for index in 0..self.cfg.buffers {
+            let fd = memfd_create(c"gliff-capture", MFdFlags::MFD_CLOEXEC)
+                .map_err(|e| Error::Capture(format!("memfd: {e}")))?;
+            let file = File::from(fd);
+            file.set_len(size)?;
+            let pool = shm.create_pool(file.as_fd(), size as i32, &self.qh, ());
+            let wl_buffer =
+                pool.create_buffer(0, w as i32, h as i32, stride as i32, format, &self.qh, ());
+            let fd: OwnedFd = file.try_clone()?.into();
+            let buffer = Arc::new(CaptureBuffer {
+                index,
+                generation: self.ring_generation,
+                info: DmabufInfo {
+                    fd,
+                    width: w,
+                    height: h,
+                    fourcc,
+                    modifier: u64::from(DrmModifier::Invalid),
+                    planes: vec![Plane { offset: 0, stride }],
+                },
+                backing: Backing::Shm(file),
+            });
+            self.ring.push(RingSlot {
+                buffer,
+                wl_buffer,
+                pool: Some(pool),
+                busy: false,
+            });
+        }
+        self.ring_ready(fourcc, u64::from(DrmModifier::Invalid), "shm");
+        Ok(())
+    }
+
+    fn ring_ready(&mut self, fourcc: u32, modifier: u64, kind: &str) {
+        let (w, h) = (self.constraints.width, self.constraints.height);
         self.ring_format = Some((fourcc, modifier));
         tracing::info!(
             w,
             h,
-            fourcc = format!("{:?}", format),
+            kind,
+            fourcc = format!("{:?}", DrmFourcc::try_from(fourcc)),
             modifier = format!("{modifier:#x}"),
             buffers = self.cfg.buffers,
             "capture ring allocated"
@@ -493,7 +598,6 @@ impl State {
             fourcc,
             modifier,
         });
-        Ok(())
     }
 
     fn maybe_capture(&mut self) {
