@@ -292,10 +292,12 @@ fn pick_families(instance: &ash::Instance, pd: vk::PhysicalDevice) -> Option<Fam
     })
 }
 
-/// A command pool plus a fence, for one-shot submissions on one queue.
+/// A command pool with one command buffer plus a fence, for one-shot
+/// submissions on one queue.
 pub(crate) struct Commands {
     gpu: Arc<Gpu>,
     pool: vk::CommandPool,
+    cmd: vk::CommandBuffer,
     pub(crate) queue: vk::Queue,
     fence: vk::Fence,
 }
@@ -304,19 +306,26 @@ impl Commands {
     pub(crate) fn new(gpu: &Arc<Gpu>, family: u32, queue: vk::Queue) -> Result<Self> {
         // SAFETY: valid device and family index. The fence starts signalled
         // so the first `run` does not wait on work that was never submitted.
-        let (pool, fence) = unsafe {
+        let (pool, cmd, fence) = unsafe {
             let info = vk::CommandPoolCreateInfo::default()
                 .queue_family_index(family)
                 .flags(vk::CommandPoolCreateFlags::TRANSIENT);
+            let pool = gpu.device.create_command_pool(&info, None)?;
+            let alloc = vk::CommandBufferAllocateInfo::default()
+                .command_pool(pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1);
             let fence = vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
             (
-                gpu.device.create_command_pool(&info, None)?,
+                pool,
+                gpu.device.allocate_command_buffers(&alloc)?[0],
                 gpu.device.create_fence(&fence, None)?,
             )
         };
         Ok(Self {
             gpu: gpu.clone(),
             pool,
+            cmd,
             queue,
             fence,
         })
@@ -334,18 +343,15 @@ impl Commands {
         f: impl FnOnce(vk::CommandBuffer) -> Result<()>,
     ) -> Result<()> {
         let dev = &self.gpu.device;
+        let cmd = self.cmd;
         // SAFETY: the pool is reset only after the previous submission's fence
-        // signalled (`block`, or the wait below), so no command buffer is in
-        // flight when it is recycled.
+        // signalled (`block`, or the wait below), so the command buffer is not
+        // in flight when it is recycled. A reset returns it to the initial
+        // state but does not free it, so it is allocated once, in `new`.
         unsafe {
             dev.wait_for_fences(&[self.fence], true, u64::MAX)?;
             dev.reset_fences(&[self.fence])?;
             dev.reset_command_pool(self.pool, vk::CommandPoolResetFlags::empty())?;
-            let alloc = vk::CommandBufferAllocateInfo::default()
-                .command_pool(self.pool)
-                .level(vk::CommandBufferLevel::PRIMARY)
-                .command_buffer_count(1);
-            let cmd = dev.allocate_command_buffers(&alloc)?[0];
             dev.begin_command_buffer(
                 cmd,
                 &vk::CommandBufferBeginInfo::default()
@@ -435,5 +441,33 @@ impl Drop for Timeline {
     fn drop(&mut self) {
         // SAFETY: owners wait for their work before dropping.
         unsafe { self.gpu.device.destroy_semaphore(self.semaphore, None) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_records_every_submission_into_the_same_command_buffer() {
+        let Ok(gpu) = Gpu::open(None) else {
+            eprintln!("no GPU; skipping");
+            return;
+        };
+        let commands = Commands::new(&gpu, gpu.families.compute, gpu.compute_queue).unwrap();
+        let timeline = Timeline::new(&gpu).unwrap();
+        let mut recorded = Vec::new();
+        for _ in 0..3 {
+            commands
+                .run(timeline.semaphore, None, None, true, |cmd| {
+                    recorded.push(cmd);
+                    Ok(())
+                })
+                .unwrap();
+        }
+        assert!(
+            recorded.iter().all(|&cmd| cmd == recorded[0]),
+            "{recorded:?}"
+        );
     }
 }
