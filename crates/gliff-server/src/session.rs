@@ -1296,6 +1296,11 @@ impl VideoEncoder {
     ) -> Result<EncodedFrame> {
         match self {
             Self::Gpu(enc) => {
+                anyhow::ensure!(
+                    !frame.buffer.is_shm(),
+                    "the GPU tier needs dmabuf capture, but the compositor offered no linear \
+                     dmabuf and capture fell back to wl_shm; run with --video cpu"
+                );
                 let info = &frame.buffer.info;
                 let fourcc = drm_fourcc::DrmFourcc::try_from(info.fourcc).map_err(|_| {
                     anyhow::anyhow!("capture fourcc {:#x} is not a DRM format", info.fourcc)
