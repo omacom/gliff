@@ -1,6 +1,7 @@
 //! Vulkan media pipeline: dmabuf import, the AVC444 split and recombine as
 //! compute shaders, and the hand-off of NV12 surfaces to and from the
-//! VA-API codec in `gliff-va`.
+//! VA-API codec in `gliff-va`, or to the Vulkan Video H.264 encoder when
+//! the VA-API driver has none.
 //!
 //! Vulkan calls use `unsafe` through `ash`. Callers see plain Rust types.
 
@@ -27,6 +28,7 @@ pub mod device;
 pub mod image;
 
 pub mod pipeline;
+mod vkenc;
 
 pub use device::Gpu;
 pub use gliff_va::EncoderSettings;
