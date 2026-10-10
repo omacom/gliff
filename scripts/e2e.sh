@@ -15,6 +15,8 @@
 #   8. a 1 MiB binary clipboard item in both directions (chunked)
 #   9. copied files (a directory tree) in both directions, via the spool
 #  10. a keymap sent mid-session is the one the compositor serves its clients
+#  11. the GTK client gets one shortcut-inhibit notification per inhibit
+#      change, however often its video gains focus
 #
 # Exits non-zero on the first failure.
 set -uo pipefail
@@ -248,5 +250,32 @@ kill "$kdp" "$ksp" 2>/dev/null
 grep -q "^PASS" "$kout" || fail "client keymap not served ($(tr '\n' ' ' <"$kout"); client said: $(tail -3 "$keyf" | tr '\n' ' '))"
 rm -f "$keyf" "$kout"
 echo "   client keymap PASS"
+
+echo "== 11. focus changes do not stack shortcut-inhibit handlers =="
+"$SERVER" --listen 127.0.0.1:9050 --headless --instance "$NEST_SIG" >/tmp/gliff-e2e-server.log 2>&1 &
+isp=$!; PIDS+=("$isp"); sleep 2
+damage & idp=$!; PIDS+=("$idp")
+ixdg=$(mktemp -d); txdg=$(mktemp -d); ilog=$(mktemp)
+XDG_CONFIG_HOME="$ixdg" RUST_LOG=gliff=debug target/release/gliff --connect 127.0.0.1:9050 >"$ilog" 2>&1 &
+icp=$!; PIDS+=("$icp")
+# A second, unconnected client window to take focus away.
+XDG_CONFIG_HOME="$txdg" target/release/gliff >/dev/null 2>&1 &
+iop=$!; PIDS+=("$iop"); sleep 4
+# The video takes focus only while the pointer is over it, so the other
+# window goes to its own workspace, leaving the client under the pointer.
+hyprctl dispatch "hl.dsp.window.move({ workspace = 2, window = \"pid:$iop\" })" >/dev/null; sleep 1
+for _ in $(seq 1 10); do
+    hyprctl dispatch "hl.dsp.focus({ window = \"pid:$iop\" })" >/dev/null; sleep 0.5
+    hyprctl dispatch "hl.dsp.focus({ window = \"pid:$icp\" })" >/dev/null; sleep 0.5
+done
+kill "$icp" "$iop" "$idp" "$isp" 2>/dev/null; sleep 1
+focused=$(grep -c "video focused" "$ilog")
+inhibits=$(grep -c "compositor shortcut inhibit" "$ilog")
+[ "$focused" -ge 10 ] || fail "client gained focus $focused times, expected at least 10"
+# The compositor answers each inhibit and each restore once.
+[ "$inhibits" -ge "$focused" ] && [ "$inhibits" -le $((2 * focused)) ] \
+    || fail "$inhibits shortcut-inhibit notifications for $focused focus changes"
+rm -rf "$ixdg" "$txdg" "$ilog"
+echo "   shortcut inhibit PASS"
 
 echo "E2E PASS: all checks passed"
