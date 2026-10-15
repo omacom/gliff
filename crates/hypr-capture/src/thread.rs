@@ -345,14 +345,18 @@ fn run_loop(
     state.output = Some((output.clone(), info));
 
     let source = state.source_mgr.create_source(&output, &qh, ());
-    let session =
-        state
-            .copy_mgr
-            .create_session(&source, manager::Options::empty(), &qh, Kind::Screen);
+    let options = if state.cfg.cursor_in_video {
+        manager::Options::PaintCursors
+    } else {
+        manager::Options::empty()
+    };
+    let session = state
+        .copy_mgr
+        .create_session(&source, options, &qh, Kind::Screen);
     state.source = Some(source);
     state.session = Some(session);
 
-    if state.cfg.cursor && state.shm.is_some() {
+    if state.cfg.cursor && !state.cfg.cursor_in_video && state.shm.is_some() {
         state.start_cursor_session();
     }
     let _ = ready_tx.send(Ok(()));

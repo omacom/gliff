@@ -15,6 +15,7 @@ bin/build
 opened, run `bin/install-dev` and choose **Gliff (Development)**; build
 failures raise a notification and are logged to `target/dev-build.log`. The
 remote end of an SSH session still runs the `gliff-server` installed there.
+The Omarchy and macOS builds share the [app icon](icon.md).
 
 Needs Rust, a C++ toolchain (the vendored OpenH264 build; nasm speeds it up),
 and the runtime libraries in the `pkgbuild/PKGBUILD` `depends`. The GPU tier
@@ -44,6 +45,24 @@ packet delays and compare its decoded pixels with the reference:
 ```
 gliff-probe --video cpu roundtrip --single --decode gpu --frame-delay-ms 300 --frames 20
 ```
+
+## macOS
+
+On macOS, `bin/build` builds the native client and host with the shared
+protocol, transport, and software codecs. It excludes the Linux-only probes,
+Wayland, GTK, Vulkan and VA-API. `bin/install-macos` installs the app and its
+SSH host for the current user; it also works through `bin/install`.
+
+The build needs Rust and Xcode Command Line Tools. `gliff-macos/build.rs`
+compiles the Swift bridge for the selected architecture (Apple Silicon or
+Intel), targeting macOS 13. The bridge is embedded in the binaries; installation
+writes that exact bridge into the app bundle and signs it locally.
+
+`scripts/check.sh` selects the portable and macOS packages on a Mac, and CI
+runs those checks plus a release build and downloadable development archive
+on Apple Silicon and Intel runners. Native capture and
+input need a logged-in desktop and OS permission grants, so they are tested on
+real hardware rather than in unattended CI. See [macos.md](macos.md).
 
 ## Run on one machine
 
@@ -97,8 +116,12 @@ tiers independently, so every pairing can be tested on one machine.
   copied directory tree), a mirrored-output resize, a keymap sent
   mid-session, and the GTK client's shortcut inhibit across repeated focus
   changes. It needs a Hyprland session, so it is not a CI unit test; run
-  it on a target machine. Without the GPU tier it skips the GPU cases and
-  still runs the CPU cases.
+  it on a target machine. Encoder and decoder support are detected separately:
+  Vulkan Video encoding is exercised even without a VA-API encoder, and
+  unsupported GPU cases are skipped while the CPU cases still run. Failed
+  capture and stream probes retain their full output in the reported log file.
+  If a nested output stays at 0x0 before capture, check the compositor's buffer
+  allocation; see the [NVIDIA nested-output issue](hardware-quirks.md#nvidia-nested-headless-outputs).
 - **`scripts/bench.sh`** runs a server and `stream-bench` in a nested
   Hyprland over a shaped link: `BENCH_PRESET=lan|dsl|satellite`, a
   token-bucket TCP proxy (`scripts/throttle-proxy.py`) or `tc netem` in an
@@ -127,9 +150,11 @@ The version is set in one place, `[workspace.package]` in `Cargo.toml`;
    commit `vX.Y.Z`, and push the commit and tag to `origin`.
 
 The tag starts `.github/workflows/ci.yml`. Only after formatting, Clippy,
-and tests pass does CI check that the tag matches the workspace version and
-publish a GitHub release with generated notes. Review and edit those notes
-on GitHub to describe the changes users will notice.
+tests and both Mac builds pass does CI check that the tag matches the workspace
+version and publish a GitHub release with generated notes and notarized Mac
+packages. Configure the maintainer signing credentials described in
+[macos.md](macos.md) before pushing a release tag. Review and edit the release
+notes on GitHub to describe the changes users will notice.
 
 The Omarchy Package Repository watches Gliff's `v*` tags. Its hourly
 unattended update workflow opens a package update PR, builds and tests the

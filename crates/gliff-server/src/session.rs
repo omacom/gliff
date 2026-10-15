@@ -15,7 +15,7 @@ use gliff_proto::clipboard::CHUNK;
 use gliff_proto::{
     features, version_mismatch, ChromaMode, ClientCaps, ClientMsg, ClipboardMsg, Codec, Greeting,
     OutputInfo as ProtoOutput, Rect, ServerMsg, SessionInfo, VideoPipeline, ERROR_NO_CHROMA,
-    ERROR_NO_CODEC, ERROR_VERSION, PROTOCOL_VERSION,
+    ERROR_NO_CODEC, ERROR_VERSION, FEATURE_CURSOR_IN_VIDEO, PROTOCOL_VERSION,
 };
 use gliff_sw::VideoMode;
 use gliff_transport::clipboard::progress::Jobs;
@@ -119,7 +119,10 @@ where
                 height: output.height,
                 scale_milli: (output.scale * 1000.0).round() as u32,
             }],
-            features: features(),
+            features: features()
+                .into_iter()
+                .chain([FEATURE_CURSOR_IN_VIDEO.to_string()])
+                .collect(),
         })
         .await?;
     let ladder = Ladder::new(START_LEVEL);
@@ -168,6 +171,7 @@ where
         cfg.capture,
         allow_shm,
         cap_tx,
+        caps.features.iter().any(|f| f == FEATURE_CURSOR_IN_VIDEO),
     )?;
 
     let input = start_input(&cfg.target, &output.name, &keymap)?;
@@ -1618,6 +1622,7 @@ fn start_capture(
     capture: CaptureMode,
     allow_shm: bool,
     tx: UnboundedSender<Incoming>,
+    cursor_in_video: bool,
 ) -> Result<Capturer> {
     let mut cc = CaptureConfig::new(output.to_string());
     cc.target = target.clone();
@@ -1625,6 +1630,10 @@ fn start_capture(
     cc.shm_fallback = allow_shm;
     cc.mode = capture;
     cc.cursor = true;
+    // Hyprland 0.56 can crash in CCursorshareSession::copy when a physical
+    // monitor disconnects. Clients requesting embedded cursors avoid that
+    // separate capture path, and receive the cursor in their video instead.
+    cc.cursor_in_video = cursor_in_video;
     // One extra ring slot: the session pins the last sent frame for
     // still-picture refinement.
     cc.buffers = 4;

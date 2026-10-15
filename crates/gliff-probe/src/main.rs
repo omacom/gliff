@@ -123,10 +123,14 @@ enum Cmd {
         #[arg(long)]
         output: Option<String>,
     },
-    /// Connect to a running `gliff-server --listen` and decode a few frames
+    /// Connect over TCP or SSH and decode real desktop frames
     ServeTest {
-        #[arg(long, default_value = "127.0.0.1:9000")]
+        #[arg(long, default_value = "127.0.0.1:9000", conflicts_with = "ssh")]
         connect: String,
+        #[arg(long)]
+        ssh: Option<String>,
+        #[arg(long, default_value = "gliff-server")]
+        server_bin: String,
         #[arg(long, default_value_t = 30)]
         frames: usize,
     },
@@ -237,7 +241,12 @@ fn main() -> Result<()> {
             click,
         } => input(&target, output, &text, click)?,
         Cmd::Pipeline { output } => pipeline(&target, &node, capture_mode, output, video)?,
-        Cmd::ServeTest { connect, frames } => serve_test(&node, &connect, frames, video)?,
+        Cmd::ServeTest {
+            connect,
+            frames,
+            ssh,
+            server_bin,
+        } => serve_test(&node, &connect, frames, video, ssh.as_deref(), &server_bin)?,
         Cmd::StreamBench {
             connect,
             seconds,
@@ -586,7 +595,14 @@ fn input(target: &Target, output: Option<String>, text: &str, click: bool) -> Re
     Ok(())
 }
 
-fn serve_test(node: &std::path::Path, addr: &str, frames: usize, video: VideoMode) -> Result<()> {
+fn serve_test(
+    node: &std::path::Path,
+    addr: &str,
+    frames: usize,
+    video: VideoMode,
+    ssh: Option<&str>,
+    server_bin: &str,
+) -> Result<()> {
     use gliff_proto::{ChromaMode, ClientCaps, ClientMsg, Codec, ServerMsg};
     use gliff_transport::Framed;
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -594,9 +610,20 @@ fn serve_test(node: &std::path::Path, addr: &str, frames: usize, video: VideoMod
         .build()?;
     let local = tokio::task::LocalSet::new();
     local.block_on(&rt, async move {
-        let stream = tokio::net::TcpStream::connect(addr).await.with_context(|| format!("connect {addr}"))?;
-        stream.set_nodelay(true)?;
-        let (rd, wr) = tokio::io::split(stream);
+        let _ssh_child;
+        let (rd, wr): (Box<dyn tokio::io::AsyncRead + Unpin>, Box<dyn tokio::io::AsyncWrite + Unpin>) = if let Some(host) = ssh {
+            let mut target = gliff_transport::SshTarget::new(host);
+            target.server_bin = server_bin.into();
+            let stream = gliff_transport::spawn_ssh(&target)?;
+            _ssh_child = Some(stream.child);
+            (Box::new(stream.stdout), Box::new(stream.stdin))
+        } else {
+            _ssh_child = None;
+            let stream = tokio::net::TcpStream::connect(addr).await.with_context(|| format!("connect {addr}"))?;
+            stream.set_nodelay(true)?;
+            let (rd, wr) = tokio::io::split(stream);
+            (Box::new(rd), Box::new(wr))
+        };
         let mut reader = Framed::new(rd);
         let mut writer = Framed::new(wr);
         let caps = ClientCaps { codecs: vec![Codec::H264], max_width: 1280, max_height: 720, chroma: vec![ChromaMode::Dual420, ChromaMode::Single420], features: gliff_proto::features() };
@@ -621,6 +648,7 @@ fn serve_test(node: &std::path::Path, addr: &str, frames: usize, video: VideoMod
         let mut got = 0usize;
         let mut keyframes = 0usize;
         let mut scaled = false;
+        let mut resize_deadline = None;
         // GLIFF_SEND_CLIP offers text; GLIFF_SEND_CLIP_FILE offers a file as
         // application/octet-stream; GLIFF_SEND_CLIP_FILES (colon-separated
         // paths) offers copied files. GLIFF_RECV_CLIP_FILE stores a received
@@ -687,9 +715,17 @@ fn serve_test(node: &std::path::Path, addr: &str, frames: usize, video: VideoMod
             eprintln!("CLIP-RECV-FILES: {} entries", files.len());
             Ok(None)
         }
-        while got < frames {
-            let msg = reader.read_msg::<ServerMsg>().await?;
+        // Fast GPU streams can deliver the requested frames before Hyprland
+        // applies the resize. Wait for its config too, with a fixed deadline.
+        while got < frames || (frames > 3 && !scaled) {
+            let msg = if let Some(deadline) = resize_deadline.filter(|_| !scaled) {
+                tokio::time::timeout_at(deadline, reader.read_msg::<ServerMsg>())
+                    .await.context("timed out waiting for the requested resize")??
+            } else {
+                reader.read_msg::<ServerMsg>().await?
+            };
             match msg {
+                ServerMsg::Ping { t } => writer.write_msg(&ClientMsg::Pong { t }).await?,
                 ServerMsg::VideoFrame { frame_id, keyframe, data_len, aux_len, .. } => {
                     let main = reader.read_payload(data_len).await?;
                     let aux = if aux_len > 0 { reader.read_payload(aux_len).await?.to_vec() } else { Vec::new() };
@@ -715,7 +751,10 @@ fn serve_test(node: &std::path::Path, addr: &str, frames: usize, video: VideoMod
                             writer.write_msg(&ClientMsg::Key { keycode, pressed: false }).await?;
                         }
                     }
-                    if got == 3 { writer.write_msg(&ClientMsg::Resize { width: 800, height: 600, scale: 2.0 }).await?; }
+                    if got == 3 {
+                        writer.write_msg(&ClientMsg::Resize { width: 800, height: 600, scale: 2.0 }).await?;
+                        resize_deadline = Some(tokio::time::Instant::now() + Duration::from_secs(5));
+                    }
                     if got == 4 && (send_clip.is_some() || send_file.is_some() || !send_files.entries.is_empty()) {
                         let mut mime_types: Vec<String> = Vec::new();
                         if send_clip.is_some() { mime_types.extend(TEXT_MIMES.iter().map(|m| m.to_string())); }
@@ -1830,4 +1869,114 @@ fn pipeline(
         bail!("pipeline PSNR too low");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gliff_proto::{ChromaMode, ClientMsg, Codec, ServerMsg, SessionInfo, VideoPipeline};
+    use gliff_transport::Framed;
+
+    #[test]
+    fn serve_test_waits_for_resize_after_fast_frames() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        listener.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            runtime.block_on(async {
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    let listener = tokio::net::TcpListener::from_std(listener)?;
+                    let (stream, _) = listener.accept().await?;
+                    let (rd, wr) = tokio::io::split(stream);
+                    let mut reader = Framed::new(rd);
+                    let mut writer = Framed::new(wr);
+                    assert!(matches!(
+                        reader.read_msg::<ClientMsg>().await?,
+                        ClientMsg::Hello { .. }
+                    ));
+                    writer
+                        .write_msg(&ServerMsg::HelloAck {
+                            version: gliff_proto::PROTOCOL_VERSION,
+                            session: SessionInfo {
+                                headless: true,
+                                output: "fixture".into(),
+                            },
+                            outputs: vec![],
+                            features: vec![],
+                        })
+                        .await?;
+                    let config = |width, height, scale_milli| ServerMsg::StreamConfig {
+                        codec: Codec::H264,
+                        chroma: ChromaMode::Single420,
+                        pipeline: Some(VideoPipeline::Cpu),
+                        width,
+                        height,
+                        scale_milli,
+                        extradata: vec![],
+                        aux_extradata: None,
+                        view_width: width,
+                        view_height: height,
+                        fps_cap: 60,
+                    };
+                    writer.write_msg(&config(64, 64, 1000)).await?;
+                    let mut encoder =
+                        gliff_sw::Encoder::new(sw_settings(64, 64, 1_000_000), false)?;
+                    let pixels = [64, 96, 128, 255].repeat(64 * 64);
+                    for frame_id in 1..=8 {
+                        let packet = encoder.encode_bgra(&pixels, true)?;
+                        writer
+                            .write_msg_with_payloads(
+                                &ServerMsg::VideoFrame {
+                                    frame_id,
+                                    pts_us: frame_id * 1000,
+                                    keyframe: packet.keyframe,
+                                    damage: vec![],
+                                    data_len: packet.main.len() as u32,
+                                    aux_len: 0,
+                                },
+                                &[&packet.main],
+                            )
+                            .await?;
+                    }
+                    // This barrier arrives after all eight frames, before the
+                    // resize config. The probe must keep reading and reply.
+                    writer.write_msg(&ServerMsg::Ping { t: 42 }).await?;
+                    let mut acknowledgements = 0;
+                    let mut resized = false;
+                    loop {
+                        match reader.read_msg::<ClientMsg>().await? {
+                            ClientMsg::FrameAck { .. } => acknowledgements += 1,
+                            ClientMsg::Resize {
+                                width: 800,
+                                height: 600,
+                                scale: 2.0,
+                            } => resized = true,
+                            ClientMsg::Pong { t: 42 } => break,
+                            other => anyhow::bail!("probe quit before applying resize: {other:?}"),
+                        }
+                    }
+                    assert_eq!(acknowledgements, 8);
+                    assert!(resized);
+                    writer.write_msg(&config(800, 600, 2000)).await?;
+                    assert_eq!(reader.read_msg::<ClientMsg>().await?, ClientMsg::Bye);
+                    Ok::<_, anyhow::Error>(())
+                })
+                .await
+                .context("fake server timed out")?
+            })
+        });
+        let result = serve_test(
+            std::path::Path::new("unused"),
+            &address,
+            8,
+            VideoMode::Cpu,
+            None,
+            "unused",
+        );
+        server.join().unwrap().unwrap();
+        result.unwrap();
+    }
 }

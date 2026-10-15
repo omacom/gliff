@@ -14,7 +14,7 @@ use bytes::Bytes;
 use gliff_proto::clipboard::CHUNK;
 use gliff_proto::{
     features, is_incompatible, version_mismatch, ChromaMode, ClientCaps, ClientMsg, ClipboardFile,
-    ClipboardMsg, Codec, ServerMsg, VideoPipeline, PROTOCOL_VERSION,
+    ClipboardMsg, Codec, ServerMsg, VideoPipeline, FEATURE_CURSOR_IN_VIDEO, PROTOCOL_VERSION,
 };
 use gliff_sw::VideoMode;
 use gliff_transport::clipboard::progress::Progress;
@@ -59,6 +59,7 @@ pub enum Status {
         view_width: u32,
         view_height: u32,
         fps_cap: u32,
+        cursor_in_video: bool,
         /// The server serves a dedicated headless output whose frames carry
         /// the compositor-drawn cursor.
         headless: bool,
@@ -273,7 +274,7 @@ where
     let mut reader = Framed::new(rd);
     let mut writer = Framed::new(wr);
 
-    let gpu = open_gpu(video);
+    let mut gpu = open_gpu(video);
     let caps = ClientCaps {
         codecs: vec![Codec::H264],
         max_width: MAX_STREAM.0,
@@ -285,7 +286,10 @@ where
         } else {
             vec![ChromaMode::Single420]
         },
-        features: features(),
+        features: features()
+            .into_iter()
+            .chain([FEATURE_CURSOR_IN_VIDEO.to_string()])
+            .collect(),
     };
     let _ = tokio::time::timeout(FIRST_KEYMAP_WAIT, keymap.wait_for(|k| !k.is_empty())).await;
     let first_keymap = keymap.borrow_and_update().clone();
@@ -305,6 +309,7 @@ where
     // it before anything else (even GPU setup) so the server's round-trip
     // estimate is seeded ahead of the first frame ack.
     let mut got_ack = false;
+    let mut cursor_in_video = false;
     let mut headless = false;
     let (mut width, mut height, mut chroma, mut scale_milli, pipeline, mut view, mut fps_cap) = loop {
         match reader.read_msg::<ServerMsg>().await? {
@@ -319,6 +324,7 @@ where
                         Incompatible(version_mismatch(PROTOCOL_VERSION, version).into()).into(),
                     );
                 }
+                cursor_in_video = features.iter().any(|f| f == FEATURE_CURSOR_IN_VIDEO);
                 tracing::debug!(?features, "server features");
                 headless = session.headless;
                 got_ack = true;
@@ -355,12 +361,14 @@ where
         }
     };
     let mut decoder = new_decoder(&gpu, chroma, width, height)?;
+    let mut server_pipeline = pipeline;
     let mut video_label = tier_label(pipeline, &decoder);
     let _ = status.send(Status::Connected {
         video: video_label.clone(),
         view_width: view.0,
         view_height: view.1,
         fps_cap,
+        cursor_in_video,
         headless,
     });
     let decode_on = match (&decoder, &gpu) {
@@ -655,6 +663,30 @@ where
                         }
                     }
                     Err(e) => {
+                        // Some drivers advertise H.264 decoding but export
+                        // surfaces our Vulkan importer cannot use. Keyframes
+                        // cannot fix that capability mismatch.
+                        if matches!(decoder, VideoDecoder::Gpu(_))
+                            && matches!(
+                                e.downcast_ref::<gliff_vk::Error>(),
+                                Some(gliff_vk::Error::Unsupported(_))
+                            )
+                        {
+                            tracing::warn!(error = %e, "unsupported GPU decode path; switching to CPU");
+                            gpu = None;
+                            decoder = new_decoder(&gpu, chroma, width, height)?;
+                            undelivered = None;
+                            last_gpu_geometry = None;
+                            video_label = tier_label(server_pipeline, &decoder);
+                            let _ = status.send(Status::Connected {
+                                video: video_label.clone(),
+                                view_width: view.0,
+                                view_height: view.1,
+                                fps_cap,
+                                cursor_in_video,
+                                headless,
+                            });
+                        }
                         tracing::warn!(error = %e, "decode error; requesting keyframe");
                         in_decoder.clear();
                         let _ = out_tx.send((ClientMsg::RequestKeyframe, Bytes::new()));
@@ -683,12 +715,14 @@ where
                 }
                 (width, height, chroma, scale_milli) = (w, h, c, s);
                 (view, fps_cap) = ((view_width, view_height), f);
+                server_pipeline = pipeline;
                 video_label = tier_label(pipeline, &decoder);
                 let _ = status.send(Status::Connected {
                     video: video_label.clone(),
                     view_width,
                     view_height,
                     fps_cap,
+                    cursor_in_video,
                     headless,
                 });
             }
