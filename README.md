@@ -133,6 +133,13 @@ gliff --server-bin 'gliff-server --low-bandwidth' user@host
 - Screens wider than 4096 pixels are streamed at a reduced size and scaled
   back up.
 
+## Other clients
+
+- [Gliff Client](https://github.com/c4software/gliff-client): an Android
+  app, on [Google Play](https://play.google.com/store/apps/details?id=io.github.c4software.gliff).
+  It talks to an unmodified `gliff-server`. Maintained separately, not by the
+  gliff authors.
+
 ## More
 
 - [docs/architecture.md](docs/architecture.md): how it works, the design
