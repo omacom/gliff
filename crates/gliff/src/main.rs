@@ -65,6 +65,11 @@ struct Cli {
     /// this window, instead of mirroring the remote's focused screen.
     #[arg(long, conflicts_with = "output")]
     headless: bool,
+    /// With --headless: bring the remote's workspaces, and their windows,
+    /// onto the headless output for the session; they go back to their
+    /// screens on disconnect.
+    #[arg(long, requires = "headless")]
+    move_workspaces: bool,
     /// Mirror the named remote output (e.g. `DP-1`) instead of the focused one.
     #[arg(long)]
     output: Option<String>,
@@ -248,6 +253,9 @@ fn ssh_endpoint(cli: &Cli, host: &str) -> Endpoint {
     t.server_bin = cli.server_bin.clone();
     t.server_args = match (&cli.output, cli.headless) {
         (Some(name), _) => vec!["--output".into(), name.clone()],
+        (None, true) if cli.move_workspaces => {
+            vec!["--headless".into(), "--move-workspaces".into()]
+        }
         (None, true) => vec!["--headless".into()],
         (None, false) => vec!["--output".into(), "auto".into()],
     };
