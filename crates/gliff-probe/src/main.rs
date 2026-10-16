@@ -783,6 +783,8 @@ fn serve_test(node: &std::path::Path, addr: &str, frames: usize, video: VideoMod
                     if let Some(s) = serving.as_mut() { s.3 = s.3.saturating_sub(1); }
                     push_chunks(&mut writer, &mut serving).await?;
                 }
+                // The server's heartbeat pings throughout; answer like the client.
+                ServerMsg::Ping { t } => writer.write_msg(&ClientMsg::Pong { t }).await?,
                 ServerMsg::CursorPos { .. } | ServerMsg::Pong { .. } | ServerMsg::Error { .. } => {}
                 _ => {}
             }
@@ -1052,6 +1054,8 @@ fn stream_bench(
                         offset_ms = Some(server_now_ms as f64 - (t as f64 + rtt / 2.0));
                     }
                 }
+                // The server's heartbeat pings throughout; answer like the client.
+                ServerMsg::Ping { t } => writer.write_msg(&ClientMsg::Pong { t }).await?,
                 _ => {}
             }
         }

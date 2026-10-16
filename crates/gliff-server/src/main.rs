@@ -5,6 +5,7 @@
 #![forbid(unsafe_code)]
 
 mod clipboard;
+mod heartbeat;
 mod notify;
 mod rate;
 mod session;

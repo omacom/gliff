@@ -155,12 +155,23 @@ Every crate with `unsafe` documents the safety requirements at each block.
   nothing; a request stays outstanding while sending is blocked, so the frame
   that finally goes out is current.
   A separate writer task owns the socket write half and keeps at most one
-  queued encoded frame; unsent cursor and pong messages are coalesced,
+  queued encoded frame; unsent cursor, ping and pong messages are coalesced,
   clipboard messages are never coalesced (transfers are ordered and
   reliable, bounded by the engine's ack window), and stream configuration
   stays ordered with its video frames.
   The session keeps processing input while a video write is blocked, and a
   write that outlives a frame interval is a congestion signal of its own.
+  The session pings the client every 2 s (`gliff-server/src/heartbeat.rs`),
+  and any client message counts as a sign of life. The reader and writer
+  tasks apply each message and each completed ping write to the shared
+  heartbeat as it happens, so queued work never distorts it. When nothing
+  arrives within 10 s of a ping finishing its write (30 s while writes are
+  blocked), held keys and buttons are released, and input received from
+  then on, or received before the release but not yet handled, is dropped
+  until a ping sent after that point is answered. A client that stays
+  silent ends the session after 5 minutes on a headless output, which a
+  reconnect cannot reattach, or 60 s on a mirrored one, so a sleeping or
+  disconnected client does not leave keys pressed.
 
 - **Rate control and the quality ladder** (`gliff-server/src/rate.rs`). A
   transport-independent `LinkEstimator` pairs acks by frame id and measures
