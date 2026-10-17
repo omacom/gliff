@@ -258,8 +258,15 @@ impl H264Decoder {
         let refs = (sps.max_num_ref_frames as usize).clamp(1, 16);
         let dpb_slots = refs + 1;
         self.stream = None;
+        // NVIDIA's VA-API driver exports block-linear NV12 whose luma dmabuf
+        // is padded to 64 KiB. Vulkan reads such a surface wrongly (a green
+        // tint) unless the size is already a multiple of that: 8 blocks of
+        // 64 B x 128 rows, which a width of 512 guarantees for any height.
+        // The surface may be wider than the picture; the context stays at
+        // the coded size.
+        let alloc_w = cw.next_multiple_of(512);
         let surfaces = (0..dpb_slots + 1)
-            .map(|_| Surface::new_nv12(&self.display, cw, ch, UsageHint::Decoder))
+            .map(|_| Surface::new_nv12(&self.display, alloc_w, ch, UsageHint::Decoder))
             .collect::<Result<Vec<_>>>()?;
         let targets: Vec<&Surface> = surfaces.iter().collect();
         let context = Context::new(&self.display, &self.config, cw, ch, &targets)?;
