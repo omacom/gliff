@@ -65,18 +65,19 @@ To build from source, see [docs/development.md](docs/development.md).
 gliff user@host
 ```
 
-This mirrors the screen that has focus on the remote machine. To pick a
-screen, or to get a private one:
+On a Hyprland machine this gives the remote a screen of its own, the size
+and scale of your window, and moves its workspaces and their windows onto
+it. The screen follows the window as you resize it; when you disconnect it
+is removed and the workspaces go back to their own screens. To mirror a
+screen instead, or to leave the workspaces where they are:
 
 ```
-gliff --output DP-1 user@host   # mirror a named remote screen
-gliff --headless user@host      # a private remote screen, sized and
-                                # scaled to this window
+gliff --mirror user@host            # mirror the remote's focused screen
+gliff --output DP-1 user@host       # mirror a named remote screen
+gliff --keep-workspaces user@host   # a screen of its own, empty
 ```
 
-A mirrored screen keeps its own size and is fitted into the window. A private
-screen follows the window as you resize it, and is removed when you
-disconnect.
+A mirrored screen keeps its own size and is fitted into the window.
 
 Every machine you connect to gets a tab in the title bar. Click a tab to
 connect to that machine, or to switch to it: each connection keeps running

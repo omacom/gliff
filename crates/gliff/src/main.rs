@@ -61,11 +61,24 @@ struct Cli {
     /// Remote gliff-server path.
     #[arg(long, default_value = "gliff-server")]
     server_bin: String,
-    /// Create a private headless output on the remote, sized and scaled to
-    /// this window, instead of mirroring the remote's focused screen.
+    /// Mirror the remote's focused screen, fitted into this window, instead
+    /// of giving the remote a screen the size of this window (the default).
     #[arg(long, conflicts_with = "output")]
+    mirror: bool,
+    /// The default: a private screen on the remote, sized and scaled to this
+    /// window, holding the remote's workspaces for the session.
+    #[arg(long, hide = true, conflicts_with_all = ["mirror", "output"])]
     headless: bool,
-    /// Mirror the named remote output (e.g. `DP-1`) instead of the focused one.
+    /// The default: the remote's workspaces, and their windows, move onto
+    /// the window's screen for the session, and go back to their screens on
+    /// disconnect.
+    #[arg(long, hide = true, conflicts_with = "keep_workspaces")]
+    move_workspaces: bool,
+    /// Leave the remote's workspaces on its own screens: the window's
+    /// screen starts empty.
+    #[arg(long, conflicts_with_all = ["mirror", "output"])]
+    keep_workspaces: bool,
+    /// Mirror the named remote output (e.g. `DP-1`).
     #[arg(long)]
     output: Option<String>,
     /// Hotkey that releases captured shortcuts and hands the keyboard back to
@@ -246,12 +259,26 @@ fn endpoints_from_cli(cli: &Cli) -> Vec<Endpoint> {
 fn ssh_endpoint(cli: &Cli, host: &str) -> Endpoint {
     let mut t = SshTarget::new(host.to_string());
     t.server_bin = cli.server_bin.clone();
-    t.server_args = match (&cli.output, cli.headless) {
-        (Some(name), _) => vec!["--output".into(), name.clone()],
-        (None, true) => vec!["--headless".into()],
-        (None, false) => vec!["--output".into(), "auto".into()],
-    };
+    t.server_args = server_args(cli);
     Endpoint::Ssh(t)
+}
+
+/// What the server shows: by default a screen the size of the window that
+/// holds the remote's workspaces; a mirror with --mirror or --output.
+fn server_args(cli: &Cli) -> Vec<String> {
+    match (&cli.output, cli.mirror) {
+        (Some(name), _) => vec!["--output".into(), name.clone()],
+        (None, true) => vec!["--output".into(), "auto".into()],
+        // Moving the workspaces is asked in the handshake (see
+        // `moves_workspaces`), which servers without it ignore.
+        (None, false) => vec!["--headless".into()],
+    }
+}
+
+/// Whether the session asks the server to bring its workspaces onto the
+/// window's screen.
+fn moves_workspaces(cli: &Cli) -> bool {
+    cli.output.is_none() && !cli.mirror && !cli.keep_workspaces
 }
 
 /// The tab name for an endpoint.
@@ -991,6 +1018,7 @@ fn start_session(ui: Rc<App>, s: Rc<Session>) {
 
     let endpoint = s.endpoint.clone();
     let video = gliff_sw::VideoMode::resolve(ui.cli.video.as_deref());
+    let move_workspaces = moves_workspaces(&ui.cli);
     let keymap = ui.keymap.clone();
     std::thread::Builder::new()
         .name("gliff-net".into())
@@ -998,6 +1026,7 @@ fn start_session(ui: Rc<App>, s: Rc<Session>) {
             Worker {
                 endpoint,
                 video,
+                move_workspaces,
                 frames: frame_tx,
                 status: status_tx,
                 input: input_rx,
@@ -1966,6 +1995,25 @@ fn device_scale(ui: &App) -> f64 {
 mod tests {
     use super::*;
     use std::cell::RefCell;
+
+    #[test]
+    fn the_window_gets_its_own_screen_unless_asked_to_mirror() {
+        let args =
+            |argv: &[&str]| server_args(&Cli::try_parse_from([&["gliff"], argv].concat()).unwrap());
+        let moves = |argv: &[&str]| {
+            moves_workspaces(&Cli::try_parse_from([&["gliff"], argv].concat()).unwrap())
+        };
+        assert_eq!(args(&["h"]), ["--headless"]);
+        assert!(moves(&["h"]));
+        assert!(moves(&["--headless", "--move-workspaces", "h"]));
+        assert_eq!(args(&["--keep-workspaces", "h"]), ["--headless"]);
+        assert!(!moves(&["--keep-workspaces", "h"]));
+        assert_eq!(args(&["--mirror", "h"]), ["--output", "auto"]);
+        assert!(!moves(&["--mirror", "h"]));
+        assert_eq!(args(&["--output", "DP-1", "h"]), ["--output", "DP-1"]);
+        assert!(!moves(&["--output", "DP-1", "h"]));
+        assert!(Cli::try_parse_from(["gliff", "--mirror", "--keep-workspaces", "h"]).is_err());
+    }
 
     #[test]
     fn reconnect_invalidates_the_previous_scale_request() {

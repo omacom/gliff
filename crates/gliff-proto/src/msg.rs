@@ -36,6 +36,11 @@ pub const PROTOCOL_VERSION: u16 = 1;
 /// behaviour is used only when both ends list it.
 pub const FEATURES: &[&str] = &[];
 
+/// A request in the client's list rather than a capability: give a headless
+/// output the host's workspaces for the session, as `--move-workspaces`
+/// does. Asked this way, a server too old to move them still connects.
+pub const FEATURE_MOVE_WORKSPACES: &str = "move-workspaces";
+
 pub fn features() -> Vec<String> {
     FEATURES.iter().map(|f| f.to_string()).collect()
 }

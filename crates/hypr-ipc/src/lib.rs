@@ -153,6 +153,53 @@ impl Instance {
         self.request_json("monitors all")
     }
 
+    pub fn workspaces(&self) -> Result<Vec<Workspace>> {
+        self.request_json("workspaces")
+    }
+
+    /// Run a dispatcher. A legacy (hyprlang) config takes `dispatch <name>
+    /// <args>`; a Lua config reads `dispatch` as `hl.dispatch(...)`, rejects
+    /// that form, and takes the `hl.dsp` call in `lua` instead.
+    fn dispatcher(&self, legacy: &str, lua: &str) -> Result<()> {
+        match self.dispatch(&format!("dispatch {legacy}")) {
+            Err(Error::Command { response, .. }) if response.contains("lua") => {
+                self.dispatch(&format!("dispatch {lua}"))
+            }
+            other => other,
+        }
+    }
+
+    /// Move a workspace, with its windows, onto `monitor`.
+    pub fn move_workspace_to_monitor(&self, workspace: i64, monitor: &str) -> Result<()> {
+        self.dispatcher(
+            &format!("moveworkspacetomonitor {workspace} {monitor}"),
+            &format!(
+                "hl.dsp.workspace.move({{ workspace = {workspace}, monitor = \"{monitor}\" }})"
+            ),
+        )
+    }
+
+    /// Show `workspace` on `monitor`, which it must be on, and focus it.
+    pub fn show_workspace(&self, monitor: &str, workspace: i64) -> Result<()> {
+        self.dispatcher(
+            &format!("focusmonitor {monitor}"),
+            &format!("hl.dsp.focus({{ monitor = \"{monitor}\" }})"),
+        )?;
+        self.dispatcher(
+            &format!("workspace {workspace}"),
+            &format!("hl.dsp.focus({{ workspace = \"{workspace}\" }})"),
+        )
+    }
+
+    /// Switch one monitor's DPMS on or off, leaving the others alone.
+    pub fn set_dpms(&self, monitor: &str, on: bool) -> Result<()> {
+        let action = if on { "on" } else { "off" };
+        self.dispatcher(
+            &format!("dpms {action} {monitor}"),
+            &format!("hl.dsp.dpms({{ action = \"{action}\", monitor = \"{monitor}\" }})"),
+        )
+    }
+
     pub fn get_option(&self, name: &str) -> Result<OptionValue> {
         self.request_json(&format!("getoption {name}"))
     }
@@ -231,6 +278,35 @@ pub struct Monitor {
     pub focused: bool,
     #[serde(default)]
     pub disabled: bool,
+    #[serde(default)]
+    pub active_workspace: WorkspaceRef,
+    /// False while DPMS has the monitor off; Hyprland does not render it.
+    #[serde(default = "yes")]
+    pub dpms_status: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+/// A workspace as a monitor refers to it.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct WorkspaceRef {
+    pub id: i64,
+    #[serde(default)]
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Workspace {
+    /// Negative for special (scratchpad) workspaces.
+    pub id: i64,
+    #[serde(default)]
+    pub name: String,
+    /// The monitor's name.
+    pub monitor: String,
+    #[serde(default)]
+    pub windows: u32,
 }
 
 fn one() -> f32 {
@@ -288,6 +364,32 @@ mod tests {
         let explicit = Instance::discover_in(tmp.path(), Some("old_1_1")).unwrap();
         assert_eq!(explicit.signature, "old_1_1");
         assert!(Instance::discover_in(tmp.path(), Some("missing")).is_err());
+    }
+
+    #[test]
+    fn parses_workspaces_and_active_workspace() {
+        let ws: Vec<Workspace> = serde_json::from_str(
+            r#"[{"id": 1, "name": "1", "monitor": "DP-2", "monitorID": 0, "windows": 3},
+                {"id": -98, "name": "special:scratch", "monitor": "DP-2", "windows": 0}]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            (ws[0].id, ws[0].monitor.as_str(), ws[0].windows),
+            (1, "DP-2", 3)
+        );
+        assert_eq!(ws[1].id, -98);
+        let m: Monitor = serde_json::from_str(
+            r#"{"id": 0, "name": "DP-2", "width": 3440, "height": 1440,
+                "activeWorkspace": {"id": 4, "name": "4"}}"#,
+        )
+        .unwrap();
+        assert_eq!(m.active_workspace.id, 4);
+        assert!(m.dpms_status, "a monitor without the field counts as on");
+        let m: Monitor = serde_json::from_str(
+            r#"{"id": 1, "name": "gliff-1", "width": 1280, "height": 712, "dpmsStatus": false}"#,
+        )
+        .unwrap();
+        assert!(!m.dpms_status);
     }
 
     #[test]

@@ -14,7 +14,7 @@ use bytes::Bytes;
 use gliff_proto::clipboard::CHUNK;
 use gliff_proto::{
     features, is_incompatible, version_mismatch, ChromaMode, ClientCaps, ClientMsg, ClipboardFile,
-    ClipboardMsg, Codec, ServerMsg, VideoPipeline, PROTOCOL_VERSION,
+    ClipboardMsg, Codec, ServerMsg, VideoPipeline, FEATURE_MOVE_WORKSPACES, PROTOCOL_VERSION,
 };
 use gliff_sw::VideoMode;
 use gliff_transport::clipboard::progress::Progress;
@@ -125,6 +125,8 @@ pub enum Frame {
 pub struct Worker {
     pub endpoint: Endpoint,
     pub video: VideoMode,
+    /// Ask a Hyprland server to move its workspaces onto the window's screen.
+    pub move_workspaces: bool,
     /// Bounded so a stalled UI thread cannot make the decoder buffer frames
     /// without limit; when full, the newest frame is dropped (latest-wins).
     pub frames: SyncSender<Picture>,
@@ -157,7 +159,10 @@ impl Worker {
                     session(
                         rd,
                         wr,
-                        self.video,
+                        Wants {
+                            video: self.video,
+                            move_workspaces: self.move_workspaces,
+                        },
                         self.frames,
                         self.status,
                         self.input,
@@ -170,7 +175,10 @@ impl Worker {
                     session(
                         ssh.stdout,
                         ssh.stdin,
-                        self.video,
+                        Wants {
+                            video: self.video,
+                            move_workspaces: self.move_workspaces,
+                        },
                         self.frames,
                         self.status,
                         self.input,
@@ -257,10 +265,16 @@ fn tier_label(pipeline: Option<VideoPipeline>, decoder: &VideoDecoder) -> String
     format!("{server}→{}", decoder.label())
 }
 
+/// What the session asks of the decoder and the server.
+struct Wants {
+    video: VideoMode,
+    move_workspaces: bool,
+}
+
 async fn session<R, W>(
     rd: R,
     wr: W,
-    video: VideoMode,
+    wants: Wants,
     frames: SyncSender<Picture>,
     status: StdSender<Status>,
     mut input: UnboundedReceiver<ToWorker>,
@@ -273,6 +287,10 @@ where
     let mut reader = Framed::new(rd);
     let mut writer = Framed::new(wr);
 
+    let Wants {
+        video,
+        move_workspaces,
+    } = wants;
     let gpu = open_gpu(video);
     let caps = ClientCaps {
         codecs: vec![Codec::H264],
@@ -285,7 +303,10 @@ where
         } else {
             vec![ChromaMode::Single420]
         },
-        features: features(),
+        features: features()
+            .into_iter()
+            .chain(move_workspaces.then(|| FEATURE_MOVE_WORKSPACES.to_string()))
+            .collect(),
     };
     let _ = tokio::time::timeout(FIRST_KEYMAP_WAIT, keymap.wait_for(|k| !k.is_empty())).await;
     let first_keymap = keymap.borrow_and_update().clone();
