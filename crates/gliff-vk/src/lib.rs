@@ -26,6 +26,9 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+mod decode_import;
+pub use decode_import::decode_import_supported;
+
 pub mod compute;
 pub mod device;
 pub mod image;

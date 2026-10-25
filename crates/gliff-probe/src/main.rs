@@ -3,7 +3,6 @@
 
 #![forbid(unsafe_code)]
 
-use std::os::fd::AsFd;
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::Duration;
@@ -14,9 +13,13 @@ use wayland_client::globals::GlobalListContents;
 use wayland_client::protocol::wl_registry::WlRegistry;
 use wayland_client::{Connection, Dispatch, QueueHandle};
 
-use gliff_proto::color::{bgra_to_yuv444, downscale_bgra, psnr, yuv444_to_bgra};
+mod gpu;
+mod pipeline;
+mod pipeline_quality;
+
+use gliff_proto::color::{bgra_to_yuv444, psnr, yuv444_to_bgra};
 use gliff_sw::VideoMode;
-use gliff_vk::{Decoder, DmabufPlane, EncodedFrame, Encoder, EncoderSettings, Gpu};
+use gliff_vk::{Decoder, EncodedFrame, Encoder, EncoderSettings, Gpu};
 use hypr_capture::{CaptureConfig, CaptureEvent, CaptureMode, Capturer};
 use hypr_input::{keys, Input, InputConfig, InputEvent};
 use hypr_wl::Target;
@@ -192,12 +195,16 @@ fn main() -> Result<()> {
     };
     let node = hypr_capture::render_node_for_target(cli.render_node.as_deref(), &target);
     let video = VideoMode::resolve(cli.video.as_deref());
+    let fallback = pipeline::Fallback::resolve(
+        cli.video.as_deref(),
+        std::env::var("GLIFF_VIDEO").ok().as_deref(),
+    );
     let capture_mode = CaptureMode::resolve(cli.capture.as_deref());
     match cli.cmd {
         Cmd::Protocols => protocols(&target)?,
         Cmd::Outputs => outputs(&target)?,
         Cmd::Permissions => permissions(&target)?,
-        Cmd::Gpu => gpu_info(&node)?,
+        Cmd::Gpu => gpu::info(&node)?,
         Cmd::Surfaces { width, height } => surfaces(&node, width, height)?,
         Cmd::Roundtrip {
             width,
@@ -236,7 +243,9 @@ fn main() -> Result<()> {
             text,
             click,
         } => input(&target, output, &text, click)?,
-        Cmd::Pipeline { output } => pipeline(&target, &node, capture_mode, output, video)?,
+        Cmd::Pipeline { output } => {
+            pipeline::run(&target, &node, capture_mode, output, video, fallback)?
+        }
         Cmd::ServeTest { connect, frames } => serve_test(&node, &connect, frames, video)?,
         Cmd::StreamBench {
             connect,
@@ -263,7 +272,7 @@ fn main() -> Result<()> {
             protocols(&target)?;
             outputs(&target)?;
             permissions(&target)?;
-            let gpu_ok = match gpu_info(&node) {
+            let gpu_ok = match gpu::info(&node) {
                 Ok(()) => true,
                 Err(e) => {
                     status(
@@ -1228,75 +1237,6 @@ fn bench(iters: usize) -> Result<()> {
     Ok(())
 }
 
-fn gpu_info(node: &std::path::Path) -> Result<()> {
-    let gpu = Gpu::open(Some(node))?;
-    println!("  vulkan: {} ({})", gpu.name, gpu.driver);
-    println!(
-        "  va-api: {} (libva {}.{})",
-        gpu.va.vendor, gpu.va.version.0, gpu.va.version.1
-    );
-    print_caps(&gpu.va_caps);
-    print_encode(&gpu);
-    match gpu.va_caps.can_decode() {
-        Ok(()) => status(true, "VA-API H.264 decode"),
-        Err(e) => status(false, &format!("VA-API H.264 decode: {e}")),
-    }
-    Ok(())
-}
-
-fn print_caps(caps: &gliff_va::Caps) {
-    if let Some(e) = caps.encode_entrypoint {
-        println!(
-            "  H.264 encode: entrypoint {}, rate control {}, packed headers {:#x}, maximum {}x{}",
-            gliff_va::display::entrypoint_name(e),
-            gliff_va::display::rate_control_names(caps.rate_control).join("|"),
-            caps.packed_headers,
-            caps.max_width,
-            caps.max_height
-        );
-    }
-}
-
-/// Which API encodes H.264 here, if either. The VA-API line keeps its own
-/// PASS (`e2e.sh` keys the VA-API-only checks on it), but a VA-API driver
-/// without an encoder is not a failure when Vulkan Video encodes instead:
-/// that is the normal NVIDIA case, and a bare FAIL there reads as if the
-/// GPU tier were unavailable.
-fn print_encode(gpu: &Gpu) {
-    let vk = gpu.vk_encode_info();
-    let va = gpu.va_caps.can_encode();
-    match (&va, &vk) {
-        (Ok(()), _) => status(true, "VA-API H.264 encode"),
-        (Err(e), Some(_)) => println!("  va-api H.264 encode: {e}; Vulkan Video encodes instead"),
-        (Err(e), None) => status(false, &format!("VA-API H.264 encode: {e}")),
-    }
-    match (&vk, va.is_ok()) {
-        (Some(info), false) => status(
-            true,
-            &format!(
-                "Vulkan Video H.264 encode: maximum {}x{}, {} encode queue(s), {} {}",
-                info.max_extent.0,
-                info.max_extent.1,
-                info.queues,
-                info.std_header,
-                info.std_header_version
-            ),
-        ),
-        // The VA-API encoder is the one the pipeline picks; say the fallback
-        // is there without a second PASS line for an encoder nothing uses.
-        (Some(info), true) => println!(
-            "  vulkan video: H.264 encode also available (maximum {}x{}), unused while VA-API encodes",
-            info.max_extent.0, info.max_extent.1
-        ),
-        (None, false) => status(
-            false,
-            "Vulkan Video H.264 encode: no encoder (no VK_KHR_video_encode_h264 H.264 profile, \
-             or GLIFF_VK_ENCODE=0); the CPU tier will be used",
-        ),
-        (None, true) => {}
-    }
-}
-
 /// The hand-off: a driver-owned NV12 surface exported as a dmabuf, imported
 /// into Vulkan, written by the split shader, and read back through the
 /// driver to compare with the CPU split.
@@ -1594,242 +1534,4 @@ fn reference_for(src: &[u8], w: usize, h: usize, dual: bool) -> Vec<u8> {
             &gliff_proto::chroma::yuv444_to_nv12(&yuv),
         ))
     }
-}
-
-/// Capture one frame and push it through the exact server and client
-/// pipelines: dmabuf import, GPU split, two encodes, two decodes, GPU
-/// recombine. Compares the result with the CPU 4:4:4 reference.
-fn pipeline(
-    target: &Target,
-    node: &std::path::Path,
-    mode: CaptureMode,
-    output: Option<String>,
-    video: VideoMode,
-) -> Result<()> {
-    if mode == CaptureMode::Shm && video == VideoMode::Gpu {
-        bail!("--capture shm frames can only go through the CPU pipeline; add --video cpu");
-    }
-    let output = pick_output(target, output)?;
-    let mut cfg = CaptureConfig::new(output.clone());
-    cfg.target = target.clone();
-    cfg.render_node = node.to_path_buf();
-    cfg.mode = mode;
-    // Capture the way the tier under test captures, as the server does: the
-    // GPU tier imports the dmabuf as it is and must not get a wl_shm buffer,
-    // while the CPU tier maps the frame and keeps the fallback.
-    cfg.shm_fallback = video != VideoMode::Gpu;
-    cfg.cursor = false;
-    let (tx, rx) = mpsc::channel();
-    let capturer = Capturer::start(
-        cfg,
-        Box::new(move |ev| {
-            let _ = tx.send(ev);
-        }),
-    )?;
-    capturer.request_frame()?;
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    let mut captured = None;
-    while std::time::Instant::now() < deadline {
-        match rx.recv_timeout(Duration::from_millis(200)) {
-            Ok(CaptureEvent::Frame(frame)) => {
-                captured = Some(frame);
-                break;
-            }
-            Ok(CaptureEvent::Error(e)) => bail!("capture error: {e}"),
-            Ok(_) => {}
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(_) => break,
-        }
-    }
-    let frame = captured.ok_or_else(|| {
-        anyhow!(
-            "no frame captured (a headless output renders reliably; a physical KVM output may not)"
-        )
-    })?;
-    if video == VideoMode::Gpu && frame.buffer.is_shm() {
-        bail!(
-            "the GPU tier needs dmabuf capture, but capture fell back to wl_shm; \
-             this is what the server refuses too (run with --video cpu)"
-        );
-    }
-    let info = &frame.buffer.info;
-    // Even dimensions, as `read_bgra` crops to for the 4:2:0 path.
-    let (w, h) = frame.extent();
-    let fourcc = drm_fourcc::DrmFourcc::try_from(info.fourcc)
-        .map_err(|_| anyhow!("captured fourcc {:#x} is not a DRM format", info.fourcc))?;
-    println!(
-        "  captured {w}x{h} {fourcc:?} modifier {:#x} {} from {output}",
-        info.modifier,
-        if frame.buffer.is_shm() {
-            "(wl_shm)"
-        } else {
-            "(dmabuf)"
-        }
-    );
-    // The CPU reference for the PSNR, when the frame maps at all: a tiled
-    // capture buffer (NVIDIA, GPU tier) is not CPU-readable, which is why the
-    // CPU tier captures into wl_shm instead.
-    let reference = match frame.read_bgra() {
-        Ok(r) => Some(r),
-        Err(e) if video == VideoMode::Gpu => {
-            println!("  no CPU reference for this frame: {e}; the PSNR is skipped");
-            None
-        }
-        Err(e) => return Err(e).context("read the captured frame"),
-    };
-    let plane = DmabufPlane {
-        fd: info.fd.as_fd(),
-        width: info.width,
-        height: info.height,
-        offset: info.planes[0].offset,
-        stride: info.planes[0].stride,
-        fourcc,
-        modifier: info.modifier,
-    };
-
-    let gpu = match video {
-        VideoMode::Gpu => Some(Gpu::open(Some(node))?),
-        VideoMode::Cpu => None,
-    };
-    let encoder_max = match &gpu {
-        Some(gpu) => Encoder::max_size(gpu).context("encoder limits")?,
-        None => gliff_sw::Encoder::MAX_SIZE,
-    };
-    let (sw, sh) = EncoderSettings::fit_extent(w, h, encoder_max);
-    let scaled = (sw, sh) != (w, h);
-    if scaled {
-        println!(
-            "  scaling {w}x{h} to {sw}x{sh} to fit the encoder maximum {}x{}",
-            encoder_max.0, encoder_max.1
-        );
-    }
-    let settings = EncoderSettings {
-        width: sw,
-        height: sh,
-        bitrate: EncoderSettings::default_bitrate(sw, sh, 60),
-        framerate: 60,
-        vbv_ms: EncoderSettings::DEFAULT_VBV_MS,
-    };
-    let (mut encoder, mut decoder) = match &gpu {
-        Some(gpu) => (
-            ProbeEncoder::Gpu(Box::new(
-                Encoder::new(gpu, settings, true).context("encoder")?,
-            )),
-            ProbeDecoder::Gpu(Box::new(
-                Decoder::new(gpu, true, sw, sh).context("decoder")?,
-            )),
-        ),
-        None => (
-            ProbeEncoder::Cpu(Box::new(
-                gliff_sw::Encoder::new(sw_settings(sw, sh, settings.bitrate), true)
-                    .context("encoder")?,
-            )),
-            ProbeDecoder::Cpu(Box::new(
-                gliff_sw::Decoder::new(true, sw, sh).context("decoder")?,
-            )),
-        ),
-    };
-    let t0 = std::time::Instant::now();
-    let packet = match &mut encoder {
-        ProbeEncoder::Gpu(enc) => enc
-            .encode_dmabuf_transformed(1, &plane, frame.transform, true)
-            .context("encode")?,
-        ProbeEncoder::Cpu(enc) => {
-            let reference = reference
-                .as_ref()
-                .ok_or_else(|| anyhow!("the CPU tier needs a mappable capture buffer"))?;
-            let pixels = if scaled {
-                downscale_bgra(
-                    &reference.pixels,
-                    reference.width,
-                    reference.height,
-                    sw as usize,
-                    sh as usize,
-                )
-            } else {
-                reference.pixels.clone()
-            };
-            let f = enc.encode_bgra(&pixels, true).context("encode")?;
-            EncodedFrame {
-                main: f.main,
-                aux: f.aux,
-                keyframe: f.keyframe,
-            }
-        }
-    };
-    let enc_ms = t0.elapsed().as_secs_f64() * 1000.0;
-    let aux = packet.aux.as_deref().unwrap_or(&[]);
-    println!(
-        "  encoded main {} bytes, aux {} bytes, key={}, {enc_ms:.1} ms",
-        packet.main.len(),
-        aux.len(),
-        packet.keyframe
-    );
-    let t1 = std::time::Instant::now();
-    let out = match decoder
-        .decode_to_bgra(&packet.main, aux)
-        .context("decode")?
-    {
-        Some(out) => out,
-        // The CPU decoder holds its only picture until the next unit or a
-        // drain; this is the last unit, so drain.
-        None => decoder
-            .flush()
-            .context("flush")?
-            .ok_or_else(|| anyhow!("decode produced no frame"))?,
-    };
-    let dec_ms = t1.elapsed().as_secs_f64() * 1000.0;
-    drop(frame);
-    drop(capturer);
-
-    let Some(reference) = reference else {
-        println!("  decoded {dec_ms:.1} ms");
-        status(
-            true,
-            "Dual420 4:4:4 GPU pipeline on a captured frame (ran; no PSNR without a \
-             CPU-mappable capture buffer)",
-        );
-        return Ok(());
-    };
-
-    // What the CPU reference path makes of the same pixels, so only coding
-    // loss and shader rounding count. A scaled stream is compared with a
-    // CPU downscale, whose filter differs from the shader's, so the PSNR
-    // is then informational and the check is that the round trip ran.
-    let pixels = if scaled {
-        downscale_bgra(
-            &reference.pixels,
-            reference.width,
-            reference.height,
-            sw as usize,
-            sh as usize,
-        )
-    } else {
-        reference.pixels.clone()
-    };
-    let cpu = yuv444_to_bgra(&bgra_to_yuv444(
-        &pixels,
-        sw as usize * 4,
-        sw as usize,
-        sh as usize,
-    ));
-    let rgb_psnr = psnr(&rgb_channels(&cpu), &rgb_channels(&out));
-    println!("  decoded {dec_ms:.1} ms; end-to-end RGB PSNR vs CPU reference {rgb_psnr:.1} dB");
-    // OpenH264 takes a first keyframe's QP from a fixed bits-per-pixel
-    // table (QP 30 at the default bitrate), so the CPU tier scores a few dB
-    // below the GPU on the same frame.
-    let (tier, min_psnr) = if gpu.is_some() {
-        ("GPU", 35.0)
-    } else {
-        ("CPU", 32.0)
-    };
-    let ok = scaled || rgb_psnr > min_psnr;
-    status(
-        ok,
-        &format!("Dual420 4:4:4 {tier} pipeline on a captured frame"),
-    );
-    if !ok {
-        bail!("pipeline PSNR too low");
-    }
-    Ok(())
 }
