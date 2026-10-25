@@ -190,15 +190,17 @@ Every crate with `unsafe` documents the safety requirements at each block.
   below a fifth of the frame budget), so a picture that arrived soft under
   a low starting budget converges to sharp.
 
-- **Threading.** Each pipeline lives on one thread: the server loop and the
-  client decode worker are current-thread tokio runtimes that own their
-  `gliff-vk` objects. The loop's Hyprland IPC calls run on tokio's blocking
-  pool. Capture and input each own a Wayland connection on their own calloop
-  thread and talk to the async side through channels; the capture thread
-  hands the whole `CapturedFrame` (its dmabuf) to the encoder, which releases
-  the ring slot when the encode has finished. On both peers, reads and writes
-  run on separate tasks so an input burst cannot starve video and a blocked
-  write cannot block reads.
+- **Threading.** The server loop and the client decode worker are
+  current-thread tokio runtimes. The client decode worker owns its `gliff-vk`
+  objects; the server encodes on a dedicated thread that builds and owns the
+  encoder and codes one frame at a time, so the loop keeps serving input and
+  capture events during an encode. The loop's Hyprland IPC calls run on
+  tokio's blocking pool. Capture and input each own a Wayland connection on
+  their own calloop thread and talk to the async side through channels; the
+  capture thread hands the whole `CapturedFrame` (its dmabuf) to the encoder,
+  which releases the ring slot when the encode has finished. On both peers,
+  reads and writes run on separate tasks so an input burst cannot starve video
+  and a blocked write cannot block reads.
 
 - **Client display.** The decode worker exports each finished BGRX image as a
   linear dmabuf and the UI wraps it in a `GdkDmabufTexture` on a
