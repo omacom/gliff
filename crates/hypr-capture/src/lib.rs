@@ -118,6 +118,9 @@ pub struct CaptureConfig {
     pub shm_fallback: bool,
     /// Also run a cursor session and report shape/position.
     pub cursor: bool,
+    /// Paint the cursor into video; avoids a separate cursor capture session.
+    /// Takes precedence over `cursor`.
+    pub cursor_in_video: bool,
     /// Refuse to allocate a ring for an output past this size; the capture
     /// then ends with an error.
     pub max_size: Option<SizeLimit>,
@@ -158,6 +161,7 @@ impl CaptureConfig {
             prefer_linear: true,
             shm_fallback: true,
             cursor: true,
+            cursor_in_video: false,
             max_size: None,
         }
     }
