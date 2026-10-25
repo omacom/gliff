@@ -9,6 +9,7 @@ use gliff_vk::{Decoder, DmabufPlane, EncodedFrame, Encoder, EncoderSettings, Gpu
 use hypr_capture::{CaptureConfig, CaptureEvent, CaptureMode, Capturer};
 use hypr_wl::Target;
 
+use super::pipeline_quality;
 use super::{pick_output, rgb_channels, status, sw_settings, ProbeDecoder, ProbeEncoder};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -161,6 +162,7 @@ fn run_tier(
         framerate: 60,
         vbv_ms: EncoderSettings::DEFAULT_VBV_MS,
     };
+    let bitrate = settings.bitrate;
     let (mut encoder, mut decoder) = match &gpu {
         Some(gpu) => (
             ProbeEncoder::Gpu(Box::new(
@@ -244,9 +246,8 @@ fn run_tier(
     };
 
     // What the CPU reference path makes of the same pixels, so only coding
-    // loss and shader rounding count. A scaled stream is compared with a
-    // CPU downscale, whose filter differs from the shader's, so the PSNR
-    // is then informational and the check is that the round trip ran.
+    // loss and shader rounding count. For scaled GPU streams the shader's
+    // downscale filter differs, so their PSNR remains informational.
     let pixels = if scaled {
         downscale_bgra(
             &reference.pixels,
@@ -266,15 +267,20 @@ fn run_tier(
     ));
     let rgb_psnr = psnr(&rgb_channels(&cpu), &rgb_channels(&out));
     println!("  decoded {dec_ms:.1} ms; end-to-end RGB PSNR vs CPU reference {rgb_psnr:.1} dB");
-    // OpenH264 takes a first keyframe's QP from a fixed bits-per-pixel
-    // table (QP 30 at the default bitrate), so the CPU tier scores a few dB
-    // below the GPU on the same frame.
-    let (tier, min_psnr) = if gpu.is_some() {
-        ("GPU", 35.0)
+    let (tier, ok) = if gpu.is_some() {
+        ("GPU", scaled || rgb_psnr > 35.0)
     } else {
-        ("CPU", 32.0)
+        let reference_psnr =
+            pipeline_quality::single_stream_psnr(&pixels, sw_settings(sw, sh, bitrate), &cpu)?;
+        println!(
+            "  pipeline {rgb_psnr:.1} dB, OpenH264 single-stream reference {reference_psnr:.1} dB (margin {:.1} dB)",
+            pipeline_quality::CPU_REFERENCE_MARGIN_DB
+        );
+        (
+            "CPU",
+            pipeline_quality::cpu_passes(rgb_psnr, reference_psnr),
+        )
     };
-    let ok = scaled || rgb_psnr > min_psnr;
     status(
         ok,
         &format!("Dual420 4:4:4 {tier} pipeline on a captured frame"),

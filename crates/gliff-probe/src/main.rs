@@ -14,6 +14,7 @@ use wayland_client::protocol::wl_registry::WlRegistry;
 use wayland_client::{Connection, Dispatch, QueueHandle};
 
 mod pipeline;
+mod pipeline_quality;
 
 use gliff_proto::color::{bgra_to_yuv444, psnr, yuv444_to_bgra};
 use gliff_sw::VideoMode;
