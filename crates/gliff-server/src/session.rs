@@ -20,7 +20,7 @@ use gliff_sw::VideoMode;
 use gliff_transport::clipboard::progress::Jobs;
 use gliff_transport::clipboard::{outbound_channel, Side, Transfers};
 use gliff_transport::Framed;
-use gliff_vk::{Encoder, EncoderSettings, Gpu};
+use gliff_vk::{EncodedFrame, Encoder, EncoderSettings, Gpu};
 
 use crate::encode::{EncodeThread, Encoded, EncoderSpec, VideoEncoder};
 use crate::rate::{Ladder, LinkEstimator, RateController};
@@ -533,6 +533,35 @@ struct InFlight {
     refine: bool,
     /// The frame waited on the byte cap before it was dispatched.
     blocked: bool,
+}
+
+/// What a finished encode means for the session.
+enum Finished {
+    Send(EncodedFrame),
+    /// The output changed during the encode (a resize or mirror change).
+    /// The encoder has advanced past a frame the client never gets.
+    Stale,
+    /// The first GPU encode failed: move to the CPU tier.
+    FallBack(anyhow::Error),
+}
+
+impl Finished {
+    /// `first_gpu_encode` holds on the GPU tier until an encode succeeds. A
+    /// failure then falls back, even for a stale frame; a later failure
+    /// ends the session.
+    fn judge(
+        result: Result<EncodedFrame>,
+        first_gpu_encode: bool,
+        frame: (u32, u32),
+        output: (u32, u32),
+    ) -> Result<Self> {
+        match result {
+            Err(e) if first_gpu_encode => Ok(Self::FallBack(e)),
+            Err(e) => Err(e),
+            Ok(_) if frame != output => Ok(Self::Stale),
+            Ok(encoded) => Ok(Self::Send(encoded)),
+        }
+    }
 }
 
 /// The session-wide fps ceiling; ladder levels cap below it.
@@ -1213,9 +1242,21 @@ impl Session {
         let Some(job) = self.in_flight.take() else {
             return Ok(());
         };
-        let encoded = match done.result {
-            Ok(e) => e,
-            Err(e) if matches!(self.video, VideoTier::Gpu(_)) && !self.gpu_encoded => {
+        let first_gpu_encode = matches!(self.video, VideoTier::Gpu(_)) && !self.gpu_encoded;
+        let output = (self.output.width, self.output.height);
+        let encoded = match Finished::judge(
+            done.result,
+            first_gpu_encode,
+            done.frame.extent(),
+            output,
+        )? {
+            Finished::Send(encoded) => encoded,
+            Finished::Stale => {
+                self.gpu_encoded = true;
+                self.want_keyframe = true;
+                return Ok(());
+            }
+            Finished::FallBack(e) => {
                 tracing::warn!(error = %format!("{e:#}"), "the first GPU encode failed; falling back to the CPU pipeline");
                 self.fall_back_to_cpu()?;
                 // A tiled NVIDIA dmabuf cannot be read by the CPU. Replace
@@ -1230,15 +1271,8 @@ impl Session {
                 self.capture_asked = true;
                 return Ok(());
             }
-            Err(e) => return Err(e),
         };
         self.gpu_encoded = true;
-        // The output changed during the encode (a resize or mirror change).
-        // The encoder has advanced past a frame the client never gets.
-        if !self.matches_output(&done.frame) {
-            self.want_keyframe = true;
-            return Ok(());
-        }
         let (width, height) = job.stream;
         let enc_us = done.took.as_micros();
         let aux = encoded.aux.unwrap_or_default();
@@ -2038,5 +2072,30 @@ mod tests {
         assert_eq!(headless_target(16384, 16384, 1.0), (2880, 2880));
         assert_eq!(headless_target(u32::MAX, u32::MAX, 1.5), (2880, 2880));
         assert_eq!(headless_target(8192, 4608, 1.25), (3840, 2160));
+    }
+
+    #[test]
+    fn a_frame_coded_across_a_resize_is_stale() {
+        let judge = |frame| {
+            let coded = Ok(EncodedFrame {
+                main: vec![1],
+                aux: None,
+                keyframe: false,
+            });
+            Finished::judge(coded, true, frame, (1280, 720)).unwrap()
+        };
+        assert!(matches!(judge((1920, 1080)), Finished::Stale));
+        assert!(matches!(judge((1280, 720)), Finished::Send(_)));
+    }
+
+    #[test]
+    fn only_a_failed_first_gpu_encode_falls_back() {
+        let failed = || Err(anyhow::anyhow!("encode failed"));
+        // The failure wins over a resize during the encode.
+        assert!(matches!(
+            Finished::judge(failed(), true, (1920, 1080), (1280, 720)),
+            Ok(Finished::FallBack(_))
+        ));
+        assert!(Finished::judge(failed(), false, (1280, 720), (1280, 720)).is_err());
     }
 }
