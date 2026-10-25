@@ -292,7 +292,7 @@ where
                 }
                 ControlFlow::Continue(())
             }
-            ev = cap_rx.recv() => session.on_capture(ev)?,
+            ev = cap_rx.recv() => session.on_capture(ev).await?,
             report = write_reports.recv() => {
                 let elapsed = report.context("writer task ended")??;
                 // A write that took longer than a frame interval means the
@@ -378,6 +378,17 @@ where
             .await;
     }
     step
+}
+
+/// Run a Hyprland IPC call on tokio's blocking pool. The reader and writer
+/// tasks keep running while the compositor answers (its socket times out
+/// after 5 s), though the awaiting `select!` arm still holds up the others.
+async fn ipc<T: Send + 'static>(
+    instance: &hypr_ipc::Instance,
+    call: impl FnOnce(&hypr_ipc::Instance) -> hypr_ipc::Result<T> + Send + 'static,
+) -> Result<T> {
+    let instance = instance.clone();
+    Ok(tokio::task::spawn_blocking(move || call(&instance)).await??)
 }
 
 /// What the reader task hands the session.
@@ -668,10 +679,7 @@ impl Session {
             return Ok(());
         }
         tracing::info!(width, height, scale, "resizing headless output");
-        if let Err(e) = self
-            .instance
-            .set_monitor_mode(&self.output.name, width, height, 60, scale)
-        {
+        if let Err(e) = self.set_mode(width, height, scale).await {
             tracing::warn!(error = %e, "could not resize the headless output");
             return Ok(());
         }
@@ -698,9 +706,7 @@ impl Session {
                 self.output.width = old_w;
                 self.output.height = old_h;
                 let s = self.output.scale;
-                self.instance
-                    .set_monitor_mode(&self.output.name, old_w, old_h, 60, s)
-                    .ok();
+                self.set_mode(old_w, old_h, s).await.ok();
                 self.wait_for_mode(old_w, old_h, s).await;
                 self.inject(self.output.logical_extent());
                 return Ok(());
@@ -748,7 +754,7 @@ impl Session {
         let mut seen = None;
         for _ in 0..10 {
             tokio::time::sleep(Duration::from_millis(50)).await;
-            let Ok(mons) = self.instance.monitors() else {
+            let Ok(mons) = ipc(&self.instance, |i| i.monitors()).await else {
                 continue;
             };
             if let Some(m) = mons
@@ -764,7 +770,15 @@ impl Session {
         seen.unwrap_or(scale)
     }
 
-    fn on_capture(&mut self, ev: Option<Incoming>) -> Result<ControlFlow<()>> {
+    async fn set_mode(&self, width: u32, height: u32, scale: f32) -> Result<()> {
+        let name = self.output.name.clone();
+        ipc(&self.instance, move |i| {
+            i.set_monitor_mode(&name, width, height, 60, scale)
+        })
+        .await
+    }
+
+    async fn on_capture(&mut self, ev: Option<Incoming>) -> Result<ControlFlow<()>> {
         match ev {
             Some(Incoming::Frame(image)) => {
                 if self.require_shm && !image.buffer.is_shm() {
@@ -774,9 +788,8 @@ impl Session {
                 if !self.output.is_headless() && size != (self.output.width, self.output.height) {
                     self.output.width = size.0;
                     self.output.height = size.1;
-                    if let Some(monitor) = self
-                        .instance
-                        .monitors()?
+                    if let Some(monitor) = ipc(&self.instance, |i| i.monitors())
+                        .await?
                         .iter()
                         .find(|m| m.name == self.output.name)
                     {

@@ -192,12 +192,13 @@ Every crate with `unsafe` documents the safety requirements at each block.
 
 - **Threading.** Each pipeline lives on one thread: the server loop and the
   client decode worker are current-thread tokio runtimes that own their
-  `gliff-vk` objects. Capture and input each own a Wayland connection on their
-  own calloop thread and talk to the async side through channels; the capture
-  thread hands the whole `CapturedFrame` (its dmabuf) to the encoder, which
-  releases the ring slot when the encode has finished. On both peers, reads and
-  writes run on separate tasks so an input burst cannot starve video and a
-  blocked write cannot block reads.
+  `gliff-vk` objects. The loop's Hyprland IPC calls run on tokio's blocking
+  pool. Capture and input each own a Wayland connection on their own calloop
+  thread and talk to the async side through channels; the capture thread
+  hands the whole `CapturedFrame` (its dmabuf) to the encoder, which releases
+  the ring slot when the encode has finished. On both peers, reads and writes
+  run on separate tasks so an input burst cannot starve video and a blocked
+  write cannot block reads.
 
 - **Client display.** The decode worker exports each finished BGRX image as a
   linear dmabuf and the UI wraps it in a `GdkDmabufTexture` on a
