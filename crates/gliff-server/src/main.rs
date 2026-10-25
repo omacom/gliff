@@ -5,6 +5,7 @@
 #![forbid(unsafe_code)]
 
 mod clipboard;
+mod heartbeat;
 mod notify;
 mod rate;
 mod session;
@@ -111,7 +112,7 @@ fn main() -> Result<()> {
         .enable_all()
         .build()?;
     let local = tokio::task::LocalSet::new();
-    local.block_on(&rt, async move {
+    let result = local.block_on(&rt, async move {
         if let Some(addr) = cli.listen {
             let addresses: Vec<_> = tokio::net::lookup_host(&addr).await?.collect();
             validate_listen_addresses(&addresses, cli.allow_remote)?;
@@ -129,7 +130,12 @@ fn main() -> Result<()> {
             let wr = tokio::io::stdout();
             serve(rd, wr, cfg).await
         }
-    })
+    });
+    // Tokio's stdin uses an uncancellable blocking read. A heartbeat can end
+    // a session while that read still waits on a silent SSH client.
+    drop(local);
+    rt.shutdown_background();
+    result
 }
 
 async fn serve<R, W>(rd: R, wr: W, cfg: session::Config) -> Result<()>
