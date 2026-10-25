@@ -292,7 +292,7 @@ where
                 }
                 ControlFlow::Continue(())
             }
-            ev = cap_rx.recv() => session.on_capture(ev)?,
+            ev = cap_rx.recv() => session.on_capture(ev).await?,
             report = write_reports.recv() => {
                 let elapsed = report.context("writer task ended")??;
                 // A write that took longer than a frame interval means the
@@ -745,26 +745,55 @@ impl Session {
     /// asynchronously and may round the scale), for up to half a second,
     /// without blocking the session. Returns the scale in effect.
     async fn wait_for_mode(&self, width: u32, height: u32, scale: f32) -> f32 {
-        let mut seen = None;
-        for _ in 0..10 {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            let Ok(mons) = self.instance.monitors() else {
-                continue;
-            };
-            if let Some(m) = mons
-                .iter()
-                .find(|m| m.name == self.output.name && m.width == width && m.height == height)
-            {
-                seen = Some(m.scale);
-                if (m.scale - scale).abs() < 0.15 {
-                    return m.scale;
-                }
-            }
-        }
-        seen.unwrap_or(scale)
+        wait_for_mode(
+            || output_mode(&self.instance, &self.output.name),
+            width,
+            height,
+            scale,
+        )
+        .await
+        .map_or(scale, |mode| mode.2)
     }
 
-    fn on_capture(&mut self, ev: Option<Incoming>) -> Result<ControlFlow<()>> {
+    /// A captured frame of a headless output is not the size the session set.
+    /// Normally that is a frame from before a resize took effect, but a
+    /// compositor config reload also discards the runtime monitor rule that
+    /// set the mode, and the output falls back to its default. Every frame
+    /// would then be stale, so look at the output: when its mode has been
+    /// reset, ask for the session's mode again, and follow whatever the
+    /// output ends up with if the compositor does not give it back.
+    async fn recover_headless_mode(&mut self) -> Result<()> {
+        let set = (self.output.width, self.output.height, self.output.scale);
+        let Some((width, height, scale)) = restore_headless_mode(
+            set,
+            || output_mode(&self.instance, &self.output.name),
+            |(w, h, s)| {
+                self.instance
+                    .set_monitor_mode(&self.output.name, w, h, 60, s)
+            },
+        )
+        .await
+        else {
+            return Ok(());
+        };
+        if (width, height) != (self.output.width, self.output.height) {
+            tracing::warn!(width, height, "following the headless output's new size");
+            let old_base = self.base_stream;
+            self.base_stream = EncoderSettings::fit_extent(width, height, self.encoder_max);
+            self.output.width = width;
+            self.output.height = height;
+            if !self.apply_stream_params()? {
+                self.base_stream = old_base;
+            }
+        }
+        self.output.scale = scale;
+        self.inject(self.output.logical_extent());
+        self.send_config();
+        self.want_keyframe = true;
+        Ok(())
+    }
+
+    async fn on_capture(&mut self, ev: Option<Incoming>) -> Result<ControlFlow<()>> {
         match ev {
             Some(Incoming::Frame(image)) => {
                 if self.require_shm && !image.buffer.is_shm() {
@@ -793,6 +822,9 @@ impl Session {
                         self.want_keyframe = true;
                     }
                     tracing::info!(width = size.0, height = size.1, "mirrored output resized");
+                }
+                if self.output.is_headless() && !self.matches_output(&image) {
+                    self.recover_headless_mode().await?;
                 }
                 self.pending = Some(image);
                 self.capture_asked = false;
@@ -1868,6 +1900,71 @@ const HEADLESS_LIMIT: SizeLimit = SizeLimit {
     pixels: 3840 * 2160,
 };
 
+/// A headless output's captured width, captured height and scale.
+type OutputMode = (u32, u32, f32);
+
+/// The named output's mode, or `None` when it cannot be read.
+fn output_mode(instance: &hypr_ipc::Instance, name: &str) -> Option<OutputMode> {
+    let mons = instance.monitors().ok()?;
+    let m = mons.iter().find(|m| m.name == name)?;
+    Some((m.width & !1, m.height & !1, m.scale))
+}
+
+/// The output no longer has the mode the session set on it.
+fn mode_was_reset(set: OutputMode, real: OutputMode) -> bool {
+    (set.0, set.1) != (real.0, real.1) || (set.2 - real.2).abs() >= 0.01
+}
+
+/// Poll until the output reports the requested mode (Hyprland applies it
+/// asynchronously and may round the scale), for up to half a second. Returns
+/// the last mode it read at the requested size, which has the scale in
+/// effect, or `None` if the output never showed that size.
+async fn wait_for_mode(
+    mut read: impl FnMut() -> Option<OutputMode>,
+    width: u32,
+    height: u32,
+    scale: f32,
+) -> Option<OutputMode> {
+    let mut seen = None;
+    for _ in 0..10 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        if let Some(mode) = read().filter(|m| (m.0, m.1) == (width, height)) {
+            seen = Some(mode);
+            if (mode.2 - scale).abs() < 0.15 {
+                break;
+            }
+        }
+    }
+    seen
+}
+
+/// Put a headless output back to the mode `set` after something else reset
+/// it. Returns `None` when the output still has that mode (or cannot be
+/// read), so the caller has nothing to change. Otherwise returns the mode
+/// the output has now: `set` again, or what the compositor settled on when it
+/// refused to restore it.
+async fn restore_headless_mode(
+    set: OutputMode,
+    mut read: impl FnMut() -> Option<OutputMode>,
+    apply: impl Fn(OutputMode) -> hypr_ipc::Result<()>,
+) -> Option<OutputMode> {
+    let real = read().filter(|real| mode_was_reset(set, *real))?;
+    tracing::warn!(
+        width = real.0,
+        height = real.1,
+        scale = real.2,
+        "headless output lost its mode; restoring it"
+    );
+    if let Err(e) = apply(set) {
+        tracing::warn!(error = %e, "could not restore the headless output mode");
+        return Some(real);
+    }
+    // Keep what the polling saw: a failed read afterwards must not bring back
+    // the mode from before the restore.
+    let seen = wait_for_mode(&mut read, set.0, set.1, set.2).await;
+    Some(seen.or_else(&mut read).unwrap_or(real))
+}
+
 /// Fit a requested headless size within the server's limits, keeping the
 /// aspect ratio and the sides even. A window too narrow to scale stays at
 /// the smallest size resize accepts.
@@ -2059,5 +2156,104 @@ mod tests {
         assert_eq!(headless_target(16384, 16384, 1.0), (2880, 2880));
         assert_eq!(headless_target(u32::MAX, u32::MAX, 1.5), (2880, 2880));
         assert_eq!(headless_target(8192, 4608, 1.25), (3840, 2160));
+    }
+
+    /// What a compositor config reload leaves behind for the output.
+    const RESET: OutputMode = (1920, 1080, 1.25);
+    const SET: OutputMode = (2880, 1800, 2.0);
+
+    fn restore(
+        set: OutputMode,
+        output: &std::cell::Cell<Option<OutputMode>>,
+        on_apply: impl Fn(OutputMode) -> hypr_ipc::Result<Option<OutputMode>>,
+    ) -> (Option<OutputMode>, Vec<OutputMode>) {
+        let applied = std::cell::RefCell::new(Vec::new());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = runtime.block_on(restore_headless_mode(
+            set,
+            || output.get(),
+            |mode| {
+                applied.borrow_mut().push(mode);
+                on_apply(mode).map(|now| output.set(now))
+            },
+        ));
+        (result, applied.into_inner())
+    }
+
+    #[test]
+    fn a_reset_mode_is_told_from_the_one_that_was_set() {
+        assert!(!mode_was_reset(SET, SET));
+        // The size, or the scale alone, differing means the rule is gone.
+        assert!(mode_was_reset(SET, RESET));
+        assert!(mode_was_reset(SET, (2880, 1800, 1.25)));
+        assert!(mode_was_reset(SET, (1920, 1080, 2.0)));
+        // Float noise in the reported scale is not a reset.
+        assert!(!mode_was_reset((1920, 1080, 1.25), (1920, 1080, 1.2500001)));
+    }
+
+    #[test]
+    fn a_reset_headless_mode_is_asked_for_again() {
+        let output = std::cell::Cell::new(Some(RESET));
+        let (result, applied) = restore(SET, &output, |mode| Ok(Some(mode)));
+        assert_eq!(result, Some(SET));
+        assert_eq!(applied, [SET]);
+    }
+
+    #[test]
+    fn a_refused_headless_mode_is_followed() {
+        // The compositor takes the request but keeps its own mode.
+        let output = std::cell::Cell::new(Some(RESET));
+        let (result, applied) = restore(SET, &output, |_| Ok(Some(RESET)));
+        assert_eq!(result, Some(RESET));
+        assert_eq!(applied, [SET]);
+
+        // The compositor answers with an error.
+        let output = std::cell::Cell::new(Some(RESET));
+        let (result, applied) = restore(SET, &output, |_| {
+            Err(hypr_ipc::Error::Command {
+                command: "keyword monitor".into(),
+                response: "refused".into(),
+            })
+        });
+        assert_eq!(result, Some(RESET));
+        assert_eq!(applied, [SET]);
+    }
+
+    #[test]
+    fn a_failed_read_after_the_restore_keeps_the_restored_mode() {
+        // The output reads as reset, then as restored while polling, and
+        // every read after that fails.
+        let reads = std::cell::RefCell::new(vec![Some(SET), Some(RESET)]);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = runtime.block_on(restore_headless_mode(
+            SET,
+            || reads.borrow_mut().pop().flatten(),
+            |_| Ok(()),
+        ));
+        assert_eq!(result, Some(SET));
+        assert!(
+            reads.borrow().is_empty(),
+            "the polling read the restored mode"
+        );
+    }
+
+    #[test]
+    fn an_intact_or_unreadable_headless_mode_is_left_alone() {
+        let output = std::cell::Cell::new(Some(SET));
+        let (result, applied) = restore(SET, &output, |mode| Ok(Some(mode)));
+        assert_eq!(result, None);
+        assert!(applied.is_empty());
+
+        // An output that cannot be read (the IPC failed, or it is gone).
+        let output = std::cell::Cell::new(None);
+        let (result, applied) = restore(SET, &output, |mode| Ok(Some(mode)));
+        assert_eq!(result, None);
+        assert!(applied.is_empty());
     }
 }

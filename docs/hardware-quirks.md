@@ -248,6 +248,17 @@ images arrive.
   Hyprland's queue while `output remove` arrives on the hyprctl socket, and
   Hyprland can handle the remove first. The capture thread therefore ends
   with a roundtrip, which blocks until Hyprland has processed the destroys.
+- **A config reload resets a headless output's mode.** The server sets the
+  mode with a runtime monitor rule, and `hyprctl reload` discards it: the
+  output drops back to its default (1920x1080 at scale 1.25 on the machine
+  that showed it) while the session still believes it set the client's size.
+  Every captured frame then differs from the session's output size and the
+  client sees a black window on a live connection. When a headless frame does
+  not match, the server reads the output's mode back; if it is not the one the
+  session set, the server sets that mode again, and follows what the output
+  has if Hyprland keeps its own. A reload that leaves the size alone but
+  changes the scale produces no mismatched frame and is not detected until the
+  next resize.
 
 ## Hyprland with the Lua config (Omarchy)
 
