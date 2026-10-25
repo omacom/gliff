@@ -752,6 +752,7 @@ impl Session {
             scale,
         )
         .await
+        .map_or(scale, |mode| mode.2)
     }
 
     /// A captured frame of a headless output is not the size the session set.
@@ -1916,24 +1917,25 @@ fn mode_was_reset(set: OutputMode, real: OutputMode) -> bool {
 
 /// Poll until the output reports the requested mode (Hyprland applies it
 /// asynchronously and may round the scale), for up to half a second. Returns
-/// the scale in effect.
+/// the last mode it read at the requested size, which has the scale in
+/// effect, or `None` if the output never showed that size.
 async fn wait_for_mode(
     mut read: impl FnMut() -> Option<OutputMode>,
     width: u32,
     height: u32,
     scale: f32,
-) -> f32 {
+) -> Option<OutputMode> {
     let mut seen = None;
     for _ in 0..10 {
         tokio::time::sleep(Duration::from_millis(50)).await;
-        if let Some((_, _, s)) = read().filter(|m| (m.0, m.1) == (width, height)) {
-            seen = Some(s);
-            if (s - scale).abs() < 0.15 {
-                return s;
+        if let Some(mode) = read().filter(|m| (m.0, m.1) == (width, height)) {
+            seen = Some(mode);
+            if (mode.2 - scale).abs() < 0.15 {
+                break;
             }
         }
     }
-    seen.unwrap_or(scale)
+    seen
 }
 
 /// Put a headless output back to the mode `set` after something else reset
@@ -1957,8 +1959,10 @@ async fn restore_headless_mode(
         tracing::warn!(error = %e, "could not restore the headless output mode");
         return Some(real);
     }
-    wait_for_mode(&mut read, set.0, set.1, set.2).await;
-    Some(read().unwrap_or(real))
+    // Keep what the polling saw: a failed read afterwards must not bring back
+    // the mode from before the restore.
+    let seen = wait_for_mode(&mut read, set.0, set.1, set.2).await;
+    Some(seen.or_else(&mut read).unwrap_or(real))
 }
 
 /// Fit a requested headless size within the server's limits, keeping the
@@ -2216,6 +2220,27 @@ mod tests {
         });
         assert_eq!(result, Some(RESET));
         assert_eq!(applied, [SET]);
+    }
+
+    #[test]
+    fn a_failed_read_after_the_restore_keeps_the_restored_mode() {
+        // The output reads as reset, then as restored while polling, and
+        // every read after that fails.
+        let reads = std::cell::RefCell::new(vec![Some(SET), Some(RESET)]);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = runtime.block_on(restore_headless_mode(
+            SET,
+            || reads.borrow_mut().pop().flatten(),
+            |_| Ok(()),
+        ));
+        assert_eq!(result, Some(SET));
+        assert!(
+            reads.borrow().is_empty(),
+            "the polling read the restored mode"
+        );
     }
 
     #[test]
