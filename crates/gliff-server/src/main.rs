@@ -10,12 +10,15 @@ mod rate;
 mod session;
 mod writer;
 
+use std::future::Future;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
+use tokio::signal::unix::{signal, SignalKind};
 
 use hypr_wl::Target;
 
@@ -111,7 +114,7 @@ fn main() -> Result<()> {
         .enable_all()
         .build()?;
     let local = tokio::task::LocalSet::new();
-    local.block_on(&rt, async move {
+    let result = local.block_on(&rt, async move {
         if let Some(addr) = cli.listen {
             let addresses: Vec<_> = tokio::net::lookup_host(&addr).await?.collect();
             validate_listen_addresses(&addresses, cli.allow_remote)?;
@@ -129,7 +132,12 @@ fn main() -> Result<()> {
             let wr = tokio::io::stdout();
             serve(rd, wr, cfg).await
         }
-    })
+    });
+    drop(local);
+    // The stdin read blocks a thread that cannot be cancelled, so dropping
+    // the runtime would wait until the client closes the pipe.
+    rt.shutdown_timeout(Duration::from_millis(100));
+    result
 }
 
 async fn serve<R, W>(rd: R, wr: W, cfg: session::Config) -> Result<()>
@@ -137,13 +145,28 @@ where
     R: AsyncRead + Unpin + 'static,
     W: AsyncWrite + Unpin + 'static,
 {
-    match session::run(rd, wr, cfg).await {
+    let shutdown = shutdown_signal().context("listen for SIGTERM and SIGINT")?;
+    match session::run(rd, wr, cfg, shutdown).await {
         Ok(()) => Ok(()),
         Err(e) => {
             tracing::error!(error = %e, "session ended with error");
             Err(e)
         }
     }
+}
+
+/// Resolves on the first SIGTERM or SIGINT. The handlers are installed here,
+/// so a signal that arrives while the session is still setting up is kept,
+/// and they replace the default exit for the rest of the process.
+fn shutdown_signal() -> std::io::Result<impl Future<Output = ()>> {
+    let mut terminate = signal(SignalKind::terminate())?;
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    Ok(async move {
+        tokio::select! {
+            _ = terminate.recv() => {}
+            _ = interrupt.recv() => {}
+        }
+    })
 }
 
 /// In --stdio mode nothing else may hold fd 1, or it would corrupt the wire.

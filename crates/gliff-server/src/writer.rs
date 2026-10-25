@@ -1,7 +1,7 @@
 //! A dedicated task for the socket write half, so the session loop never
 //! waits on the network and keeps handling input while a write is blocked.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -65,6 +65,7 @@ impl Queue {
             | ServerMsg::ClipboardData { .. }
             | ServerMsg::ClipboardAck { .. }
             | ServerMsg::ClipboardAbort { .. } => {}
+            ServerMsg::Error { .. } => {}
             _ => unreachable!("unsupported queued server message"),
         }
         self.packets.push_back((msg, payloads));
@@ -77,6 +78,8 @@ impl Queue {
 pub struct Writer {
     queue: Rc<RefCell<Queue>>,
     notify: Rc<Notify>,
+    /// Set while the task writes a packet it took off the queue.
+    writing: Rc<Cell<bool>>,
     task: JoinHandle<()>,
 }
 
@@ -86,10 +89,12 @@ impl Writer {
     ) -> (Self, mpsc::Receiver<Result<Duration>>) {
         let queue = Rc::new(RefCell::new(Queue::default()));
         let notify = Rc::new(Notify::new());
+        let writing = Rc::new(Cell::new(false));
         let (report_tx, report_rx) = mpsc::channel(1);
         let task = {
             let queue = queue.clone();
             let notify = notify.clone();
+            let writing = writing.clone();
             tokio::task::spawn_local(async move {
                 loop {
                     let packet = queue.borrow_mut().packets.pop_front();
@@ -97,9 +102,11 @@ impl Writer {
                         notify.notified().await;
                         continue;
                     };
+                    writing.set(true);
                     let parts: Vec<&[u8]> = payloads.iter().map(Vec::as_slice).collect();
                     let begin = Instant::now();
                     let result = framed.write_msg_with_payloads(&msg, &parts).await;
+                    writing.set(false);
                     let elapsed = begin.elapsed();
                     tracing::debug!(
                         write_ms = elapsed.as_secs_f64() * 1000.0,
@@ -117,6 +124,7 @@ impl Writer {
             Self {
                 queue,
                 notify,
+                writing,
                 task,
             },
             report_rx,
@@ -132,6 +140,27 @@ impl Writer {
     /// True when no video frame is waiting to be written.
     pub fn video_ready(&self) -> bool {
         self.queue.borrow().video_ready()
+    }
+
+    /// Wait up to `timeout` for every queued message to be written, and
+    /// report whether they were. It reads `reports`, dropping them, because
+    /// the task stalls once that channel is full.
+    pub async fn drain(
+        &self,
+        reports: &mut mpsc::Receiver<Result<Duration>>,
+        timeout: Duration,
+    ) -> bool {
+        let written = async {
+            while !self.queue.borrow().packets.is_empty() || self.writing.get() {
+                if !matches!(reports.recv().await, Some(Ok(_))) {
+                    return false;
+                }
+            }
+            true
+        };
+        tokio::time::timeout(timeout, written)
+            .await
+            .unwrap_or(false)
     }
 }
 
@@ -345,6 +374,42 @@ mod tests {
                     .await
                     .unwrap()
                     .is_none());
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn drain_waits_for_every_queued_write() {
+        LocalSet::new()
+            .run_until(async {
+                let (socket, peer) = tokio::io::duplex(1024);
+                let (writer, mut reports) = Writer::spawn(Framed::new(socket));
+                // Nobody reads the first report, so the task stalls on the
+                // second one until `drain` takes them.
+                for code in 1..=3 {
+                    writer.send(ServerMsg::error(code, "m"), Vec::new());
+                    tokio::task::yield_now().await;
+                }
+                assert!(writer.drain(&mut reports, Duration::from_secs(1)).await);
+                let mut reader = Framed::new(peer);
+                for code in 1..=3 {
+                    let msg: ServerMsg = reader.read_msg().await.unwrap();
+                    assert!(matches!(msg, ServerMsg::Error { code: c, .. } if c == code));
+                }
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn drain_gives_up_on_a_blocked_write() {
+        LocalSet::new()
+            .run_until(async {
+                let (socket, _peer) = tokio::io::duplex(1);
+                let (writer, mut reports) = Writer::spawn(Framed::new(socket));
+                let (msg, payloads) = video(1);
+                writer.send(msg, payloads);
+                tokio::task::yield_now().await;
+                assert!(!writer.drain(&mut reports, Duration::from_millis(50)).await);
             })
             .await;
     }
