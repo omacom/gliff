@@ -105,10 +105,19 @@ where
         cfg.target.instance().context("find Hyprland instance"),
     )
     .await?;
-    let output = report_setup(&mut writer, setup_output(&instance, &cfg, &caps)).await?;
+    // Open the GPU while a headless setup waits for its output.
+    let opening = {
+        let (mode, capture, render_node) = (cfg.video, cfg.capture, cfg.render_node.clone());
+        tokio::task::spawn_blocking(move || VideoTier::open(mode, capture, &render_node))
+    };
+    let output = setup_output(&instance, &cfg, &caps);
+    // Join the open before any setup error returns, so it never outlives
+    // the session.
+    let video = opening.await.context("open the video pipeline");
+    let output = report_setup(&mut writer, output).await?;
     tracing::info!(output = %output.name, output.width, output.height, headless = output.is_headless(), "session output ready");
 
-    let video = VideoTier::open(cfg.video, cfg.capture, &cfg.render_node);
+    let video = report_setup(&mut writer, video).await?;
     let codec = Codec::H264;
     writer
         .write_msg(&ServerMsg::HelloAck {
