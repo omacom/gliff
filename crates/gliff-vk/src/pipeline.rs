@@ -663,18 +663,7 @@ impl DecodeStream {
                 .dec
                 .surfaces()
                 .iter()
-                .map(|s| {
-                    let desc = s.export()?;
-                    match Image::import_nv12_planes(&self.gpu, &desc) {
-                        Ok(img) => Ok(img),
-                        Err(e) => {
-                            if desc.objects.len() == 2 && desc.planes.len() == 2 {
-                                tracing::warn!(error = %e, "separate-plane import failed; trying the combined NV12 import");
-                            }
-                            Image::import_nv12(&self.gpu, &desc, false)
-                        }
-                    }
-                })
+                .map(|s| Image::import_decode_surface(&self.gpu, &s.export()?))
                 .collect::<Result<Vec<_>>>()?;
             self.generation = self.dec.generation();
         }
