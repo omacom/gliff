@@ -72,11 +72,11 @@ tiers independently, so every pairing can be tested on one machine.
   single-stream subsample/upsample, BGRA↔YUV444 colour round-trip, the H.264
   header parser against an x264 stream, framing with payloads and partial
   writes, the rate controller and ladder against a simulated link (a fake
-  clock drives satellite, LAN and collapse scenarios), keymap building,
-  Hyprland instance discovery, and the clipboard rules and engine (mime
-  filtering, URI lists, safe paths, the send window and assembler, chunked
-  transfers between two engines, the size cap, and a spooled directory
-  tree).
+  clock drives satellite, LAN and collapse scenarios), the encoder thread's
+  command order and failed rebuilds, keymap building, Hyprland instance
+  discovery, and the clipboard rules and engine (mime filtering, URI lists,
+  safe paths, the send window and assembler, chunked transfers between two
+  engines, the size cap, and a spooled directory tree).
 - **`gliff-probe`** is the hardware integration harness: `protocols`,
   `outputs`, `permissions` (Hyprland settings that can block capture),
   `gpu` (the Vulkan device and the VA-API codec capabilities),
