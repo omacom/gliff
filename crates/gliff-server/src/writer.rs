@@ -78,7 +78,8 @@ impl Queue {
 pub struct Writer {
     queue: Rc<RefCell<Queue>>,
     notify: Rc<Notify>,
-    /// Set while the task writes a packet it took off the queue.
+    /// Set from taking a packet off the queue until its report is in the
+    /// channel, so `drain` cannot finish while that report is unread.
     writing: Rc<Cell<bool>>,
     task: JoinHandle<()>,
 }
@@ -106,7 +107,6 @@ impl Writer {
                     let parts: Vec<&[u8]> = payloads.iter().map(Vec::as_slice).collect();
                     let begin = Instant::now();
                     let result = framed.write_msg_with_payloads(&msg, &parts).await;
-                    writing.set(false);
                     let elapsed = begin.elapsed();
                     tracing::debug!(
                         write_ms = elapsed.as_secs_f64() * 1000.0,
@@ -114,7 +114,9 @@ impl Writer {
                     );
                     let failed = result.is_err();
                     let report = result.map(|_| elapsed).map_err(Into::into);
-                    if report_tx.send(report).await.is_err() || failed {
+                    let stop = report_tx.send(report).await.is_err() || failed;
+                    writing.set(false);
+                    if stop {
                         break;
                     }
                 }
@@ -410,6 +412,25 @@ mod tests {
                 writer.send(msg, payloads);
                 tokio::task::yield_now().await;
                 assert!(!writer.drain(&mut reports, Duration::from_millis(50)).await);
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn drain_reports_a_failed_write_behind_unread_reports() {
+        LocalSet::new()
+            .run_until(async {
+                let (socket, peer) = tokio::io::duplex(1024);
+                let (writer, mut reports) = Writer::spawn(Framed::new(socket));
+                // The first report fills the channel, so the failure report
+                // queues behind the second one.
+                for code in 1..=2 {
+                    writer.send(ServerMsg::error(code, "m"), Vec::new());
+                    tokio::task::yield_now().await;
+                }
+                drop(peer);
+                writer.send(ServerMsg::error(3, "m"), Vec::new());
+                assert!(!writer.drain(&mut reports, Duration::from_secs(1)).await);
             })
             .await;
     }
