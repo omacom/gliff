@@ -152,3 +152,6 @@ gliff --server-bin 'gliff-server --low-bandwidth' user@host
   machine, and the tests.
 
 gliff is released under the MIT license.
+
+Only one session can move a compositor’s workspaces at a time. While another
+session holds them, a new headless session starts empty and leaves them in place.
