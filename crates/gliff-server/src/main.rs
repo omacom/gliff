@@ -43,6 +43,11 @@ struct Cli {
     /// window instead of mirroring.
     #[arg(long)]
     headless: bool,
+    /// With --headless: move every workspace onto the headless output while
+    /// the session lasts, so the remote's open windows show in it, and put
+    /// them back on their screens when it ends.
+    #[arg(long, requires = "headless")]
+    move_workspaces: bool,
     /// Hyprland instance signature (default: newest).
     #[arg(long)]
     instance: Option<String>,
@@ -105,6 +110,7 @@ fn main() -> Result<()> {
         video: gliff_sw::VideoMode::resolve(cli.video.as_deref()),
         full_chroma: cli.full_chroma,
         capture: hypr_capture::CaptureMode::resolve(cli.capture.as_deref()),
+        move_workspaces: cli.move_workspaces,
     };
 
     let rt = tokio::runtime::Builder::new_current_thread()

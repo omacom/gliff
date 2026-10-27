@@ -43,6 +43,9 @@ pub struct Config {
     pub full_chroma: bool,
     /// What the capture ring is made of; `Shm` implies the CPU tier.
     pub capture: CaptureMode,
+    /// Move every workspace onto the headless output for the session, so
+    /// the remote's windows show in it, and put them back at the end.
+    pub move_workspaces: bool,
 }
 
 /// Events from the capture thread.
@@ -1585,6 +1588,19 @@ struct SessionOutput {
     scale: f32,
     headless: Option<hypr_ipc::Instance>,
     awake: Option<KeepAwake>,
+    /// Workspaces moved onto the headless output, to put back.
+    borrowed: Option<Borrowed>,
+}
+
+/// Where the workspaces were before a session moved them onto its output.
+struct Borrowed {
+    /// Held for the full borrow/restore lifetime, across every server process.
+    _lease: std::fs::File,
+    output: String,
+    /// Each moved workspace's selector and the monitor it came from.
+    homes: Vec<(String, String)>,
+    /// The workspace each other monitor was showing.
+    shown: Vec<(String, String)>,
 }
 
 impl SessionOutput {
@@ -1607,8 +1623,128 @@ impl Drop for SessionOutput {
         // Join the poller before removing its output, so every in-flight
         // DPMS request finishes while we still own the monitor.
         drop(self.awake.take());
-        if let Some(instance) = &self.headless {
-            let _ = instance.remove_output(&self.name);
+        let Some(instance) = &self.headless else {
+            return;
+        };
+        // Put the workspaces back before the output goes; otherwise
+        // Hyprland piles them all onto one monitor.
+        if let Some(borrowed) = self.borrowed.take() {
+            return_workspaces(instance, &borrowed);
+        }
+        let _ = instance.remove_output(&self.name);
+    }
+}
+
+/// A compositor has one set of workspaces. Keep a compositor-wide lease so
+/// another remote client cannot borrow them again or undo our restoration.
+fn workspace_lease(instance: &hypr_ipc::Instance) -> Result<std::fs::File> {
+    let lease = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(instance.dir.join("gliff-workspaces.lock"))?;
+    rustix::fs::flock(&lease, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+        .context("another gliff session already holds the remote workspaces")?;
+    Ok(lease)
+}
+
+/// Move every regular workspace onto `output` and show there the one the
+/// main monitor was showing, recording where each came from.
+fn borrow_workspaces(instance: &hypr_ipc::Instance, output: &str) -> Result<Borrowed> {
+    let lease = workspace_lease(instance)?;
+    let mons = instance.monitors()?;
+    let shown: Vec<(String, String)> = mons
+        .iter()
+        .filter(|m| m.name != output && !m.disabled && m.active_workspace.id != 0)
+        .map(|m| (m.name.clone(), m.active_workspace.selector()))
+        .collect();
+    let front = main_monitor(&mons)
+        .filter(|m| m.name != output)
+        .map(|m| m.active_workspace.selector());
+    let mut homes = Vec::new();
+    for ws in instance.workspaces()? {
+        if ws.is_special() || ws.monitor == output || ws.monitor.starts_with("gliff-") {
+            continue;
+        }
+        let selector = ws.selector();
+        // Record the home first: a move whose answer times out may still
+        // happen. Restoration only moves what is on this output.
+        homes.push((selector.clone(), ws.monitor));
+        if let Err(e) = instance.move_workspace_to_monitor(&selector, output) {
+            tracing::warn!(workspace = selector, error = %e, "could not move workspace");
+        }
+    }
+    if let Some(ws) = front.filter(|ws| homes.iter().any(|(w, _)| w == ws)) {
+        if let Err(e) = instance.show_workspace(output, &ws) {
+            tracing::warn!(workspace = ws, error = %e, "could not show workspace");
+        }
+    }
+    tracing::info!(
+        moved = homes.len(),
+        output,
+        "moved workspaces onto the session output"
+    );
+    Ok(Borrowed {
+        _lease: lease,
+        output: output.into(),
+        homes,
+        shown,
+    })
+}
+
+/// A modeset can temporarily stall IPC. Retry each restoration request
+/// before giving up: treating a failed query as an empty desktop silently
+/// skips every restoration, blindly restoring would undo the user's own
+/// moves, and a failed move strands the workspace once the output goes.
+fn retry_restoration<T>(mut read: impl FnMut() -> Result<T>) -> Result<T> {
+    for _ in 0..2 {
+        match read() {
+            Ok(snapshot) => return Ok(snapshot),
+            Err(e) => tracing::debug!(error = %e, "retrying workspace restoration"),
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    read()
+}
+
+/// Undo `borrow_workspaces`: each workspace to its monitor, if that is
+/// still there, and each monitor back to what it showed.
+fn return_workspaces(instance: &hypr_ipc::Instance, borrowed: &Borrowed) {
+    let (monitors, workspaces) =
+        match retry_restoration(|| Ok((instance.monitors()?, instance.workspaces()?))) {
+            Ok(snapshot) => snapshot,
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot read workspace ownership for restoration");
+                return;
+            }
+        };
+    let present: Vec<String> = monitors.into_iter().map(|m| m.name).collect();
+    let mut restored = std::collections::HashSet::new();
+    for (ws, home) in &borrowed.homes {
+        // A user may have moved the workspace elsewhere during the session.
+        // Only restore workspaces this output still owns.
+        if !present.contains(home)
+            || !workspaces
+                .iter()
+                .any(|w| w.selector() == *ws && w.monitor == borrowed.output)
+        {
+            continue;
+        }
+        match retry_restoration(|| Ok(instance.move_workspace_to_monitor(ws, home)?)) {
+            Ok(()) => {
+                restored.insert(ws);
+            }
+            Err(e) => {
+                tracing::warn!(workspace = ws, home, error = %e, "could not return workspace")
+            }
+        }
+    }
+    for (monitor, ws) in &borrowed.shown {
+        if present.contains(monitor) && restored.contains(ws) {
+            if let Err(e) = retry_restoration(|| Ok(instance.show_workspace(monitor, ws)?)) {
+                tracing::warn!(monitor, workspace = ws, error = %e, "could not show restored workspace");
+            }
         }
     }
 }
@@ -1685,6 +1821,7 @@ fn setup_output(
             } & !1,
             scale: m.scale,
             headless: None,
+            borrowed: None,
             awake: None,
         });
     }
@@ -1705,6 +1842,7 @@ fn setup_output(
         height: 0,
         scale: 1.0,
         headless: Some(instance.clone()),
+        borrowed: None,
         awake: None,
     };
     wait_for_output(&output.name, wait, || {
@@ -1744,6 +1882,17 @@ fn setup_output(
     output.scale = scale;
     // An output added while the remote sleeps comes up switched off.
     output.awake = Some(KeepAwake::start(instance.clone(), output.name.clone())?);
+    if cfg.move_workspaces
+        || caps
+            .features
+            .iter()
+            .any(|f| f == gliff_proto::FEATURE_MOVE_WORKSPACES)
+    {
+        match borrow_workspaces(instance, &output.name) {
+            Ok(borrowed) => output.borrowed = Some(borrowed),
+            Err(e) => tracing::warn!(error = %e, "could not move workspaces"),
+        }
+    }
     Ok(output)
 }
 
@@ -1905,6 +2054,39 @@ fn stream_limit(encoder: (u32, u32), caps: &ClientCaps) -> Result<(u32, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn restoration_retries_transient_ipc_failures_and_reports_persistent_ones() {
+        let mut calls = 0;
+        let snapshot = retry_restoration(|| {
+            calls += 1;
+            anyhow::ensure!(calls > 1, "temporary IPC timeout");
+            Ok(vec![7])
+        })
+        .unwrap();
+        assert_eq!(snapshot, vec![7]);
+        assert_eq!(calls, 2);
+        let mut calls = 0;
+        let result: Result<()> = retry_restoration(|| {
+            calls += 1;
+            anyhow::bail!("compositor is unavailable")
+        });
+        assert!(result.is_err());
+        assert_eq!(calls, 3);
+    }
+
+    #[test]
+    fn workspaces_have_only_one_borrower_until_restoration_ends() {
+        let directory = tempfile::tempdir().unwrap();
+        let instance = hypr_ipc::Instance {
+            signature: "test".into(),
+            dir: directory.path().into(),
+        };
+        let first = workspace_lease(&instance).unwrap();
+        assert!(workspace_lease(&instance).is_err());
+        drop(first);
+        assert!(workspace_lease(&instance).is_ok());
+    }
+
     #[test]
     fn slow_dpms_ipc_does_not_block_the_streaming_runtime() {
         let (started, ready) = std::sync::mpsc::channel();
