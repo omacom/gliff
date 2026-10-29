@@ -17,7 +17,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::sync::mpsc::{channel, sync_channel, Receiver};
 use std::time::{Duration, Instant};
 
@@ -117,6 +117,10 @@ struct App {
     sessions: RefCell<Vec<Rc<Session>>>,
     /// The session the window shows and sends input to.
     active: RefCell<Option<Rc<Session>>>,
+    /// The session whose dropped connection took the window out of
+    /// fullscreen. Its reconnect fills the screen again, unless the user
+    /// changed the window's fullscreen state in between.
+    refullscreen: RefCell<Weak<Session>>,
     /// Offers the local clipboard to the shown session; set once the
     /// clipboard is watched.
     local_clipboard: RefCell<Option<clipboard_ui::LocalSelection>>,
@@ -414,6 +418,7 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         connections: Cell::new(0),
         sessions: RefCell::new(Vec::new()),
         active: RefCell::new(None),
+        refullscreen: RefCell::new(Weak::new()),
         local_clipboard: RefCell::new(None),
         view_size: Cell::new((0, 0)),
         view_scale: Cell::new(1.0),
@@ -434,6 +439,16 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
     refresh_tabs(&ui);
 
     // Fullscreen toggle.
+    {
+        // The user going fullscreen again settles it; so does leaving
+        // fullscreen after that, which a reconnect must not undo.
+        let ui = Rc::downgrade(&ui);
+        window.connect_fullscreened_notify(move |w| {
+            if let Some(ui) = ui.upgrade().filter(|_| w.is_fullscreen()) {
+                *ui.refullscreen.borrow_mut() = Weak::new();
+            }
+        });
+    }
     {
         let window = window.clone();
         fullscreen_btn.connect_toggled(move |b| {
@@ -1103,8 +1118,14 @@ fn set_stats(ui: &App, s: &Rc<Session>, text: &str) {
 
 /// Go back to a black screen with no stream geometry.
 fn show_disconnected(ui: &Rc<App>, s: &Rc<Session>) {
-    if s.connected.replace(false) {
+    let was_connected = s.connected.replace(false);
+    if was_connected {
         refresh_tabs(ui);
+    }
+    // A fullscreen window would keep the whole screen on a dead stream.
+    if was_connected && is_active(ui, s) && ui.window.is_fullscreen() {
+        ui.window.unfullscreen();
+        *ui.refullscreen.borrow_mut() = Rc::downgrade(s);
     }
     s.last_frame.borrow_mut().take();
     s.stream_size.set((0, 0));
@@ -1338,6 +1359,13 @@ fn poll_status(ui: Rc<App>, s: Rc<Session>, rx: Receiver<Status>, generation: u6
                     s.gave_up.set(false);
                     if !s.connected.replace(true) {
                         refresh_tabs(&ui);
+                    }
+                    let left_fullscreen = ui.refullscreen.borrow().ptr_eq(&Rc::downgrade(&s));
+                    if left_fullscreen {
+                        *ui.refullscreen.borrow_mut() = Weak::new();
+                        if is_active(&ui, &s) && !ui.window.is_fullscreen() {
+                            ui.window.fullscreen();
+                        }
                     }
                     set_status(&ui, &s, "");
                     // Visible before the first per-second stats arrive.
