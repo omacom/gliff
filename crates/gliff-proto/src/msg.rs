@@ -46,6 +46,10 @@ pub fn features() -> Vec<String> {
 pub const ERROR_VERSION: u16 = 1;
 pub const ERROR_NO_CHROMA: u16 = 2;
 pub const ERROR_NO_CODEC: u16 = 3;
+/// The client's window is on the screen this server's machine is already
+/// showing to that client's machine; see [`Origin`]. Reconnecting would
+/// refuse the same way until the window moves, so it is fatal.
+pub const ERROR_LOOP: u16 = 4;
 /// The server could not start the session: no Hyprland instance, no such
 /// output, or the video, capture or input pipeline failed to start. It is
 /// outside the incompatible range, so a client may reconnect.
@@ -172,6 +176,45 @@ pub struct SessionInfo {
     pub output: String,
 }
 
+/// A machine currently viewing the sender's screen.
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+pub struct Viewer {
+    /// The viewer's machine identity, as it sent it in its own [`Origin`].
+    #[n(0)]
+    pub machine: String,
+    /// The output of the sender's machine that the viewer captures.
+    #[n(1)]
+    pub output: String,
+}
+
+/// Where a client runs, so a server can refuse a connection that would show
+/// its own screen inside itself: A views B, then B's window (on the screen A
+/// captures) connects back to A.
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+pub struct Origin {
+    /// An opaque identity of the client's machine; equal strings are the same
+    /// machine whatever name or address reached it.
+    #[n(0)]
+    pub machine: String,
+    /// The output the client's window is on, when it knows.
+    #[n(1)]
+    pub window_output: Option<String>,
+    /// The machines viewing the client's machine right now.
+    #[n(2)]
+    pub viewers: Vec<Viewer>,
+}
+
+impl Origin {
+    /// The viewer whose captured screen holds this client's window while that
+    /// viewer is the machine `server` — the loop a connection would close.
+    pub fn loops_through(&self, server: &str) -> Option<&Viewer> {
+        let window = self.window_output.as_deref()?;
+        self.viewers
+            .iter()
+            .find(|v| v.machine == server && v.output == window)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
 pub enum ClientMsg {
     #[n(0)]
@@ -185,6 +228,9 @@ pub enum ClientMsg {
         keymap: String,
         #[n(2)]
         caps: ClientCaps,
+        /// Where the client runs; absent from builds that predate it.
+        #[n(3)]
+        origin: Option<Box<Origin>>,
     },
     #[n(1)]
     Resize {
@@ -479,7 +525,11 @@ impl ServerMsg {
 /// recognised even when the rest of it has changed shape.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Greeting {
-    Hello { keymap: String, caps: ClientCaps },
+    Hello {
+        keymap: String,
+        caps: ClientCaps,
+        origin: Option<Box<Origin>>,
+    },
     OtherVersion(u16),
 }
 
@@ -497,7 +547,16 @@ impl<'b, C> Decode<'b, C> for Greeting {
         }
         d.set_position(start);
         match ClientMsg::decode(d, ctx)? {
-            ClientMsg::Hello { keymap, caps, .. } => Ok(Self::Hello { keymap, caps }),
+            ClientMsg::Hello {
+                keymap,
+                caps,
+                origin,
+                ..
+            } => Ok(Self::Hello {
+                keymap,
+                caps,
+                origin,
+            }),
             _ => Err(Error::message("expected Hello")),
         }
     }
@@ -595,6 +654,14 @@ mod tests {
                     chroma: vec![ChromaMode::Dual420, ChromaMode::Single420],
                     features: vec!["x".into()],
                 },
+                origin: Some(Box::new(Origin {
+                    machine: "a".into(),
+                    window_output: Some("DP-1".into()),
+                    viewers: vec![Viewer {
+                        machine: "b".into(),
+                        output: "DP-1".into(),
+                    }],
+                })),
             },
             ClientMsg::Key {
                 keycode: 30,
@@ -698,8 +765,31 @@ mod tests {
                         chroma: vec![ChromaMode::Dual420, ChromaMode::Single420],
                         features: vec!["f".into()],
                     },
+                    origin: None,
                 },
                 "82008301616b858101190f00190870820102816166",
+            ),
+            (
+                ClientMsg::Hello {
+                    version: 1,
+                    keymap: "k".into(),
+                    caps: ClientCaps {
+                        codecs: vec![Codec::H264],
+                        max_width: 3840,
+                        max_height: 2160,
+                        chroma: vec![ChromaMode::Dual420, ChromaMode::Single420],
+                        features: vec!["f".into()],
+                    },
+                    origin: Some(Box::new(Origin {
+                        machine: "m".into(),
+                        window_output: Some("o".into()),
+                        viewers: vec![Viewer {
+                            machine: "v".into(),
+                            output: "p".into(),
+                        }],
+                    })),
+                },
+                "82008401616b858101190f0019087082010281616683616d616f818261766170",
             ),
             (
                 ClientMsg::Key {
@@ -793,7 +883,7 @@ mod tests {
             keymap: String,
             #[n(2)]
             caps: NewerCaps,
-            #[n(3)]
+            #[n(4)]
             layout: String,
         },
     }
@@ -821,6 +911,52 @@ mod tests {
         H264OrDual420,
         #[n(9)]
         Future,
+    }
+
+    /// A `Hello` from a build that predates `origin`: three fields.
+    #[test]
+    fn hello_without_origin_decodes() {
+        let old = "82008301616b858101190f00190870820102816166";
+        let bytes: Vec<u8> = (0..old.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&old[i..i + 2], 16).unwrap())
+            .collect();
+        let ClientMsg::Hello { origin, .. } = minicbor::decode::<ClientMsg>(&bytes).unwrap() else {
+            unreachable!()
+        };
+        assert_eq!(origin, None);
+    }
+
+    #[test]
+    fn a_window_on_a_viewed_output_loops() {
+        let origin = Origin {
+            machine: "b".into(),
+            window_output: Some("gliff-7".into()),
+            viewers: vec![
+                Viewer {
+                    machine: "a".into(),
+                    output: "gliff-7".into(),
+                },
+                Viewer {
+                    machine: "c".into(),
+                    output: "DP-1".into(),
+                },
+            ],
+        };
+        assert!(origin.loops_through("a").is_some());
+        // Another machine viewing, or a window elsewhere, is no loop.
+        assert!(origin.loops_through("c").is_none());
+        assert!(origin.loops_through("d").is_none());
+        let elsewhere = Origin {
+            window_output: Some("DP-2".into()),
+            ..origin.clone()
+        };
+        assert!(elsewhere.loops_through("a").is_none());
+        let unknown = Origin {
+            window_output: None,
+            ..origin
+        };
+        assert!(unknown.loops_through("a").is_none());
     }
 
     #[test]
@@ -851,8 +987,36 @@ mod tests {
                     chroma: vec![ChromaMode::Dual420],
                     features: vec!["future".into()],
                 },
+                origin: None,
             }
         );
+    }
+
+    #[test]
+    fn greeting_carries_the_origin() {
+        let origin = Box::new(Origin {
+            machine: "m".into(),
+            window_output: None,
+            viewers: vec![],
+        });
+        let hello = ClientMsg::Hello {
+            version: PROTOCOL_VERSION,
+            keymap: "k".into(),
+            caps: ClientCaps {
+                codecs: vec![Codec::H264],
+                max_width: 1,
+                max_height: 1,
+                chroma: vec![ChromaMode::Dual420],
+                features: vec![],
+            },
+            origin: Some(origin.clone()),
+        };
+        let Greeting::Hello { origin: got, .. } =
+            minicbor::decode::<Greeting>(&minicbor::to_vec(&hello).unwrap()).unwrap()
+        else {
+            panic!("not a hello")
+        };
+        assert_eq!(got, Some(origin));
     }
 
     #[test]
@@ -867,13 +1031,18 @@ mod tests {
                 chroma: vec![ChromaMode::Dual420],
                 features: vec![],
             },
+            origin: None,
         };
         let ClientMsg::Hello { keymap, caps, .. } = hello.clone() else {
             unreachable!()
         };
         assert_eq!(
             minicbor::decode::<Greeting>(&minicbor::to_vec(&hello).unwrap()).unwrap(),
-            Greeting::Hello { keymap, caps }
+            Greeting::Hello {
+                keymap,
+                caps,
+                origin: None
+            }
         );
 
         /// A future protocol version whose `Hello` has a different shape.

@@ -14,13 +14,13 @@ use bytes::Bytes;
 use gliff_proto::clipboard::CHUNK;
 use gliff_proto::{
     features, version_mismatch, ChromaMode, ClientCaps, ClientMsg, ClipboardMsg, Codec, Greeting,
-    OutputInfo as ProtoOutput, Rect, ServerMsg, SessionInfo, VideoPipeline, ERROR_NO_CHROMA,
-    ERROR_NO_CODEC, ERROR_SETUP, ERROR_VERSION, PROTOCOL_VERSION,
+    Origin, OutputInfo as ProtoOutput, Rect, ServerMsg, SessionInfo, VideoPipeline, ERROR_LOOP,
+    ERROR_NO_CHROMA, ERROR_NO_CODEC, ERROR_SETUP, ERROR_VERSION, PROTOCOL_VERSION,
 };
 use gliff_sw::VideoMode;
 use gliff_transport::clipboard::progress::Jobs;
 use gliff_transport::clipboard::{outbound_channel, Side, Transfers};
-use gliff_transport::Framed;
+use gliff_transport::{viewers, Framed};
 use gliff_vk::{DmabufPlane, EncodedFrame, Encoder, EncoderSettings, Gpu};
 
 use crate::rate::{cpu_rebuild_due, Ladder, LinkEstimator, RateController};
@@ -79,7 +79,7 @@ where
     let mut reader = Framed::new(rd);
     let mut writer = Framed::new(wr);
 
-    let (keymap, caps) = handshake(&mut reader, &mut writer).await?;
+    let (keymap, caps, origin) = handshake(&mut reader, &mut writer).await?;
     if !caps.codecs.contains(&Codec::H264) {
         writer
             .write_msg(&ServerMsg::error(
@@ -100,6 +100,28 @@ where
         anyhow::bail!("client advertises no chroma mode this server speaks");
     }
 
+    tracing::debug!(
+        machine = ?origin.as_ref().map(|o| &o.machine),
+        window = ?origin.as_ref().map(|o| &o.window_output),
+        viewers = origin.as_ref().map_or(0, |o| o.viewers.len()),
+        "client origin"
+    );
+    if let Some(viewer) = origin
+        .as_ref()
+        .zip(viewers::machine_id())
+        .and_then(|(origin, me)| origin.loops_through(&me))
+    {
+        let message = "This machine is already showing the screen this window is on. \
+                       Connecting back would show it inside itself.";
+        writer
+            .write_msg(&ServerMsg::error(ERROR_LOOP, message))
+            .await?;
+        anyhow::bail!(
+            "refusing a connection back into {}, which this machine is viewing",
+            viewer.output
+        );
+    }
+
     let instance = report_setup(
         &mut writer,
         cfg.target.instance().context("find Hyprland instance"),
@@ -108,6 +130,12 @@ where
     let output = report_setup(&mut writer, setup_output(&instance, &cfg, &caps)).await?;
     tracing::info!(output = %output.name, output.width, output.height, headless = output.is_headless(), "session output ready");
 
+    // Kept until the session ends, so a client on this machine can see who
+    // views it.
+    let _viewer = origin.as_ref().and_then(|o| {
+        let runtime = hypr_ipc::runtime_dir().ok()?;
+        viewers::register(&runtime, &o.machine, &output.name)
+    });
     let video = VideoTier::open(cfg.video, cfg.capture, &cfg.render_node);
     let codec = Codec::H264;
     writer
@@ -344,15 +372,19 @@ where
 async fn handshake<R, W>(
     reader: &mut Framed<R>,
     writer: &mut Framed<W>,
-) -> Result<(String, ClientCaps)>
+) -> Result<(String, ClientCaps, Option<Box<Origin>>)>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
     match reader.read_msg::<Greeting>().await.context("read Hello")? {
-        Greeting::Hello { keymap, caps } => {
+        Greeting::Hello {
+            keymap,
+            caps,
+            origin,
+        } => {
             tracing::debug!(features = ?caps.features, "client features");
-            Ok((keymap, caps))
+            Ok((keymap, caps, origin))
         }
         Greeting::OtherVersion(version) => {
             let message = version_mismatch(version, PROTOCOL_VERSION);

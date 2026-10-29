@@ -600,7 +600,7 @@ fn serve_test(node: &std::path::Path, addr: &str, frames: usize, video: VideoMod
         let mut reader = Framed::new(rd);
         let mut writer = Framed::new(wr);
         let caps = ClientCaps { codecs: vec![Codec::H264], max_width: 1280, max_height: 720, chroma: vec![ChromaMode::Dual420, ChromaMode::Single420], features: gliff_proto::features() };
-        writer.write_msg(&ClientMsg::Hello { version: gliff_proto::PROTOCOL_VERSION, keymap: String::new(), caps }).await?;
+        writer.write_msg(&ClientMsg::Hello { version: gliff_proto::PROTOCOL_VERSION, keymap: String::new(), caps, origin: None }).await?;
         let ack = reader.read_msg::<ServerMsg>().await?;
         let ServerMsg::HelloAck { session, outputs, .. } = ack else { bail!("expected HelloAck, got {ack:?}") };
         eprintln!("  HelloAck: headless={} output={} ({} outputs)", session.headless, session.output, outputs.len());
@@ -891,7 +891,7 @@ fn stream_bench(
         let mut reader = Framed::new(rd);
         let mut writer = Framed::new(wr);
         let caps = ClientCaps { codecs: vec![Codec::H264], max_width: 3840, max_height: 2160, chroma: vec![ChromaMode::Dual420, ChromaMode::Single420], features: gliff_proto::features() };
-        writer.write_msg(&ClientMsg::Hello { version: gliff_proto::PROTOCOL_VERSION, keymap: String::new(), caps }).await?;
+        writer.write_msg(&ClientMsg::Hello { version: gliff_proto::PROTOCOL_VERSION, keymap: String::new(), caps, origin: None }).await?;
         let ack = reader.read_msg::<ServerMsg>().await?;
         let ServerMsg::HelloAck { session, .. } = ack else { bail!("expected HelloAck, got {ack:?}") };
         milestone("hello_ack");

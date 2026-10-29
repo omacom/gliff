@@ -10,6 +10,7 @@ mod clipboard_ui;
 mod keymap;
 mod net;
 mod paintable;
+mod placement;
 mod recent;
 mod theme;
 
@@ -93,6 +94,9 @@ struct App {
     /// Centred over the picture while the shown session is not streaming:
     /// connecting, reconnecting, an error, or no session at all.
     status: gtk::Label,
+    /// Under the status while the shown session was refused for looping:
+    /// connect without the loop guard.
+    connect_anyway: gtk::Button,
     /// A short-lived note near the bottom of the picture, such as how to
     /// release the captured shortcuts.
     hint: gtk::Label,
@@ -133,6 +137,7 @@ struct App {
     config_path: PathBuf,
     cli: Cli,
     keymap: keymap::Keymap,
+    placement: placement::Placement,
 }
 
 /// One connection to a machine. Every session keeps streaming while the
@@ -184,6 +189,10 @@ struct Session {
     last_frame: RefCell<Option<(gdk::Texture, (u32, u32))>>,
     cursor: RefCell<Option<gdk::Cursor>>,
     status: RefCell<String>,
+    /// The last attempt was refused for looping.
+    loop_refused: Cell<bool>,
+    /// The next attempt skips the loop guard (the user chose to connect anyway).
+    force: Cell<bool>,
     stats: RefCell<String>,
 }
 
@@ -217,6 +226,8 @@ impl Session {
             last_frame: RefCell::new(None),
             cursor: RefCell::new(None),
             status: RefCell::new(String::new()),
+            loop_refused: Cell::new(false),
+            force: Cell::new(false),
             stats: RefCell::new(String::new()),
         }
     }
@@ -381,7 +392,19 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
     overlay.set_child(Some(&video));
     overlay.add_overlay(&stats);
     overlay.add_overlay(transfers.widget());
-    overlay.add_overlay(&status);
+    let connect_anyway = gtk::Button::builder()
+        .label("Connect anyway, I know what I'm doing")
+        .halign(gtk::Align::Center)
+        .visible(false)
+        .margin_top(8)
+        .css_classes(["destructive-action", "pill"])
+        .build();
+    let status_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    status_box.set_halign(gtk::Align::Center);
+    status_box.set_valign(gtk::Align::Center);
+    status_box.append(&status);
+    status_box.append(&connect_anyway);
+    overlay.add_overlay(&status_box);
     overlay.add_overlay(&hint);
 
     let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -403,6 +426,7 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         frame,
         stats: stats.clone(),
         status: status.clone(),
+        connect_anyway: connect_anyway.clone(),
         hint,
         hint_generation: Cell::new(0),
         capture_hinted: Cell::new(false),
@@ -422,7 +446,17 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         config_path: Config::default_path(),
         cli: cli.clone(),
         keymap: keymap::watch(),
+        placement: placement::follow(&window),
     });
+
+    {
+        let weak = Rc::downgrade(&ui);
+        connect_anyway.connect_clicked(move |_| {
+            if let Some(ui) = weak.upgrade() {
+                retry_loop(&ui, true);
+            }
+        });
+    }
 
     let hotkey = ReleaseHotkey::parse(&cli.release_hotkey).unwrap_or_else(|e| {
         tracing::warn!(error = %e, "invalid --release-hotkey; shortcut release disabled");
@@ -976,7 +1010,7 @@ fn show_session(ui: &Rc<App>, s: &Rc<Session>) {
         }
     }
     ui.window.set_title(Some(&window_title(&s.endpoint)));
-    show_status(ui, &s.status.borrow());
+    show_status(ui, &s.status.borrow(), s.loop_refused.get());
     ui.stats.set_text(&s.stats.borrow());
     match &*s.last_frame.borrow() {
         Some((texture, view)) => ui.frame.set_frame(texture.clone(), device_scale(ui), *view),
@@ -996,7 +1030,7 @@ fn show_nothing(ui: &Rc<App>) {
     let previous = ui.active.take();
     revoke_local_offer(previous.as_ref(), ui.cli.no_clipboard);
     ui.window.set_title(Some("Gliff"));
-    show_status(ui, "Not connected");
+    show_status(ui, "Not connected", false);
     ui.stats.set_text("");
     ui.frame.clear();
     ui.video.set_cursor(None);
@@ -1071,13 +1105,28 @@ fn save_config(ui: &App, config: &Config) {
 fn set_status(ui: &App, s: &Rc<Session>, text: &str) {
     *s.status.borrow_mut() = text.to_string();
     if is_active(ui, s) {
-        show_status(ui, text);
+        show_status(ui, text, s.loop_refused.get());
     }
 }
 
-fn show_status(ui: &App, text: &str) {
+fn show_status(ui: &App, text: &str, loop_refused: bool) {
     ui.status.set_text(text);
     ui.status.set_visible(!text.is_empty());
+    ui.connect_anyway.set_visible(loop_refused);
+}
+
+/// Retry a session refused for looping; `force` skips the guard for this
+/// attempt.
+fn retry_loop(ui: &Rc<App>, force: bool) {
+    let Some(s) = active(ui) else {
+        return;
+    };
+    s.loop_refused.set(false);
+    s.force.set(force);
+    s.retries.set(0);
+    s.gave_up.set(false);
+    set_status(ui, &s, &connecting_status(None));
+    start_session(ui.clone(), s);
 }
 
 /// Show a note near the bottom of the picture for a few seconds.
@@ -1128,6 +1177,7 @@ fn start_session(ui: Rc<App>, s: Rc<Session>) {
     // Replacing the sender closes the old worker's input, which ends it.
     *s.input_tx.borrow_mut() = Some(input_tx);
     s.zoom.set(1);
+    s.loop_refused.set(false);
     s.reset_resize();
     let generation = s.generation.get() + 1;
     s.generation.set(generation);
@@ -1144,6 +1194,8 @@ fn start_session(ui: Rc<App>, s: Rc<Session>) {
     let endpoint = s.endpoint.clone();
     let video = gliff_sw::VideoMode::resolve(ui.cli.video.as_deref());
     let keymap = ui.keymap.clone();
+    let force = s.force.replace(false);
+    let placement = ui.placement.clone();
     std::thread::Builder::new()
         .name("gliff-net".into())
         .spawn(move || {
@@ -1154,6 +1206,8 @@ fn start_session(ui: Rc<App>, s: Rc<Session>) {
                 status: status_tx,
                 input: input_rx,
                 keymap,
+                placement,
+                force,
             }
             .run();
         })
@@ -1443,6 +1497,15 @@ fn poll_status(ui: Rc<App>, s: Rc<Session>, rx: Receiver<Status>, generation: u6
                 Status::Incompatible(message) => {
                     *s.last_error.borrow_mut() = Some(message.clone());
                     tracing::error!(machine = %s.name, error = %message, "incompatible server");
+                    set_status(&ui, &s, &message);
+                    show_disconnected(&ui, &s);
+                    s.gave_up.set(true);
+                    return glib::ControlFlow::Break;
+                }
+                Status::Loop(message) => {
+                    tracing::warn!(machine = %s.name, "connection would loop");
+                    *s.last_error.borrow_mut() = Some(message.clone());
+                    s.loop_refused.set(true);
                     set_status(&ui, &s, &message);
                     show_disconnected(&ui, &s);
                     s.gave_up.set(true);

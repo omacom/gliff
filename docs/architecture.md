@@ -259,6 +259,19 @@ Every crate with `unsafe` documents the safety requirements at each block.
   `org.freedesktop.Notifications`. Cancel drops the fetch, which sends
   `Abort`. A failed paste is always reported, however short.
 
+- **Screen loop guard.** Two machines may show each other, but a window that
+  sits on a screen A is capturing must not connect back to A, or A's window
+  would show A. Each server records the client it serves in
+  `$XDG_RUNTIME_DIR/gliff/<pid>` (the viewer's machine identity and the
+  output it captures; removed when the session ends, ignored when the pid is
+  gone). A client lists the viewers of its own machine, its machine identity
+  (a hash of `/etc/machine-id`) and the output its window is on in the
+  optional `origin` of `Hello`. A server finding itself among the viewers,
+  on the output the window is on, answers `ERROR_LOOP`, which is fatal so
+  the client does not retry; the tab offers "Connect anyway", which sends the
+  `origin` without the viewers, so the server connects but still records the
+  client. Either end without the field skips the check.
+
 ## Measurements
 
 On an AMD Radeon RX 7600 (RADV for compute, radeonsi for the codec, Mesa
