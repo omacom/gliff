@@ -27,4 +27,5 @@ drm-fourcc.workspace = true
 hypr-ipc.workspace = true
 hypr-input.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 toml = "1"

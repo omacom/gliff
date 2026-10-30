@@ -108,12 +108,23 @@ pub enum Status {
     /// The two ends speak different protocol versions, so retrying cannot
     /// help.
     Incompatible(String),
+    /// ssh worked but the remote has no `gliff-server`, so retrying cannot
+    /// help until gliff is installed there.
+    ServerMissing,
     Closed,
 }
 
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
 struct Incompatible(String);
+
+/// The remote shell could not find the server binary.
+#[derive(Debug, thiserror::Error)]
+#[error("gliff-server is not installed on the remote machine")]
+struct ServerMissing;
+
+/// The exit status a POSIX shell gives a command it cannot find.
+const COMMAND_NOT_FOUND: i32 = 127;
 
 /// A remote cursor image: `argb` holds `width` x `height` BGRA pixels.
 pub struct CursorShape {
@@ -344,8 +355,8 @@ impl Worker {
                     .await
                 }
                 Endpoint::Ssh(ref target) => {
-                    let ssh = spawn_ssh(target)?;
-                    session(
+                    let mut ssh = spawn_ssh(target)?;
+                    let result = session(
                         ssh.stdout,
                         ssh.stdin,
                         self.video,
@@ -354,14 +365,33 @@ impl Worker {
                         self.input,
                         self.keymap,
                     )
-                    .await
+                    .await;
+                    if result.is_err() {
+                        // ssh passes on the remote exit status; it has
+                        // usually exited by the time the stream ended.
+                        let exited = tokio::time::timeout(
+                            std::time::Duration::from_secs(1),
+                            ssh.child.wait(),
+                        )
+                        .await;
+                        if let Ok(Ok(status)) = exited {
+                            if status.code() == Some(COMMAND_NOT_FOUND) {
+                                return Err(ServerMissing.into());
+                            }
+                        }
+                    }
+                    result
                 }
             }
         });
         if let Err(e) = result {
-            let _ = status.send(match e.downcast::<Incompatible>() {
-                Ok(Incompatible(message)) => Status::Incompatible(message),
-                Err(e) => Status::Error(e.to_string()),
+            let _ = status.send(if e.is::<ServerMissing>() {
+                Status::ServerMissing
+            } else {
+                match e.downcast::<Incompatible>() {
+                    Ok(Incompatible(message)) => Status::Incompatible(message),
+                    Err(e) => Status::Error(e.to_string()),
+                }
             });
         } else {
             let _ = status.send(Status::Closed);

@@ -704,6 +704,7 @@ dependencies = [
  "hypr-ipc",
  "libadwaita",
  "serde",
+ "serde_json",
  "thiserror",
  "tokio",
  "toml",
