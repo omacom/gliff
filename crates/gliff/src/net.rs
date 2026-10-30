@@ -291,6 +291,28 @@ impl Zoom {
 pub enum Endpoint {
     Tcp(String),
     Ssh(SshTarget),
+    /// The protocol on this process's stdin and stdout (`--stdio`), named
+    /// after the machine at the other end.
+    Stdio(String),
+}
+
+/// The protocol's half of stdout, kept by [`take_stdio`] until the one
+/// --stdio session takes it.
+static STDIO_OUT: Mutex<Option<std::os::fd::OwnedFd>> = Mutex::new(None);
+
+/// Keep stdout for the protocol and point fd 1 at stderr, so nothing that
+/// prints (GTK, a driver) can write into the stream.
+pub fn take_stdio() -> anyhow::Result<()> {
+    use std::io::IsTerminal;
+    use std::os::fd::AsFd;
+    anyhow::ensure!(
+        !std::io::stdin().is_terminal() && !std::io::stdout().is_terminal(),
+        "--stdio carries the protocol on stdin and stdout, which are a terminal"
+    );
+    let out = std::io::stdout().as_fd().try_clone_to_owned()?;
+    rustix::stdio::dup2_stdout(std::io::stderr().as_fd())?;
+    *STDIO_OUT.lock().unwrap() = Some(out);
+    Ok(())
 }
 
 /// A decoded frame for the GTK thread: a dmabuf from the GPU tier, or plain
@@ -335,6 +357,23 @@ impl Worker {
                     session(
                         rd,
                         wr,
+                        self.video,
+                        self.frames,
+                        self.status,
+                        self.input,
+                        self.keymap,
+                    )
+                    .await
+                }
+                Endpoint::Stdio(_) => {
+                    let out = STDIO_OUT
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .context("the --stdio stream was already used")?;
+                    session(
+                        tokio::io::stdin(),
+                        tokio::fs::File::from_std(std::fs::File::from(out)),
                         self.video,
                         self.frames,
                         self.status,

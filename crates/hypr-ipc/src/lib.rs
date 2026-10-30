@@ -200,9 +200,7 @@ impl Instance {
         self.dispatch(&format!("output remove {name}"))
     }
 
-    /// Apply a monitor rule for `name`. A legacy (hyprlang) config takes the
-    /// `monitor` keyword; a Lua config rejects keywords and takes the same
-    /// rule through `eval hl.monitor`.
+    /// Apply a monitor rule for `name`, placed where Hyprland finds room.
     pub fn set_monitor_mode(
         &self,
         name: &str,
@@ -211,11 +209,27 @@ impl Instance {
         hz: u32,
         scale: f32,
     ) -> Result<()> {
-        let keyword = format!("keyword monitor {name},{width}x{height}@{hz},auto,{scale}");
+        self.set_monitor_rule(name, width, height, hz, "auto", scale)
+    }
+
+    /// Apply a monitor rule for `name` at `position`: `auto`, a side such as
+    /// `auto-right`, or `XxY`. A legacy (hyprlang) config takes the `monitor`
+    /// keyword; a Lua config rejects keywords and takes the same rule
+    /// through `eval hl.monitor`.
+    pub fn set_monitor_rule(
+        &self,
+        name: &str,
+        width: u32,
+        height: u32,
+        hz: u32,
+        position: &str,
+        scale: f32,
+    ) -> Result<()> {
+        let keyword = format!("keyword monitor {name},{width}x{height}@{hz},{position},{scale}");
         match self.dispatch(&keyword) {
             Err(Error::Command { response, .. }) if response.contains("non-legacy") => {
                 self.dispatch(&format!(
-                    "eval hl.monitor({{ output = \"{name}\", mode = \"{width}x{height}@{hz}\", position = \"auto\", scale = {scale} }})"
+                    "eval hl.monitor({{ output = \"{name}\", mode = \"{width}x{height}@{hz}\", position = \"{position}\", scale = {scale} }})"
                 ))
             }
             other => other,
