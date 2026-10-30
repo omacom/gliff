@@ -64,7 +64,7 @@ enum Incoming {
     Error(String),
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -341,7 +341,7 @@ where
 }
 
 /// Read the client's Hello and check its protocol version.
-async fn handshake<R, W>(
+pub(crate) async fn handshake<R, W>(
     reader: &mut Framed<R>,
     writer: &mut Framed<W>,
 ) -> Result<(String, ClientCaps)>
@@ -367,7 +367,7 @@ where
 /// Pass a setup step's result through, first telling the client why the
 /// session cannot start when the step failed; otherwise all the client sees
 /// is the connection closing.
-async fn report_setup<T, W>(writer: &mut Framed<W>, step: Result<T>) -> Result<T>
+pub(crate) async fn report_setup<T, W>(writer: &mut Framed<W>, step: Result<T>) -> Result<T>
 where
     W: AsyncWrite + Unpin,
 {
@@ -623,6 +623,8 @@ impl Session {
                 self.inject(InputCmd::SetKeymap(keymap))
             }
             ClientMsg::Keymap { .. } => {}
+            // Only `--control` lists the feature that sends it.
+            ClientMsg::KeyboardLocks { .. } => {}
             ClientMsg::Hello { .. } => anyhow::bail!("unexpected second Hello"),
         }
         Ok(ControlFlow::Continue(()))

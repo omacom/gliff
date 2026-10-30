@@ -166,6 +166,8 @@ impl OutputInfo {
 #[derive(Debug, Default)]
 pub struct Outputs {
     pub list: Vec<(WlOutput, OutputInfo)>,
+    /// Registry name of each bound output, for outputs that come and go.
+    globals: Vec<(u32, WlOutput)>,
 }
 
 impl Outputs {
@@ -174,7 +176,7 @@ impl Outputs {
     where
         D: Dispatch<WlOutput, ()> + 'static,
     {
-        let mut list = Vec::new();
+        let mut outputs = Self::default();
         let names: Vec<u32> = globals.contents().with_list(|l| {
             l.iter()
                 .filter(|g| g.interface == WlOutput::interface().name)
@@ -182,10 +184,32 @@ impl Outputs {
                 .collect()
         });
         for name in names {
-            let output: WlOutput = globals.registry().bind(name, 4, qh, ());
-            list.push((output, OutputInfo::default()));
+            outputs.add(globals.registry(), name, qh);
         }
-        Ok(Self { list })
+        Ok(outputs)
+    }
+
+    /// Bind the output global `name`, announced after [`bind`](Self::bind).
+    pub fn add<D>(&mut self, registry: &WlRegistry, name: u32, qh: &QueueHandle<D>)
+    where
+        D: Dispatch<WlOutput, ()> + 'static,
+    {
+        let output: WlOutput = registry.bind(name, 4, qh, ());
+        self.globals.push((name, output.clone()));
+        self.list.push((output, OutputInfo::default()));
+    }
+
+    /// Forget the output global `name`; false when it is not an output.
+    pub fn remove(&mut self, name: u32) -> bool {
+        let Some(i) = self.globals.iter().position(|(n, _)| *n == name) else {
+            return false;
+        };
+        let (_, output) = self.globals.remove(i);
+        self.list.retain(|(o, _)| *o != output);
+        if output.version() >= 3 {
+            output.release();
+        }
+        true
     }
 
     pub fn get(&self, name: &str) -> Option<&(WlOutput, OutputInfo)> {
