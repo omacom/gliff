@@ -175,6 +175,9 @@ fn run(
     let seat = state.seat.wl_seat()?.clone();
     let device = state.manager.get_data_device(&seat, &qh, ());
     state.device = Some(device);
+    // The selection at start reaches the sink before `Clipboard::start`
+    // returns, so an owner can tell it from later ones.
+    queue.roundtrip(&mut state)?;
     let _ = ready_tx.send(Ok(()));
 
     let result = hypr_wl::run_loop(conn, queue, rx, &mut state);

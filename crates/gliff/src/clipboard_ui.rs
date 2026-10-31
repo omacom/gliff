@@ -40,7 +40,7 @@ fn clipboard() -> Option<gdk::Clipboard> {
     gdk::Display::default().map(|d| d.clipboard())
 }
 
-fn sensitive_selection(mimes: &[String]) -> bool {
+pub(crate) fn sensitive_selection(mimes: &[String]) -> bool {
     mimes.iter().any(|m| m == "x-kde-passwordManagerHint")
 }
 

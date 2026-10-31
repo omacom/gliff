@@ -49,6 +49,7 @@ video, cursor and pongs flow server→client.
 |---|---|---|
 | `gliff-proto` | wire messages, framing header, CPU reference for colour and the AVC444 split/recombine | none |
 | `gliff-transport` | `Framed` length-prefixed IO with out-of-band payloads (`write_vectored`), the clipboard transfer engine and file spool, ssh spawn | none |
+| `gliff-bridge` | joins the compositor's clipboard to the transfer engine, for the server and for `gliff --control` | none |
 | `hypr-ipc` | Hyprland control socket (instance discovery, outputs, options) | none |
 | `hypr-wl` | shared Wayland plumbing (connect, globals, output/seat tracking, calloop runner) | none |
 | `hypr-capture` | output + cursor capture into GBM dmabufs on a calloop thread | none |
@@ -243,7 +244,8 @@ Every crate with `unsafe` documents the safety requirements at each block.
   in-memory item is capped at 32 MiB, a file at its declared size, and either
   side may `Abort`. The server bridges
   `ext-data-control-v1` on its own thread, moving only mime lists and pipe fds;
-  the client bridges `gdk::Clipboard` with a lazy `ContentProvider` subclass,
+  `gliff --control`, with no window, does the same on this machine; the
+  window's client bridges `gdk::Clipboard` with a lazy `ContentProvider` subclass,
   chunks crossing to the network thread through bounded channels. Files are
   never sent as URIs: the pasting side streams each one into a disk-backed
   spool directory and hands its applications a URI list pointing there. A
