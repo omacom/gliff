@@ -57,6 +57,14 @@ bin/install
 
 This uses the current checkout, including fixes newer than the last release.
 
+If the remote machine does not have gliff yet, connecting to it offers to
+install it there for your user. Over the same ssh, the remote downloads the
+gliff package from its Omarchy repository, checks it against the repository
+checksum and the signature its own pacman keyring trusts, and copies it to
+`~/.local`; no password or sudo is needed. A file in `~/.local` that gliff
+did not put there is never replaced. To install system-wide instead, run
+`omarchy pkg add gliff` or `sudo pacman -S gliff` on that machine.
+
 To build from source, see [docs/development.md](docs/development.md).
 
 ## Use
@@ -121,6 +129,23 @@ room. Two flags change the video, and you pass them to the server through
 ```
 gliff --server-bin 'gliff-server --low-bandwidth' user@host
 ```
+
+**One mouse and keyboard for several machines.** `--control SIDE:HOST`
+places another machine beside this one's screens, with no window and no
+video: push the pointer past that edge (`left`, `right`, `above` or `below`)
+and it carries on across the other machine's screen, and the keyboard goes
+with it. Cross back over the same edge, or press the release hotkey
+(`Shift+Esc`, or a chord given to `--release-hotkey`), to come back. Give it
+once for each machine:
+
+```
+gliff --control left:user@laptop --control right:user@desktop
+```
+
+The other machine needs a `gliff-server` that knows `--control`; the pointer
+moves on its screen on the side facing this one. A machine that cannot be
+reached leaves its edge inactive until gliff connects to it again. The
+clipboard is not shared this way yet.
 
 ## If something does not work
 

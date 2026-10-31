@@ -7,17 +7,24 @@
 
 mod clipboard;
 mod clipboard_ui;
+mod control;
+mod display;
 mod keymap;
+mod monitor;
 mod net;
 mod paintable;
 mod recent;
+mod remote_install;
+mod sound;
 mod theme;
+mod tray;
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, sync_channel, Receiver};
 use std::time::{Duration, Instant};
 
@@ -58,9 +65,21 @@ struct Cli {
     /// to open a tab for each.
     #[arg(long)]
     connect: Vec<String>,
+    /// Show the gliff-server whose protocol arrives on stdin and leaves on
+    /// stdout. The machine running that server starts this over ssh to use
+    /// this screen as one of its own; the window closes when it stops.
+    #[arg(long, conflicts_with_all = ["host", "connect"])]
+    stdio: bool,
+    /// Open the window fullscreen.
+    #[arg(long)]
+    fullscreen: bool,
     /// Remote gliff-server path.
     #[arg(long, default_value = "gliff-server")]
     server_bin: String,
+    /// The other machine's gliff, for using its screen as one of this
+    /// machine's.
+    #[arg(long, default_value = "gliff")]
+    remote_gliff: String,
     /// Create a private headless output on the remote, sized and scaled to
     /// this window, instead of mirroring the remote's focused screen.
     #[arg(long, conflicts_with = "output")]
@@ -72,7 +91,8 @@ struct Cli {
     /// the local compositor. Forms: a chord like `shift+escape`, `ctrl+alt+q`
     /// or `super+escape`; `double-<key>` for a double-tap (e.g.
     /// `double-escape`); or `none` to disable. The screen recaptures when you
-    /// click it again.
+    /// click it again. With `--control` it returns the pointer, and takes a
+    /// chord or `none`.
     #[arg(long, default_value = "shift+escape")]
     release_hotkey: String,
     /// Video pipeline: `gpu` (Vulkan compute + VA-API, falling back to the
@@ -80,6 +100,13 @@ struct Cli {
     /// the GLIFF_VIDEO environment variable.
     #[arg(long, value_parser = ["gpu", "cpu"])]
     video: Option<String>,
+    /// Drive another machine with this pointer and keyboard, with no window:
+    /// `SIDE:HOST`, where SIDE (`left`, `right`, `above` or `below`) is where
+    /// it sits beside this machine's screens. Push the pointer past that edge
+    /// to move onto it; cross back, or press the release hotkey, to return.
+    /// Repeat it for a machine on each side.
+    #[arg(long, value_parser = control::parse, conflicts_with_all = ["host", "connect", "headless", "output", "stdio"])]
+    control: Vec<control::Control>,
 }
 
 /// Everything the UI shares with its callbacks.
@@ -130,6 +157,8 @@ struct App {
     /// keyboard stays local until the pointer leaves, or the picture is
     /// clicked.
     released: Cell<bool>,
+    /// The header's screen buttons; set once the window is built.
+    monitor: RefCell<Option<Rc<monitor::Controller>>>,
     config_path: PathBuf,
     cli: Cli,
     keymap: keymap::Keymap,
@@ -154,6 +183,9 @@ struct Session {
     last_error: RefCell<Option<String>>,
     /// Automatic reconnects have given up; selecting the tab tries again.
     gave_up: Cell<bool>,
+    /// gliff is being installed on the machine; selecting the tab waits for
+    /// it instead of connecting into a half-written install.
+    installing: Cell<bool>,
     /// Recorded in the config on the first successful connect.
     remembered: Cell<bool>,
     /// The server is streaming: set by its Connected status, cleared when
@@ -203,6 +235,7 @@ impl Session {
             retries: Cell::new(0),
             last_error: RefCell::new(None),
             gave_up: Cell::new(false),
+            installing: Cell::new(false),
             remembered: Cell::new(false),
             connected: Cell::new(false),
             headless: Cell::new(false),
@@ -223,10 +256,31 @@ impl Session {
 }
 
 fn main() -> glib::ExitCode {
+    let cli = Cli::parse();
+    if !cli.control.is_empty() {
+        // With no window, the log is how it says what it is doing.
+        let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+        tracing_subscriber::fmt().with_env_filter(filter).init();
+        return match control::run(&cli.control, &cli.server_bin, &cli.release_hotkey) {
+            Ok(()) => glib::ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("gliff: {e:#}");
+                glib::ExitCode::FAILURE
+            }
+        };
+    }
+    // Before anything can print or start a thread: with --stdio, stdout
+    // carries the protocol, and ssh started us outside the desktop session.
+    if cli.stdio {
+        if let Err(e) = net::take_stdio().and_then(|()| find_desktop_session()) {
+            eprintln!("gliff: {e:#}");
+            return glib::ExitCode::FAILURE;
+        }
+    }
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
-    let cli = Cli::parse();
     // GTK uses the program name as the Wayland app ID.
     glib::set_prgname(Some(APP_NAME));
     let app = adw::Application::builder().build();
@@ -241,11 +295,48 @@ fn main() -> glib::ExitCode {
     app.connect_activate(move |app| build_ui(app, &cli));
     // GTK owns argv parsing; we already parsed with clap, so pass none.
     let empty: Vec<String> = vec![];
-    app.run_with_args(&empty)
+    let code = app.run_with_args(&empty);
+    if STDIO_FAILED.load(Ordering::Relaxed) {
+        return glib::ExitCode::FAILURE;
+    }
+    code
+}
+
+/// A --stdio stream ended on an error rather than by either side closing
+/// it: the process exits unsuccessfully, so the machine that started it
+/// can tell the user why.
+static STDIO_FAILED: AtomicBool = AtomicBool::new(false);
+
+/// End a --stdio window on `error`, already logged. Its last stderr line
+/// is the reason the other machine shows.
+fn fail_stdio(ui: &App, error: &str) {
+    eprintln!("{error}");
+    STDIO_FAILED.store(true, Ordering::Relaxed);
+    ui.window.close();
+}
+
+/// A command run over ssh has no `WAYLAND_DISPLAY`: show the window on the
+/// user's running Hyprland session, the way gliff-server finds it.
+fn find_desktop_session() -> anyhow::Result<()> {
+    if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        return Ok(());
+    }
+    let runtime_dir = hypr_ipc::runtime_dir()?;
+    let instance = hypr_ipc::Instance::discover(None)?;
+    let display = instance.wayland_display()?;
+    // Single-threaded still: nothing else reads the environment yet.
+    std::env::set_var("XDG_RUNTIME_DIR", runtime_dir);
+    std::env::set_var("WAYLAND_DISPLAY", display);
+    std::env::set_var("HYPRLAND_INSTANCE_SIGNATURE", &instance.signature);
+    Ok(())
 }
 
 /// The endpoints named on the command line, if any.
 fn endpoints_from_cli(cli: &Cli) -> Vec<Endpoint> {
+    if cli.stdio {
+        let peer = stdio_peer(std::env::var("SSH_CONNECTION").ok().as_deref());
+        return vec![Endpoint::Stdio(peer)];
+    }
     if !cli.connect.is_empty() {
         return cli.connect.iter().cloned().map(Endpoint::Tcp).collect();
     }
@@ -266,11 +357,20 @@ fn ssh_endpoint(cli: &Cli, host: &str) -> Endpoint {
     Endpoint::Ssh(t)
 }
 
+/// The machine at the other end of a --stdio session: the client address
+/// in ssh's `SSH_CONNECTION`, when there is one.
+fn stdio_peer(ssh_connection: Option<&str>) -> String {
+    ssh_connection
+        .and_then(|c| c.split_whitespace().next())
+        .unwrap_or("stdio")
+        .to_owned()
+}
+
 /// The tab name for an endpoint.
 fn machine_name(endpoint: &Endpoint) -> &str {
     match endpoint {
         Endpoint::Ssh(t) => t.host.as_str(),
-        Endpoint::Tcp(addr) => addr.as_str(),
+        Endpoint::Tcp(addr) | Endpoint::Stdio(addr) => addr.as_str(),
     }
 }
 
@@ -335,6 +435,33 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
     header.pack_start(&add_revealer);
     header.pack_end(&fullscreen_btn);
     header.pack_end(&stats_btn);
+    let monitor_btn = gtk::Button::builder()
+        .icon_name("video-display-symbolic")
+        .build();
+    let monitor_settings_btn = gtk::Button::builder()
+        .icon_name("emblem-system-symbolic")
+        .tooltip_text("Where the other machine's screen stands")
+        .build();
+    let control_btn = gtk::Button::builder()
+        .icon_name("input-mouse-symbolic")
+        .build();
+    let sound_btn = gtk::ToggleButton::builder()
+        .icon_name("audio-volume-muted-symbolic")
+        .visible(false)
+        .build();
+    let hide_btn = gtk::Button::builder()
+        .icon_name("go-bottom-symbolic")
+        .tooltip_text("Hide this window in the bar while it works in the background")
+        .visible(false)
+        .build();
+    // A --stdio window is itself the other machine's screen.
+    if !cli.stdio {
+        header.pack_end(&monitor_btn);
+        header.pack_end(&sound_btn);
+        header.pack_end(&control_btn);
+        header.pack_end(&monitor_settings_btn);
+        header.pack_end(&hide_btn);
+    }
 
     let stats = gtk::Label::builder()
         .halign(gtk::Align::Start)
@@ -419,6 +546,7 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         view_scale: Cell::new(1.0),
         pressed_keys: RefCell::new(BTreeSet::new()),
         released: Cell::new(false),
+        monitor: RefCell::new(None),
         config_path: Config::default_path(),
         cli: cli.clone(),
         keymap: keymap::watch(),
@@ -431,6 +559,14 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
     install_input_handlers(&ui, &video, &window, hotkey);
     install_resize_handler(&ui);
     install_address_bar(&ui, &connect_btn);
+    *ui.monitor.borrow_mut() = Some(monitor::Controller::install(
+        &ui,
+        &monitor_btn,
+        &monitor_settings_btn,
+        &control_btn,
+        &hide_btn,
+        &sound_btn,
+    ));
     refresh_tabs(&ui);
 
     // Fullscreen toggle.
@@ -501,10 +637,18 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         *ui.local_clipboard.borrow_mut() = watch;
     }
 
+    if cli.fullscreen {
+        window.fullscreen();
+    }
     window.present();
     // Reconnect the machines that were connected when the window last
     // closed, then any named on the command line, which is shown first.
-    let config = Config::load(&ui.config_path);
+    // A --stdio window shows only the machine that started it.
+    let config = if cli.stdio {
+        Config::default()
+    } else {
+        Config::load(&ui.config_path)
+    };
     let from_cli = endpoints_from_cli(cli);
     for machine in &config.open {
         open_session(&ui, ssh_endpoint(cli, machine));
@@ -590,11 +734,13 @@ fn install_address_bar(ui: &Rc<App>, connect_btn: &gtk::Button) {
 }
 
 /// Show the address bar in place of the +, or fold it back. With no tabs
-/// the address bar is all there is, so it stays.
+/// the address bar is all there is, so it stays. A --stdio window has
+/// neither: it closes with its one stream, and would take any other
+/// machine opened in it along.
 fn show_address_bar(ui: &App, show: bool) {
-    let show = show || ui.tabs.first_child().is_none();
+    let show = !ui.cli.stdio && (show || ui.tabs.first_child().is_none());
     ui.add_revealer.set_reveal_child(show);
-    ui.add_btn.set_visible(!show);
+    ui.add_btn.set_visible(!show && !ui.cli.stdio);
     // A folded address bar must not keep the focus GTK gave it when the
     // window opened, or hovering the picture would never capture.
     if !show && address_bar_in_use(&ui.window, &ui.entry) {
@@ -606,7 +752,7 @@ fn show_address_bar(ui: &App, show: bool) {
 /// is already connected.
 fn connect_from_address_bar(ui: &Rc<App>) {
     let machine = ui.entry.text().trim().to_string();
-    if machine.is_empty() {
+    if machine.is_empty() || ui.cli.stdio {
         return;
     }
     ui.entry.set_text("");
@@ -767,7 +913,11 @@ fn find_session(ui: &App, name: &str) -> Option<Rc<Session>> {
 /// not remembered yet (a first connect still in progress, or a dev
 /// `--connect`).
 fn tab_names(ui: &App) -> Vec<String> {
-    let mut names = Config::load(&ui.config_path).machines;
+    let mut names = if ui.cli.stdio {
+        Vec::new()
+    } else {
+        Config::load(&ui.config_path).machines
+    };
     for s in ui.sessions.borrow().iter() {
         if !names.contains(&s.name) {
             names.push(s.name.clone());
@@ -793,6 +943,9 @@ fn refresh_tabs(ui: &Rc<App>) {
     if !has_tabs {
         show_address_bar(ui, true);
     }
+    if let Some(m) = ui.monitor.borrow().as_ref() {
+        m.update_control_button();
+    }
 }
 
 /// A machine's tab: its name, which shows that machine, and a button that
@@ -800,7 +953,9 @@ fn refresh_tabs(ui: &Rc<App>) {
 /// can be dragged into a new order.
 fn machine_tab(ui: &Rc<App>, name: &str) -> gtk::Box {
     let session = find_session(ui, name);
-    let running = session.is_some();
+    let screen_in_use = ui.monitor.borrow().as_ref().is_some_and(|m| m.owns(name));
+    let driven = ui.monitor.borrow().as_ref().is_some_and(|m| m.drives(name));
+    let running = session.is_some() || screen_in_use || driven;
     // The name is a plain label and the whole tab takes the click, so no
     // part of a tab takes keyboard focus and grows a focus ring.
     let label = gtk::Label::builder()
@@ -812,7 +967,12 @@ fn machine_tab(ui: &Rc<App>, name: &str) -> gtk::Box {
     }
     // The slot on the right shows whether the machine is connected, and
     // turns into its button while the pointer is on it.
-    let connected = session.as_ref().is_some_and(|s| s.connected.get());
+    let connected = session.as_ref().is_some_and(|s| s.connected.get())
+        || ui
+            .monitor
+            .borrow()
+            .as_ref()
+            .is_some_and(|m| m.drives_connected(name));
     let status_tip = if connected {
         "Connected"
     } else {
@@ -841,7 +1001,15 @@ fn machine_tab(ui: &Rc<App>, name: &str) -> gtk::Box {
         .focusable(false)
         .build();
     let tab = gtk::Box::builder().css_classes(["machine-tab"]).build();
-    if session.as_ref().is_some_and(|s| is_active(ui, s)) {
+    let chosen = || {
+        active(ui).is_none()
+            && ui
+                .monitor
+                .borrow()
+                .as_ref()
+                .is_some_and(|m| m.chosen().as_deref() == Some(name))
+    };
+    if session.as_ref().is_some_and(|s| is_active(ui, s)) || chosen() {
         tab.add_css_class("active");
     }
     tab.append(&label);
@@ -889,7 +1057,15 @@ fn machine_tab(ui: &Rc<App>, name: &str) -> gtk::Box {
         action.connect_clicked(move |_| {
             let (ui, name) = (ui.clone(), name.clone());
             glib::idle_add_local_once(move || {
-                if running {
+                if screen_in_use {
+                    if let Some(m) = ui.monitor.borrow().clone() {
+                        m.stop();
+                    }
+                } else if driven && find_session(&ui, &name).is_none() {
+                    if let Some(m) = ui.monitor.borrow().clone() {
+                        m.stop_control(&name);
+                    }
+                } else if running {
                     stop_session(&ui, &name);
                 } else {
                     forget_machine(&ui, &name);
@@ -938,9 +1114,21 @@ fn machine_tab(ui: &Rc<App>, name: &str) -> gtk::Box {
 /// Show a machine's tab: switch to its running session, retrying one whose
 /// reconnects gave up, or connect to it.
 fn select_tab(ui: &Rc<App>, name: &str) {
+    // A machine lending its screen is not also shown here unless asked
+    // for: connecting to it would show this screen inside itself.
+    let lending = ui.monitor.borrow().as_ref().is_some_and(|m| m.owns(name));
+    if lending && find_session(ui, name).is_none() {
+        show_lending(ui, name);
+        return;
+    }
+    let driven = ui.monitor.borrow().as_ref().is_some_and(|m| m.drives(name));
+    if driven && find_session(ui, name).is_none() {
+        show_controlling(ui, name);
+        return;
+    }
     match find_session(ui, name) {
         Some(s) => {
-            if s.gave_up.get() {
+            if s.gave_up.get() && !s.installing.get() {
                 s.retries.set(0);
                 s.gave_up.set(false);
                 start_session(ui.clone(), s.clone());
@@ -949,6 +1137,37 @@ fn select_tab(ui: &Rc<App>, name: &str) {
         }
         None => open_session(ui, ssh_endpoint(&ui.cli, name)),
     }
+}
+
+/// Select `name`'s tab while its screen is in use here, without its
+/// session, which would show this screen inside itself.
+fn show_lending(ui: &Rc<App>, name: &str) {
+    // Its tab is the selected one, also after the screen stops.
+    if let Some(m) = ui.monitor.borrow().as_ref() {
+        m.choose(name);
+    }
+    show_nothing(ui);
+    stop_session(ui, name);
+    show_status(
+        ui,
+        &format!("{name}'s screen is in use as a screen of this computer."),
+    );
+}
+
+/// Select `name`'s tab while it is driven from this computer's edge,
+/// without its session: its picture here would only take the pointer away
+/// from that edge.
+fn show_controlling(ui: &Rc<App>, name: &str) {
+    let monitor = ui.monitor.borrow().clone();
+    if let Some(m) = &monitor {
+        m.choose(name);
+    }
+    show_nothing(ui);
+    stop_session(ui, name);
+    if let Some(m) = &monitor {
+        show_status(ui, &m.control_status(name));
+    }
+    refresh_tabs(ui);
 }
 
 /// Connect to `endpoint` in a new session and show it.
@@ -961,6 +1180,9 @@ fn open_session(ui: &Rc<App>, endpoint: Endpoint) {
 
 /// Make `s` the session the window shows and sends input to.
 fn show_session(ui: &Rc<App>, s: &Rc<Session>) {
+    if let Some(m) = ui.monitor.borrow().as_ref() {
+        m.unchoose();
+    }
     if !is_active(ui, s) {
         release_pressed_keys(ui);
         let previous = ui.active.replace(Some(s.clone()));
@@ -1009,6 +1231,11 @@ fn stop_session(ui: &Rc<App>, name: &str) {
     let Some(s) = find_session(ui, name) else {
         return;
     };
+    // A --stdio window exists for its one session.
+    if matches!(s.endpoint, Endpoint::Stdio(_)) {
+        ui.window.close();
+        return;
+    }
     let was_active = is_active(ui, &s);
     if was_active {
         release_pressed_keys(ui);
@@ -1183,6 +1410,15 @@ fn remember_machine(ui: &Rc<App>, s: &Session) {
 /// The status keeps the error that ended the connection, if any, so it stays
 /// on screen while the reconnects run.
 fn schedule_reconnect(ui: Rc<App>, s: Rc<Session>, generation: u64, error: Option<&str>) {
+    // Only the machine at the other end can start a --stdio session again;
+    // a window left open would keep its screen.
+    if matches!(s.endpoint, Endpoint::Stdio(_)) {
+        match error {
+            Some(error) => fail_stdio(&ui, error),
+            None => ui.window.close(),
+        }
+        return;
+    }
     let n = s.retries.get() + 1;
     s.retries.set(n);
     if let Some(error) = error {
@@ -1200,6 +1436,52 @@ fn schedule_reconnect(ui: Rc<App>, s: Rc<Session>, generation: u64, error: Optio
     glib::timeout_add_local_once(Duration::from_millis(1500), move || {
         if s.generation.get() == generation {
             start_session(ui, s);
+        }
+    });
+}
+
+/// Offer to install gliff on a session's machine, then connect again. Only
+/// for the default server: a custom `--server-bin` is the user's own setup.
+fn offer_install(ui: Rc<App>, s: Rc<Session>, generation: u64) {
+    let Endpoint::Ssh(target) = &s.endpoint else {
+        return;
+    };
+    if target.server_bin != SshTarget::new("").server_bin {
+        return;
+    }
+    let (host, ssh_args) = (target.host.clone(), target.ssh_args.clone());
+    glib::spawn_future_local(async move {
+        if !remote_install::confirm(&ui.window, &host).await {
+            return;
+        }
+        // Closing the tab or reconnecting meanwhile makes this attempt stale.
+        let current = || {
+            s.generation.get() == generation
+                && find_session(&ui, &s.name).is_some_and(|open| Rc::ptr_eq(&open, &s))
+        };
+        if !current() {
+            return;
+        }
+        set_status(&ui, &s, &format!("Installing gliff on {host}…"));
+        s.installing.set(true);
+        let outcome = remote_install::install(&host, &ssh_args).await;
+        s.installing.set(false);
+        match outcome {
+            remote_install::Outcome::Ready(note) => {
+                tracing::info!(machine = %s.name, %note, "remote install");
+                if current() {
+                    s.last_error.borrow_mut().take();
+                    s.retries.set(0);
+                    s.gave_up.set(false);
+                    start_session(ui.clone(), s.clone());
+                }
+            }
+            remote_install::Outcome::Failed(why) => {
+                tracing::error!(machine = %s.name, error = %why, "remote install failed");
+                if current() {
+                    set_status(&ui, &s, &format!("Could not install gliff: {why}"));
+                }
+            }
         }
     });
 }
@@ -1446,6 +1728,19 @@ fn poll_status(ui: Rc<App>, s: Rc<Session>, rx: Receiver<Status>, generation: u6
                     set_status(&ui, &s, &message);
                     show_disconnected(&ui, &s);
                     s.gave_up.set(true);
+                    if matches!(s.endpoint, Endpoint::Stdio(_)) {
+                        fail_stdio(&ui, &message);
+                    }
+                    return glib::ControlFlow::Break;
+                }
+                Status::ServerMissing => {
+                    let message = "gliff is not installed on this machine";
+                    *s.last_error.borrow_mut() = Some(message.into());
+                    tracing::error!(machine = %s.name, "gliff-server not found");
+                    set_status(&ui, &s, message);
+                    show_disconnected(&ui, &s);
+                    s.gave_up.set(true);
+                    offer_install(ui.clone(), s.clone(), generation);
                     return glib::ControlFlow::Break;
                 }
                 Status::Closed => {
@@ -2066,10 +2361,13 @@ fn install_fullscreen_bars(
             if fullscreen_btn.is_active() != full {
                 fullscreen_btn.set_active(full);
             }
-            if full {
+            // The notify can repeat a state, as when the window starts
+            // fullscreen: move the header only when it is not there yet.
+            let in_content = header.parent().as_ref() == Some(content.upcast_ref());
+            if full && in_content {
                 content.remove(&header);
                 top.set_child(Some(&header));
-            } else {
+            } else if !full && !in_content {
                 top.set_reveal_child(false);
                 top.set_child(None::<&gtk::Widget>);
                 content.prepend(&header);
@@ -2240,6 +2538,14 @@ fn device_scale(ui: &App) -> f64 {
 mod tests {
     use super::*;
     use std::cell::RefCell;
+
+    #[test]
+    fn a_stdio_window_is_named_after_the_ssh_client() {
+        let connection = "192.168.1.31 51234 192.168.1.70 22";
+        assert_eq!(stdio_peer(Some(connection)), "192.168.1.31");
+        assert_eq!(stdio_peer(Some("")), "stdio");
+        assert_eq!(stdio_peer(None), "stdio");
+    }
 
     type Input = tokio::sync::mpsc::UnboundedReceiver<clipboard::ToWorker>;
 
