@@ -30,6 +30,10 @@ struct Stream {
     context: Context,
     /// One per DPB slot, then the spare.
     surfaces: Vec<Surface>,
+    /// Each surface exported once, before its first decode: v4l2-request
+    /// drivers fix the capture memory mode on the first decode and refuse
+    /// surfaces exported afterwards.
+    exports: Vec<crate::surface::PrimeDescriptor>,
     slots: Vec<Option<DpbPicture>>,
     /// The surface the last `decode` returned, valid until the next one.
     last_output: Option<usize>,
@@ -93,6 +97,11 @@ impl H264Decoder {
     /// The surfaces pictures land in; replaced when `generation` changes.
     pub fn surfaces(&self) -> &[Surface] {
         self.stream.as_ref().map_or(&[], |s| s.surfaces.as_slice())
+    }
+
+    /// The dmabuf exports of `surfaces`, taken before any decode.
+    pub fn exports(&self) -> &[crate::surface::PrimeDescriptor] {
+        self.stream.as_ref().map_or(&[], |s| s.exports.as_slice())
     }
 
     pub fn generation(&self) -> u64 {
@@ -272,6 +281,10 @@ impl H264Decoder {
         let surfaces = (0..dpb_slots + 1)
             .map(|_| Surface::new_nv12(&self.display, cw, ch, UsageHint::Decoder))
             .collect::<Result<Vec<_>>>()?;
+        let exports = surfaces
+            .iter()
+            .map(Surface::export)
+            .collect::<Result<Vec<_>>>()?;
         let targets: Vec<&Surface> = surfaces.iter().collect();
         let context = Context::new(&self.display, &self.config, cw, ch, &targets)?;
         tracing::info!(
@@ -284,6 +297,7 @@ impl H264Decoder {
             pps: Pps::default(),
             context,
             surfaces,
+            exports,
             slots: vec![None; dpb_slots],
             last_output: None,
         });
