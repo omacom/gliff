@@ -173,6 +173,13 @@ logical display coordinates. macOS hosts mirror physical screens and reject
 - Keyboard input is captured over the picture. Shift+Esc releases it;
   clicking the picture captures it again. Held keys and buttons are released
   when the window loses focus or disconnects.
+  Shortcuts reserved by macOS, including a custom input-source shortcut,
+  can be consumed before AppKit receives them and stay local. The native
+  viewer does not install a global keyboard event tap.
+- Fullscreen uses a native macOS Space. The system can reserve the top edge
+  for its menu bar and title bar, affecting access to a remote top bar.
+  Borderless fullscreen with camera-housing safe-area handling is not yet
+  implemented in the native viewer.
 - Shared text clipboard uses lazy paste requests, chunking and a 1 MiB cap.
   Image and copied-file clipboard transfers are not yet supported on macOS.
 
