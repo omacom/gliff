@@ -694,6 +694,7 @@ dependencies = [
  "bytes",
  "clap",
  "drm-fourcc",
+ "gliff-macos",
  "gliff-proto",
  "gliff-sw",
  "gliff-transport",
@@ -709,6 +710,24 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "gliff-macos"
+version = "0.4.1"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "clap",
+ "gliff-proto",
+ "gliff-sw",
+ "gliff-transport",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "xkbcommon",
 ]
 
 [[package]]
@@ -754,6 +773,7 @@ dependencies = [
  "clap",
  "dbus",
  "drm-fourcc",
+ "gliff-macos",
  "gliff-proto",
  "gliff-sw",
  "gliff-transport",

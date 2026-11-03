@@ -592,6 +592,8 @@ impl Image {
         ];
         let mut images = Vec::new();
         let mut memory = Vec::new();
+        // SAFETY: these handles belong to this failed import and have not
+        // been submitted to any queue; release only what was created so far.
         let release = |images: &[vk::Image], memory: &[vk::DeviceMemory]| unsafe {
             // SAFETY: nothing else refers to these yet.
             for &i in images {

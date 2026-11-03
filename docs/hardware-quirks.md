@@ -172,9 +172,31 @@ Found on a GeForce RTX 5070 Ti, driver 610.57.04, Hyprland on DP-1 at
   linear modifiers and no linear one, and `gbm_bo_map` fails on them
   (`ENOENT`), so the CPU tier captures into wl_shm buffers instead and the
   compositor does the readback. The GPU tier imports the tiled dmabuf.
-- **NVDEC decode does not work yet.** Its exported surfaces are two dmabuf
-  objects, which the decoder import does not take (`gliff-probe roundtrip`
-  stops at the first decode). Only the server side was tested here.
+- **Import NVDEC's separate layers in their exported formats.** Tested on
+  an RTX 5090 with NVIDIA 615.78.08 and `nvidia-vaapi-driver` 0.0.18. Its
+  decoded NV12 surface exports two dmabuf objects, R8 luma and RG88 chroma.
+  Importing them as one disjoint Vulkan NV12 image succeeds but misreads
+  their tiling: a Dual420 round trip scores 7.6 dB RGB PSNR even though a
+  VA-API download of the same decoded planes is correct. Importing each
+  layer separately as R8_UNORM / R8G8_UNORM reads the planes byte-exactly;
+  GPU recombination then passes at 55.8 dB. Both layers stay GPU-resident
+  and each gets its own foreign-ownership barriers. The shared NV12 import
+  remains a fallback when separate-layer sampling is unavailable.
+
+### NVIDIA nested headless outputs
+
+With Hyprland 0.56.2, Aquamarine 0.15.0 and NVIDIA 610.57.04 on an RTX 5090,
+`scripts/e2e.sh` can fail before Gliff captures a frame: the nested Wayland
+output renders, but a new headless output remains at 0x0. Explicitly setting
+its mode also fails, and the compositor logs GBM buffer-allocation errors.
+
+Aquamarine's headless backend uses guessed implicit/linear formats when no
+DRM backend exists, discarding the parent Wayland compositor's advertised
+formats and modifiers. Reusing that Wayland format list fixes allocation.
+The fix was merged in [Aquamarine #451](https://github.com/hyprwm/aquamarine/pull/451)
+as `163b138`. The complete E2E suite passes with a rebuilt Aquamarine
+containing that fix; Gliff's test script does not patch or replace the
+installed compositor.
 
 ## Not yet tested anywhere
 - Intel generations between Haswell and Panther Lake.
