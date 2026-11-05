@@ -14,7 +14,7 @@ thiserror.workspace = true
 clap.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["signal"] }
 gtk4.workspace = true
 libadwaita.workspace = true
 gliff-proto.workspace = true
@@ -26,5 +26,7 @@ bytes.workspace = true
 drm-fourcc.workspace = true
 hypr-ipc.workspace = true
 hypr-input.workspace = true
+hypr-edge.workspace = true
+xkbcommon.workspace = true
 serde.workspace = true
 toml = "1"
