@@ -5,6 +5,10 @@
 //! reference lists and the DPB state. Every DPB slot is a driver-owned
 //! surface that is also the decode output, plus one spare for pictures that
 //! are not references; the caller reads them through their exported dmabufs.
+//! The decoder exports every surface as soon as it allocates them, before
+//! the first decode: a driver may fix how it backs its surfaces on the first
+//! decode (libva-v4l2-request does), and then refuses to decode into a
+//! surface exported afterwards.
 
 use std::sync::Arc;
 
@@ -15,7 +19,7 @@ use crate::h264::annexb::{nal_units, NAL_IDR, NAL_PPS, NAL_SLICE, NAL_SPS};
 use crate::h264::parser::{
     parse_pps, parse_slice_header, parse_sps, Mmco, Pps, ScalingLists, SliceHeader, SliceType, Sps,
 };
-use crate::surface::{Surface, UsageHint};
+use crate::surface::{PrimeDescriptor, Surface, UsageHint};
 use crate::{Error, Result};
 
 #[derive(Clone, Copy)]
@@ -30,6 +34,8 @@ struct Stream {
     context: Context,
     /// One per DPB slot, then the spare.
     surfaces: Vec<Surface>,
+    /// `surfaces` exported, in the same order, before the first decode.
+    exports: Vec<PrimeDescriptor>,
     slots: Vec<Option<DpbPicture>>,
     /// The surface the last `decode` returned, valid until the next one.
     last_output: Option<usize>,
@@ -93,6 +99,11 @@ impl H264Decoder {
     /// The surfaces pictures land in; replaced when `generation` changes.
     pub fn surfaces(&self) -> &[Surface] {
         self.stream.as_ref().map_or(&[], |s| s.surfaces.as_slice())
+    }
+
+    /// The dmabufs of `surfaces`, exported when the stream opened.
+    pub fn exports(&self) -> &[PrimeDescriptor] {
+        self.stream.as_ref().map_or(&[], |s| s.exports.as_slice())
     }
 
     pub fn generation(&self) -> u64 {
@@ -274,6 +285,11 @@ impl H264Decoder {
             .collect::<Result<Vec<_>>>()?;
         let targets: Vec<&Surface> = surfaces.iter().collect();
         let context = Context::new(&self.display, &self.config, cw, ch, &targets)?;
+        // Before any decode, see the module comment.
+        let exports = surfaces
+            .iter()
+            .map(Surface::export)
+            .collect::<Result<Vec<_>>>()?;
         tracing::info!(
             coded = format!("{cw}x{ch}"),
             dpb_slots,
@@ -284,6 +300,7 @@ impl H264Decoder {
             pps: Pps::default(),
             context,
             surfaces,
+            exports,
             slots: vec![None; dpb_slots],
             last_output: None,
         });
