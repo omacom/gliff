@@ -14,18 +14,19 @@ use bytes::Bytes;
 use gliff_proto::clipboard::CHUNK;
 use gliff_proto::{
     features, is_incompatible, version_mismatch, ChromaMode, ClientCaps, ClientMsg, ClipboardFile,
-    ClipboardMsg, Codec, ServerMsg, VideoPipeline, PROTOCOL_VERSION,
+    ClipboardMsg, Codec, Origin, ServerMsg, VideoPipeline, ERROR_LOOP, PROTOCOL_VERSION,
 };
 use gliff_sw::VideoMode;
 use gliff_transport::clipboard::progress::Progress;
 use gliff_transport::clipboard::{outbound_channel, Side, Transfers};
-use gliff_transport::{spawn_ssh, Framed, SshTarget};
+use gliff_transport::{spawn_ssh, viewers, Framed, SshTarget};
 use gliff_vk::{Decoder, DisplayFrame, Gpu};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc::{self, unbounded_channel, UnboundedReceiver};
 
 use crate::clipboard::{Bridge, ToWorker};
 use crate::keymap::{Keymap, FIRST_KEYMAP_WAIT};
+use crate::placement::{Placement, FIRST_PLACEMENT_WAIT};
 
 /// Stream geometry one picture was configured under: stream size, view
 /// size, and the effective scale x1000.
@@ -108,12 +109,20 @@ pub enum Status {
     /// The two ends speak different protocol versions, so retrying cannot
     /// help.
     Incompatible(String),
+    /// The server refused because this window is on a screen it is showing
+    /// to this machine.
+    Loop(String),
     Closed,
 }
 
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
 struct Incompatible(String);
+
+/// The server refused a connection that would loop; see [`Status::Loop`].
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct LoopRefused(String);
 
 /// A remote cursor image: `argb` holds `width` x `height` BGRA pixels.
 pub struct CursorShape {
@@ -300,6 +309,13 @@ pub enum Frame {
     Bgra(gliff_sw::PooledFrame),
 }
 
+/// What the UI knows about this machine, read when a session says hello.
+struct Local {
+    keymap: Keymap,
+    placement: Placement,
+    force: bool,
+}
+
 pub struct Worker {
     pub endpoint: Endpoint,
     pub video: VideoMode,
@@ -309,6 +325,9 @@ pub struct Worker {
     pub status: StdSender<Status>,
     pub input: UnboundedReceiver<ToWorker>,
     pub keymap: Keymap,
+    pub placement: Placement,
+    /// List no viewers in the `origin`, so the server's loop guard cannot refuse.
+    pub force: bool,
 }
 
 impl Worker {
@@ -339,7 +358,11 @@ impl Worker {
                         self.frames,
                         self.status,
                         self.input,
-                        self.keymap,
+                        Local {
+                            keymap: self.keymap,
+                            placement: self.placement,
+                            force: self.force,
+                        },
                     )
                     .await
                 }
@@ -352,7 +375,11 @@ impl Worker {
                         self.frames,
                         self.status,
                         self.input,
-                        self.keymap,
+                        Local {
+                            keymap: self.keymap,
+                            placement: self.placement,
+                            force: self.force,
+                        },
                     )
                     .await
                 }
@@ -361,7 +388,10 @@ impl Worker {
         if let Err(e) = result {
             let _ = status.send(match e.downcast::<Incompatible>() {
                 Ok(Incompatible(message)) => Status::Incompatible(message),
-                Err(e) => Status::Error(e.to_string()),
+                Err(e) => match e.downcast::<LoopRefused>() {
+                    Ok(LoopRefused(message)) => Status::Loop(message),
+                    Err(e) => Status::Error(e.to_string()),
+                },
             });
         } else {
             let _ = status.send(Status::Closed);
@@ -444,12 +474,17 @@ async fn session<R, W>(
     frames: SyncSender<Picture>,
     status: StdSender<Status>,
     mut input: UnboundedReceiver<ToWorker>,
-    mut keymap: Keymap,
+    local: Local,
 ) -> anyhow::Result<()>
 where
     R: AsyncRead + Unpin + 'static,
     W: AsyncWrite + Unpin + 'static,
 {
+    let Local {
+        mut keymap,
+        mut placement,
+        force,
+    } = local;
     let mut reader = Framed::new(rd);
     let mut writer = Framed::new(wr);
 
@@ -473,11 +508,41 @@ where
         tracing::warn!("no local keymap yet; server will default to us");
     }
     tracing::debug!(bytes = first_keymap.len(), "sending keymap");
+    let _ = tokio::time::timeout(FIRST_PLACEMENT_WAIT, placement.wait_for(Option::is_some)).await;
+    let origin = viewers::machine_id().map(|machine| {
+        let window_output = placement.borrow().clone();
+        // Only the viewers of the output this window is on can make a loop, so
+        // those are all a server learns of; none while the output is unknown.
+        // Forcing lists none, so the server cannot see a loop; it still learns
+        // who connected, so the way back stays guarded.
+        let viewers = match (&window_output, force) {
+            (Some(output), false) => hypr_ipc::runtime_dir()
+                .map(|dir| viewers::viewers(&dir))
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|v| &v.output == output)
+                .collect(),
+            _ => Vec::new(),
+        };
+        Box::new(Origin {
+            machine,
+            window_output,
+            viewers,
+        })
+    });
+    tracing::debug!(
+        machine = ?origin.as_ref().map(|o| &o.machine),
+        window = ?origin.as_ref().map(|o| &o.window_output),
+        viewers = origin.as_ref().map_or(0, |o| o.viewers.len()),
+        force,
+        "sending origin"
+    );
     writer
         .write_msg(&ClientMsg::Hello {
             version: PROTOCOL_VERSION,
             keymap: first_keymap,
             caps,
+            origin,
         })
         .await?;
 
@@ -524,6 +589,11 @@ where
                 )?;
                 break (cfg, pipeline);
             }
+            ServerMsg::Error {
+                code: ERROR_LOOP,
+                message,
+                ..
+            } => return Err(LoopRefused(message).into()),
             ServerMsg::Error { code, message, .. } if is_incompatible(code) => {
                 return Err(Incompatible(message).into())
             }
@@ -1329,6 +1399,7 @@ mod session_tests {
             let (status_tx, status_rx) = std::sync::mpsc::channel();
             let (input_tx, input_rx) = unbounded_channel();
             let (keymap_tx, keymap_rx) = tokio::sync::watch::channel("keymap".to_string());
+            let (_, placement_rx) = tokio::sync::watch::channel(Some("DP-1".to_string()));
             let mut worker = tokio::task::spawn_local(session(
                 crd,
                 cwr,
@@ -1336,7 +1407,11 @@ mod session_tests {
                 frames_tx,
                 status_tx,
                 input_rx,
-                keymap_rx,
+                Local {
+                    keymap: keymap_rx,
+                    placement: placement_rx,
+                    force: false,
+                },
             ));
             let server = server(FakeServer {
                 rd: Framed::new(srd),
