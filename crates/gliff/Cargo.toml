@@ -25,6 +25,7 @@ hypr-capture.workspace = true
 bytes.workspace = true
 drm-fourcc.workspace = true
 hypr-ipc.workspace = true
+rustix = { workspace = true, features = ["stdio"] }
 hypr-input.workspace = true
 serde.workspace = true
 toml = "1"

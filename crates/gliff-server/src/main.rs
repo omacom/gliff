@@ -43,6 +43,15 @@ struct Cli {
     /// window instead of mirroring.
     #[arg(long)]
     headless: bool,
+    /// Where the headless output goes among this machine's screens:
+    /// `right`, `left`, `above` or `below` of them. The default lets
+    /// Hyprland choose.
+    #[arg(long, requires = "headless", value_parser = ["right", "left", "above", "below"])]
+    position: Option<String>,
+    /// How the headless output lines up along that side: `start` (top or
+    /// left edges), `center` or `end` (bottom or right edges).
+    #[arg(long, requires = "position", value_parser = ["start", "center", "end"], default_value = "start")]
+    align: String,
     /// Hyprland instance signature (default: newest).
     #[arg(long)]
     instance: Option<String>,
@@ -99,6 +108,19 @@ fn main() -> Result<()> {
         } else {
             Some(cli.output.clone().unwrap_or_else(|| "auto".into()))
         },
+        placement: cli.position.as_deref().map(|side| session::Placement {
+            side: match side {
+                "left" => session::Edge::Left,
+                "above" => session::Edge::Above,
+                "below" => session::Edge::Below,
+                _ => session::Edge::Right,
+            },
+            align: match cli.align.as_str() {
+                "center" => session::Align::Center,
+                "end" => session::Align::End,
+                _ => session::Align::Start,
+            },
+        }),
         render_node,
         low_bandwidth: cli.low_bandwidth,
         bitrate: cli.bitrate,
