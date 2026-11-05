@@ -15,6 +15,8 @@
 #   8. a 1 MiB binary clipboard item in both directions (chunked)
 #   9. copied files (a directory tree) in both directions, via the spool
 #  10. a keymap sent mid-session is the one the compositor serves its clients
+#  12. GPU decode with dmabuf exports taken before the first decode, held
+#      over a long session and a reconnect (v4l2-request / Apple Silicon)
 #  11. a keymap change mid-session reaches clients behind an input method
 #      (fcitx5), when fcitx5 and foot are installed
 #
@@ -85,6 +87,10 @@ else
         echo "   no GPU tier on this machine; GPU checks are skipped"
     fi
 fi
+# Decode-only machines (Apple Silicon AVD via libva-v4l2request) have no
+# VA-API encoder but still run the GPU client; section 4c covers them.
+HAS_GPU_DECODE=0
+echo "$PROBE_GPU" | grep -q "^PASS VA-API H.264 decode" && HAS_GPU_DECODE=1
 if [ "$HAS_GPU" = 1 ]; then
     $PROBE surfaces 2>/dev/null | grep -q "^PASS Vulkan split" || fail "VA-API surface hand-off"
     $PROBE roundtrip 2>/dev/null | grep -q "^PASS min RGB PSNR" || fail "GPU codec round-trip"
@@ -142,6 +148,38 @@ run_server_test 9044 "cpu server -> cpu client" cpu --video cpu
 if [ "$HAS_GPU" = 1 ]; then
     run_server_test 9045 "gpu server -> cpu client" cpu
     run_server_test 9046 "cpu server -> gpu client" gpu --video cpu
+fi
+
+echo "== 4c. GPU decode: exports before first decode, mid-session =="
+# v4l2-request decoders fix the capture memory mode on the first decode and
+# reject surfaces exported afterwards ("cannot decode into the
+# already-exported surface"); the client exports every decode surface when
+# the stream is created. Hold a session under steady damage well past
+# startup, then connect again (fresh decoder and exports), and fail on any
+# decode error. The server encodes on the CPU where VA-API cannot encode.
+if [ "$HAS_GPU_DECODE" = 1 ]; then
+    srv_video=()
+    [ "$HAS_GPU" = 1 ] || srv_video=(--video cpu)
+    long_damage() { for i in $(seq 1 600); do hyprctl notify 1 200 0 "e2e long $i" >/dev/null 2>&1; sleep 0.05; done; }
+    # The headless server ends with its client, so each run gets its own.
+    for run in 1 2; do
+        "$SERVER" --listen 127.0.0.1:9047 --headless --instance "$NEST_SIG" "${srv_video[@]}" >/tmp/gliff-e2e-long-server.log 2>&1 &
+        lsp=$!; PIDS+=("$lsp"); sleep 2
+        long_damage & ldp=$!; PIDS+=("$ldp")
+        long_log=$(mktemp)
+        start=$(date +%s)
+        timeout 60 env RUST_LOG=info "$PROBE" --video gpu serve-test --connect 127.0.0.1:9047 --frames 300 >"$long_log" 2>&1
+        took=$(( $(date +%s) - start ))
+        # Only the decode result matters here; 4b covers the other checks.
+        grep -q "^PASS decoded" "$long_log" || fail "long GPU decode session run $run ($(grep -E '^(FAIL|Error)' "$long_log" | head -1))"
+        grep -qiE "already-exported|decode (error|failed)" "$long_log" && fail "decode error mid-session, run $run ($(grep -iE 'already-exported|decode (error|failed)' "$long_log" | head -1))"
+        echo "   run $run: 300 frames over ${took}s, no decode errors"
+        rm -f "$long_log"
+        kill "$ldp" "$lsp" 2>/dev/null; sleep 1
+    done
+    echo "   GPU decode mid-session + reconnect PASS"
+else
+    echo "   no VA-API decode here; skipped"
 fi
 
 echo "== 5b. sensitive clipboard selections are withheld =="

@@ -592,8 +592,8 @@ impl Image {
         ];
         let mut images = Vec::new();
         let mut memory = Vec::new();
+        // SAFETY: nothing else refers to these yet.
         let release = |images: &[vk::Image], memory: &[vk::DeviceMemory]| unsafe {
-            // SAFETY: nothing else refers to these yet.
             for &i in images {
                 gpu.device.destroy_image(i, None);
             }
