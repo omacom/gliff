@@ -1,5 +1,6 @@
 //! One client session: output setup, the capture/encode/send loop, and input.
 
+use std::future::Future;
 use std::ops::{ControlFlow, Deref, DerefMut};
 use std::os::fd::AsFd;
 use std::path::PathBuf;
@@ -14,8 +15,8 @@ use bytes::Bytes;
 use gliff_proto::clipboard::CHUNK;
 use gliff_proto::{
     features, version_mismatch, ChromaMode, ClientCaps, ClientMsg, ClipboardMsg, Codec, Greeting,
-    OutputInfo as ProtoOutput, Rect, ServerMsg, SessionInfo, VideoPipeline, ERROR_NO_CHROMA,
-    ERROR_NO_CODEC, ERROR_SETUP, ERROR_VERSION, PROTOCOL_VERSION,
+    OutputInfo as ProtoOutput, Rect, ServerMsg, SessionInfo, VideoPipeline, ERROR_ENDED_BY_HOST,
+    ERROR_NO_CHROMA, ERROR_NO_CODEC, ERROR_SETUP, ERROR_VERSION, PROTOCOL_VERSION,
 };
 use gliff_sw::VideoMode;
 use gliff_transport::clipboard::progress::Jobs;
@@ -71,15 +72,26 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-pub async fn run<R, W>(rd: R, wr: W, cfg: Config) -> Result<()>
+/// Serve one client until it leaves or `shutdown` resolves. On shutdown the
+/// client is told not to reconnect, and the session ends in order with `Ok`.
+pub async fn run<R, W, S>(rd: R, wr: W, cfg: Config, shutdown: S) -> Result<()>
 where
     R: AsyncRead + Unpin + 'static,
     W: AsyncWrite + Unpin + 'static,
+    S: Future<Output = ()>,
 {
+    let mut shutdown = std::pin::pin!(shutdown);
     let mut reader = Framed::new(rd);
     let mut writer = Framed::new(wr);
 
-    let (keymap, caps) = handshake(&mut reader, &mut writer).await?;
+    let (keymap, caps) = tokio::select! {
+        hello = handshake(&mut reader, &mut writer) => hello?,
+        () = &mut shutdown => {
+            tracing::info!("session ended by signal");
+            let _ = tokio::time::timeout(END_NOTICE_TIMEOUT, writer.write_msg(&ended_by_host())).await;
+            return Ok(());
+        }
+    };
     if !caps.codecs.contains(&Codec::H264) {
         writer
             .write_msg(&ServerMsg::error(
@@ -277,6 +289,15 @@ where
                     ControlFlow::Break(())
                 }
             },
+            // A signal during setup waits here too, so it also ends in order.
+            () = &mut shutdown => {
+                tracing::info!("session ended by signal");
+                session.writer.send(ended_by_host(), Vec::new());
+                if !session.writer.drain(&mut write_reports, END_NOTICE_TIMEOUT).await {
+                    tracing::warn!("cannot tell the client that the host ended the session");
+                }
+                ControlFlow::Break(())
+            }
             out = clip_out_rx.recv() => {
                 if let Some((msg, payload)) = out {
                     session.writer.send(ServerMsg::from(msg), vec![payload.to_vec()]);
@@ -362,6 +383,10 @@ where
             anyhow::bail!("{message}: client protocol {version}, server {PROTOCOL_VERSION}");
         }
     }
+}
+
+fn ended_by_host() -> ServerMsg {
+    ServerMsg::error(ERROR_ENDED_BY_HOST, "The host ended the session")
 }
 
 /// Pass a setup step's result through, first telling the client why the
@@ -503,6 +528,9 @@ const REFINE_EVERY: Duration = Duration::from_millis(200);
 /// A static screen produces no damage and so no first frame; after this
 /// long the capture is torn down and retried once with full damage.
 const FIRST_FRAME_DEADLINE: Duration = Duration::from_millis(700);
+/// How long a session the host ends waits for the client to take the notice,
+/// so a dead link cannot hold the exit.
+const END_NOTICE_TIMEOUT: Duration = Duration::from_millis(500);
 /// The starting ladder level: 30 fps, full quality. It halves the first
 /// burst against level 0 while the controller measures available capacity.
 const START_LEVEL: usize = 1;

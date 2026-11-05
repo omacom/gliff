@@ -50,6 +50,10 @@ pub const ERROR_NO_CODEC: u16 = 3;
 /// output, or the video, capture or input pipeline failed to start. It is
 /// outside the incompatible range, so a client may reconnect.
 pub const ERROR_SETUP: u16 = 256;
+/// The host ended the session on purpose, so the client should not reconnect
+/// it on its own. Clients that predate this code treat it like any non-fatal
+/// error and reconnect.
+pub const ERROR_ENDED_BY_HOST: u16 = 257;
 
 pub fn is_incompatible(code: u16) -> bool {
     (1..256).contains(&code)
@@ -775,6 +779,10 @@ mod tests {
                 "8202860102f5818400000a0a18641832",
             ),
             (ServerMsg::error(ERROR_VERSION, "m"), "82098301616d01"),
+            (
+                ServerMsg::error(ERROR_ENDED_BY_HOST, "m"),
+                "820983190101616d01",
+            ),
         ];
         for (msg, bytes) in server {
             assert_eq!(hex(&minicbor::to_vec(&msg).unwrap()), bytes, "{msg:?}");
