@@ -96,6 +96,9 @@ pub enum InputCmd {
         height: u32,
     },
     ReleaseAll,
+    /// Let go of every pressed key and button but keep locked modifiers and
+    /// the layout, for a client that went silent mid-session.
+    ReleaseHeld,
     Stop,
 }
 

@@ -53,7 +53,9 @@ impl Queue {
                     ServerMsg::CursorShape { .. } | ServerMsg::CursorPos { .. }
                 )
             }),
-            ServerMsg::CursorPos { .. } | ServerMsg::Pong { .. } => {
+            // A newer Ping supersedes an unwritten one: the heartbeat
+            // matches whichever token the client answers.
+            ServerMsg::CursorPos { .. } | ServerMsg::Pong { .. } | ServerMsg::Ping { .. } => {
                 self.packets.retain(|(queued, _)| {
                     std::mem::discriminant(queued) != std::mem::discriminant(&msg)
                 });
@@ -81,8 +83,12 @@ pub struct Writer {
 }
 
 impl Writer {
+    /// `on_ping_written` runs when a Ping's write completes, so the
+    /// heartbeat counts silence from the moment the transport took the
+    /// Ping rather than from when it was queued.
     pub fn spawn<W: AsyncWrite + Unpin + 'static>(
         mut framed: Framed<W>,
+        mut on_ping_written: impl FnMut(Instant) + 'static,
     ) -> (Self, mpsc::Receiver<Result<Duration>>) {
         let queue = Rc::new(RefCell::new(Queue::default()));
         let notify = Rc::new(Notify::new());
@@ -106,6 +112,9 @@ impl Writer {
                         "output write completed"
                     );
                     let failed = result.is_err();
+                    if !failed && matches!(msg, ServerMsg::Ping { .. }) {
+                        on_ping_written(Instant::now());
+                    }
                     let report = result.map(|_| elapsed).map_err(Into::into);
                     if report_tx.send(report).await.is_err() || failed {
                         break;
@@ -256,12 +265,51 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn queued_pings_coalesce_behind_video() {
+        let mut queue = Queue::default();
+        let (msg, payloads) = video(1);
+        queue.push(msg, payloads);
+        for t in 0..10 {
+            queue.push(ServerMsg::Ping { t }, Vec::new());
+        }
+        assert_eq!(queue.packets.len(), 2);
+        assert!(matches!(queue.packets[1].0, ServerMsg::Ping { t: 9 }));
+    }
+
+    #[tokio::test]
+    async fn a_written_ping_is_reported_when_the_write_completes() {
+        LocalSet::new()
+            .run_until(async {
+                let (socket, peer) = tokio::io::duplex(1024);
+                let written = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+                let log = written.clone();
+                let (writer, mut reports) =
+                    Writer::spawn(Framed::new(socket), move |at| log.borrow_mut().push(at));
+                let before = Instant::now();
+                let (msg, payloads) = video(1);
+                writer.send(msg, payloads);
+                writer.send(ServerMsg::Ping { t: 5 }, Vec::new());
+                let mut reader = Framed::new(peer);
+                let _: ServerMsg = reader.read_msg().await.unwrap();
+                reader.read_payload(64).await.unwrap();
+                let msg: ServerMsg = reader.read_msg().await.unwrap();
+                assert_eq!(msg, ServerMsg::Ping { t: 5 });
+                reports.recv().await.unwrap().unwrap();
+                reports.recv().await.unwrap().unwrap();
+                let written = written.borrow();
+                assert_eq!(written.len(), 1);
+                assert!(written[0] >= before);
+            })
+            .await;
+    }
+
     #[tokio::test]
     async fn blocked_write_leaves_the_caller_free_and_preserves_frames() {
         LocalSet::new()
             .run_until(async {
                 let (socket, peer) = tokio::io::duplex(1);
-                let (writer, mut reports) = Writer::spawn(Framed::new(socket));
+                let (writer, mut reports) = Writer::spawn(Framed::new(socket), |_| {});
                 let (msg, payloads) = video(1);
                 writer.send(msg, payloads);
                 tokio::task::yield_now().await;
@@ -292,7 +340,7 @@ mod tests {
         LocalSet::new()
             .run_until(async {
                 let (socket, peer) = tokio::io::duplex(1);
-                let (writer, mut reports) = Writer::spawn(Framed::new(socket));
+                let (writer, mut reports) = Writer::spawn(Framed::new(socket), |_| {});
                 drop(peer);
                 let (msg, payloads) = video(1);
                 writer.send(msg, payloads);
@@ -310,7 +358,7 @@ mod tests {
         LocalSet::new()
             .run_until(async {
                 let (socket, peer) = tokio::io::duplex(1024 * 1024);
-                let (writer, mut reports) = Writer::spawn(Framed::new(socket));
+                let (writer, mut reports) = Writer::spawn(Framed::new(socket), |_| {});
                 let (msg, payloads) = video(1);
                 writer.send(msg, payloads);
                 tokio::task::yield_now().await;
@@ -336,7 +384,7 @@ mod tests {
         LocalSet::new()
             .run_until(async {
                 let (socket, _peer) = tokio::io::duplex(1);
-                let (writer, mut reports) = Writer::spawn(Framed::new(socket));
+                let (writer, mut reports) = Writer::spawn(Framed::new(socket), |_| {});
                 let (msg, payloads) = video(1);
                 writer.send(msg, payloads);
                 tokio::task::yield_now().await;
