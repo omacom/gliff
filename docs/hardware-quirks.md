@@ -251,7 +251,8 @@ images arrive.
 
 ## Hyprland with the Lua config (Omarchy)
 
-`hyprctl keyword` is rejected (`keyword can't work with non-legacy parsers`).
+`hyprctl keyword` is rejected (`keyword can't work with non-legacy parsers`;
+Hyprland 0.57 answers `unknown request`).
 `hypr-ipc` falls back to `eval hl.monitor({ output = ..., mode = ...,
 position = "auto", scale = ... })`, which applies at runtime. `output create
 headless` and `output remove` are hyprctl commands and work with both config

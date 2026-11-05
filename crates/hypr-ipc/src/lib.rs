@@ -213,7 +213,7 @@ impl Instance {
     ) -> Result<()> {
         let keyword = format!("keyword monitor {name},{width}x{height}@{hz},auto,{scale}");
         match self.dispatch(&keyword) {
-            Err(Error::Command { response, .. }) if response.contains("non-legacy") => {
+            Err(Error::Command { response, .. }) if keyword_rejected(&response) => {
                 self.dispatch(&format!(
                     "eval hl.monitor({{ output = \"{name}\", mode = \"{width}x{height}@{hz}\", position = \"auto\", scale = {scale} }})"
                 ))
@@ -221,6 +221,13 @@ impl Instance {
             other => other,
         }
     }
+}
+
+/// Whether Hyprland refused `keyword` because the config is Lua. Before
+/// 0.57 it says `keyword can't work with non-legacy parsers`; 0.57 answers
+/// `unknown request`.
+fn keyword_rejected(response: &str) -> bool {
+    response.contains("non-legacy") || response == "unknown request"
 }
 
 /// Round a mode down until `scale` divides it into whole logical pixels.
@@ -303,6 +310,15 @@ impl OptionValue {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recognizes_lua_keyword_rejection() {
+        assert!(keyword_rejected(
+            "keyword can't work with non-legacy parsers"
+        ));
+        assert!(keyword_rejected("unknown request")); // Hyprland 0.57
+        assert!(!keyword_rejected("Invalid monitor"));
+    }
 
     #[test]
     fn discovers_newest_live_instance() {
