@@ -11,6 +11,7 @@ mod keymap;
 mod net;
 mod paintable;
 mod recent;
+mod remote_install;
 mod theme;
 
 use std::cell::{Cell, RefCell};
@@ -154,6 +155,9 @@ struct Session {
     last_error: RefCell<Option<String>>,
     /// Automatic reconnects have given up; selecting the tab tries again.
     gave_up: Cell<bool>,
+    /// gliff is being installed on the machine; selecting the tab waits for
+    /// it instead of connecting into a half-written install.
+    installing: Cell<bool>,
     /// Recorded in the config on the first successful connect.
     remembered: Cell<bool>,
     /// The server is streaming: set by its Connected status, cleared when
@@ -203,6 +207,7 @@ impl Session {
             retries: Cell::new(0),
             last_error: RefCell::new(None),
             gave_up: Cell::new(false),
+            installing: Cell::new(false),
             remembered: Cell::new(false),
             connected: Cell::new(false),
             headless: Cell::new(false),
@@ -940,7 +945,7 @@ fn machine_tab(ui: &Rc<App>, name: &str) -> gtk::Box {
 fn select_tab(ui: &Rc<App>, name: &str) {
     match find_session(ui, name) {
         Some(s) => {
-            if s.gave_up.get() {
+            if s.gave_up.get() && !s.installing.get() {
                 s.retries.set(0);
                 s.gave_up.set(false);
                 start_session(ui.clone(), s.clone());
@@ -1204,6 +1209,52 @@ fn schedule_reconnect(ui: Rc<App>, s: Rc<Session>, generation: u64, error: Optio
     });
 }
 
+/// Offer to install gliff on a session's machine, then connect again. Only
+/// for the default server: a custom `--server-bin` is the user's own setup.
+fn offer_install(ui: Rc<App>, s: Rc<Session>, generation: u64) {
+    let Endpoint::Ssh(target) = &s.endpoint else {
+        return;
+    };
+    if target.server_bin != SshTarget::new("").server_bin {
+        return;
+    }
+    let (host, ssh_args) = (target.host.clone(), target.ssh_args.clone());
+    glib::spawn_future_local(async move {
+        if !remote_install::confirm(&ui.window, &host).await {
+            return;
+        }
+        // Closing the tab or reconnecting meanwhile makes this attempt stale.
+        let current = || {
+            s.generation.get() == generation
+                && find_session(&ui, &s.name).is_some_and(|open| Rc::ptr_eq(&open, &s))
+        };
+        if !current() {
+            return;
+        }
+        set_status(&ui, &s, &format!("Installing gliff on {host}…"));
+        s.installing.set(true);
+        let outcome = remote_install::install(&host, &ssh_args).await;
+        s.installing.set(false);
+        match outcome {
+            remote_install::Outcome::Ready(note) => {
+                tracing::info!(machine = %s.name, %note, "remote install");
+                if current() {
+                    s.last_error.borrow_mut().take();
+                    s.retries.set(0);
+                    s.gave_up.set(false);
+                    start_session(ui.clone(), s.clone());
+                }
+            }
+            remote_install::Outcome::Failed(why) => {
+                tracing::error!(machine = %s.name, error = %why, "remote install failed");
+                if current() {
+                    set_status(&ui, &s, &format!("Could not install gliff: {why}"));
+                }
+            }
+        }
+    });
+}
+
 /// Keep the latest failure visible while a new connection attempt runs.
 fn connecting_status(error: Option<&str>) -> String {
     match error {
@@ -1446,6 +1497,16 @@ fn poll_status(ui: Rc<App>, s: Rc<Session>, rx: Receiver<Status>, generation: u6
                     set_status(&ui, &s, &message);
                     show_disconnected(&ui, &s);
                     s.gave_up.set(true);
+                    return glib::ControlFlow::Break;
+                }
+                Status::ServerMissing => {
+                    let message = "gliff is not installed on this machine";
+                    *s.last_error.borrow_mut() = Some(message.into());
+                    tracing::error!(machine = %s.name, "gliff-server not found");
+                    set_status(&ui, &s, message);
+                    show_disconnected(&ui, &s);
+                    s.gave_up.set(true);
+                    offer_install(ui.clone(), s.clone(), generation);
                     return glib::ControlFlow::Break;
                 }
                 Status::Closed => {
