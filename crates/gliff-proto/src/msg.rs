@@ -28,7 +28,7 @@
 use minicbor::decode::{Decoder, Error};
 use minicbor::{Decode, Encode};
 
-pub use crate::clipboard::{ClipboardFile, ClipboardItem, ClipboardMsg};
+pub use crate::clipboard::{AbortReason, ClipboardFile, ClipboardItem, ClipboardMsg};
 
 pub const PROTOCOL_VERSION: u16 = 1;
 
@@ -285,6 +285,9 @@ pub enum ClientMsg {
     ClipboardAbort {
         #[n(0)]
         id: u32,
+        #[n(1)]
+        #[cbor(decode_with = "crate::cbor::optional", nil = "crate::cbor::none")]
+        reason: Option<AbortReason>,
     },
     /// The local keymap changed since `Hello`; XKB text as in its `keymap`.
     #[n(15)]
@@ -453,6 +456,9 @@ pub enum ServerMsg {
     ClipboardAbort {
         #[n(0)]
         id: u32,
+        #[n(1)]
+        #[cbor(decode_with = "crate::cbor::optional", nil = "crate::cbor::none")]
+        reason: Option<AbortReason>,
     },
     /// Sent right after HelloAck; the client answers with `ClientMsg::Pong`
     /// ahead of anything else, seeding the server's round-trip estimate
@@ -534,7 +540,7 @@ macro_rules! clipboard_bridge {
                         done,
                     },
                     ClipboardMsg::Ack { id, received } => $msg::ClipboardAck { id, received },
-                    ClipboardMsg::Abort { id } => $msg::ClipboardAbort { id },
+                    ClipboardMsg::Abort { id, reason } => $msg::ClipboardAbort { id, reason },
                 }
             }
         }
@@ -567,7 +573,7 @@ macro_rules! clipboard_bridge {
                         done,
                     },
                     $msg::ClipboardAck { id, received } => ClipboardMsg::Ack { id, received },
-                    $msg::ClipboardAbort { id } => ClipboardMsg::Abort { id },
+                    $msg::ClipboardAbort { id, reason } => ClipboardMsg::Abort { id, reason },
                     other => return Err(other),
                 })
             }
@@ -663,7 +669,14 @@ mod tests {
                 id: 7,
                 received: 13,
             },
-            ClipboardMsg::Abort { id: 7 },
+            ClipboardMsg::Abort {
+                id: 7,
+                reason: None,
+            },
+            ClipboardMsg::Abort {
+                id: 7,
+                reason: Some(AbortReason::Stale),
+            },
         ];
         for m in msgs {
             let c = ClientMsg::from(m.clone());
@@ -1043,5 +1056,49 @@ mod tests {
             minicbor::decode::<Original>(&bytes).unwrap(),
             Original { width: 7 }
         );
+    }
+
+    /// `ClipboardAbort` as a peer from before its `reason` decodes it.
+    #[derive(Debug, PartialEq, Decode)]
+    enum OldClientMsg {
+        #[n(14)]
+        ClipboardAbort {
+            #[n(0)]
+            id: u32,
+        },
+    }
+
+    #[test]
+    fn an_abort_reason_is_optional_on_the_wire() {
+        let bare = ClientMsg::ClipboardAbort {
+            id: 7,
+            reason: None,
+        };
+        // Without a reason the bytes are what older peers send and expect.
+        assert_eq!(hex(&minicbor::to_vec(&bare).unwrap()), "820e8107");
+        let server = ServerMsg::ClipboardAbort {
+            id: 7,
+            reason: None,
+        };
+        assert_eq!(hex(&minicbor::to_vec(&server).unwrap()), "820b8107");
+        assert_eq!(
+            minicbor::decode::<ClientMsg>(&[0x82, 0x0e, 0x81, 0x07]).unwrap(),
+            bare
+        );
+        let stale = ClientMsg::ClipboardAbort {
+            id: 7,
+            reason: Some(AbortReason::Stale),
+        };
+        let bytes = minicbor::to_vec(&stale).unwrap();
+        assert_eq!(hex(&bytes), "820e820700");
+        assert_eq!(minicbor::decode::<ClientMsg>(&bytes).unwrap(), stale);
+        // An older peer skips the reason it does not know.
+        assert_eq!(
+            minicbor::decode::<OldClientMsg>(&bytes).unwrap(),
+            OldClientMsg::ClipboardAbort { id: 7 }
+        );
+        // A reason from a newer peer that this build lacks reads as none.
+        let unknown = [0x82, 0x0e, 0x82, 0x07, 0x18, 0x63];
+        assert_eq!(minicbor::decode::<ClientMsg>(&unknown).unwrap(), bare);
     }
 }

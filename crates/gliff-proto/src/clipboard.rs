@@ -112,8 +112,26 @@ pub enum ClipboardMsg {
     },
     /// The requester has consumed `received` bytes so far.
     Ack { id: u32, received: u64 },
-    /// Either side gives up on the transfer.
-    Abort { id: u32 },
+    /// Either side gives up on the transfer. `reason` is set when the
+    /// requester should take it as something other than a failure; a peer
+    /// that predates it sends none.
+    Abort {
+        id: u32,
+        reason: Option<AbortReason>,
+    },
+}
+
+/// Why a transfer was aborted, for the cases the requester treats as other
+/// than a failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Encode, Decode)]
+#[cbor(index_only)]
+pub enum AbortReason {
+    /// The request named an offer the sender no longer serves: it was
+    /// replaced or withdrawn, or the sender's selection is now the
+    /// requester's own. Before any data arrived nothing failed, so the
+    /// requester ends quietly; after some did, it still fails.
+    #[n(0)]
+    Stale,
 }
 
 /// The mime types worth advertising to the peer: real data types, minus the

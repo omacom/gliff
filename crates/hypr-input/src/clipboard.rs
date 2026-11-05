@@ -241,7 +241,7 @@ impl State {
             .ok_or_else(|| Error::Input("no selection".into()))?;
         let mimes = self.offers.get(off).map(Vec::as_slice).unwrap_or_default();
         if is_own_selection(mimes) {
-            return Err(Error::Input("selection is our own".into()));
+            return Err(Error::OwnSelection);
         }
         if !mimes.iter().any(|a| a == mime) {
             return Err(Error::Input(format!("selection has no {mime}")));

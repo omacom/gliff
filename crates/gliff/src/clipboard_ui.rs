@@ -26,6 +26,7 @@ use gliff_proto::clipboard::{
 use gliff_proto::ClipboardFile;
 use gliff_transport::clipboard::files::{list_files, LocalFiles};
 use gliff_transport::clipboard::progress::{describe, Progress, State};
+use gliff_transport::clipboard::stale_offer;
 
 use crate::clipboard::ToWorker;
 
@@ -248,7 +249,7 @@ pub fn read_local(
 ) {
     glib::MainContext::default().spawn_local(async move {
         if !allowed() {
-            let error = std::io::Error::other("clipboard offer was withdrawn");
+            let error = stale_offer("clipboard offer was withdrawn");
             let _ = reply.send(Err(error)).await;
             return;
         }
@@ -256,7 +257,7 @@ pub fn read_local(
             return;
         };
         if holds_remote_offer(&cb) {
-            let error = std::io::Error::other("clipboard holds the server's offer");
+            let error = stale_offer("clipboard holds the server's offer");
             let _ = reply.send(Err(error)).await;
             return;
         }
@@ -895,7 +896,7 @@ mod tests {
                 .expect("file request was neither served nor refused")
                 .unwrap();
             assert!(
-                matches!(answer.0, ClipboardMsg::Abort { id: 2 }),
+                matches!(answer.0, ClipboardMsg::Abort { id: 2, .. }),
                 "old offer's file was served after the takeover: {:?}",
                 answer.0
             );

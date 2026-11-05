@@ -205,6 +205,7 @@ impl Jobs {
         let Some(job) = removed else { return };
         let state = match outcome {
             Ok(()) => State::Done,
+            Err(TransferError::Stale) => State::Cancelled,
             Err(e) => State::Failed(e.to_string()),
         };
         if job.shown || matches!(state, State::Failed(_)) {
@@ -367,6 +368,28 @@ mod tests {
             let (_, p) = rx.recv().await.unwrap();
             assert!(matches!(p.state, State::Failed(_)), "{p:?}");
             assert_eq!(p.percent(), None);
+        });
+    }
+
+    #[test]
+    fn a_stale_refusal_ends_as_cancelled() {
+        run(async {
+            tokio::time::pause();
+            let (jobs, mut rx) = jobs();
+            // A background read refused at once shows nothing at all.
+            jobs.run("x".into(), None, |_| async { Err(TransferError::Stale) });
+            tokio::time::sleep(QUIET * 2).await;
+            assert!(rx.try_recv().is_err());
+            // One the user already sees ends as cancelled, not failed.
+            jobs.run("x".into(), None, |_| async {
+                tokio::time::sleep(QUIET * 2).await;
+                Err(TransferError::Stale)
+            });
+            let mut last = rx.recv().await.unwrap().1;
+            while !last.is_final() {
+                last = rx.recv().await.unwrap().1;
+            }
+            assert_eq!(last.state, State::Cancelled);
         });
     }
 

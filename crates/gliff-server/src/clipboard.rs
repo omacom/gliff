@@ -123,7 +123,7 @@ impl Bridge {
         };
         if serial != self.local.borrow().serial {
             tracing::debug!(id, serial, "clipboard request against a replaced offer");
-            self.transfers.refuse(id);
+            self.transfers.refuse_stale(id);
             return;
         }
         match item {
@@ -134,15 +134,21 @@ impl Bridge {
                     self.transfers.refuse(id);
                     return;
                 };
-                match compositor
-                    .receive(actual.to_string())
+                let received = compositor.receive(actual.to_string());
+                // Our proxy for the client's offer replaced the selection.
+                let own = matches!(received, Err(hypr_input::Error::OwnSelection));
+                match received
                     .map_err(|e| e.to_string())
                     .and_then(|fd| pipe::Receiver::from_owned_fd(fd).map_err(|e| e.to_string()))
                 {
                     Ok(rx) => self.transfers.serve(id, ReadSource(rx)),
                     Err(e) => {
                         tracing::warn!(id, error = %e, "clipboard receive failed");
-                        self.transfers.refuse(id);
+                        if own {
+                            self.transfers.refuse_stale(id);
+                        } else {
+                            self.transfers.refuse(id);
+                        }
                     }
                 }
             }

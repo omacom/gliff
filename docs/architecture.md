@@ -257,7 +257,13 @@ Every crate with `unsafe` documents the safety requirements at each block.
   button over the video; the server, which has no window, posts a desktop
   notification with a progress bar and a Cancel action over
   `org.freedesktop.Notifications`. Cancel drops the fetch, which sends
-  `Abort`. A failed paste is always reported, however short.
+  `Abort`. A failed paste is always reported, however short. A side that
+  refuses a request, or cuts a serve, because the offer it names was
+  replaced or withdrawn says so in the `Abort` (reason `Stale`). If no
+  data had arrived, the requester ends that paste as cancelled, which is
+  reported only once shown, so a clipboard history reading a superseded
+  offer raises nothing; a paste already partly written still fails.
+  A bare `Abort`, all an older peer sends, is still a failure.
 
 ## Measurements
 

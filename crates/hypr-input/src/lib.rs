@@ -29,6 +29,9 @@ pub enum Error {
     Xkb(String),
     #[error("input: {0}")]
     Input(String),
+    /// The selection is the one we set, so reading it would read ourselves.
+    #[error("input: selection is our own")]
+    OwnSelection,
     #[error("input thread is gone")]
     ThreadGone,
 }

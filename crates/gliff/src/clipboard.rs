@@ -142,7 +142,7 @@ impl Bridge {
     fn on_request(&self, id: u32, serial: u32, item: ClipboardItem) {
         if self.local_serial.get() != Some(serial) {
             tracing::debug!(id, serial, "clipboard request against a replaced offer");
-            self.transfers.refuse(id);
+            self.transfers.refuse_stale(id);
             return;
         }
         match item {
@@ -182,7 +182,7 @@ impl Bridge {
                     // abort yet, so it is caught here instead.
                     if current.get() != Some(serial) {
                         tracing::debug!(id, serial, "clipboard offer revoked while opening a file");
-                        transfers.refuse(id);
+                        transfers.refuse_stale(id);
                         return;
                     }
                     match opened {
@@ -310,6 +310,7 @@ impl Bridge {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gliff_proto::AbortReason;
     use gliff_transport::clipboard::{outbound_channel, Side};
 
     #[test]
@@ -338,7 +339,10 @@ mod tests {
                     .await
                     .expect("request without an offer was not refused")
                     .unwrap();
-                assert!(matches!(refused.0, ClipboardMsg::Abort { id: got } if got == id));
+                assert!(matches!(
+                    refused.0,
+                    ClipboardMsg::Abort { id: got, reason: Some(AbortReason::Stale) } if got == id
+                ));
                 assert!(status_rx.try_recv().is_err());
             }
         });
@@ -394,7 +398,10 @@ mod tests {
                             .await
                             .expect("unoffered mime type was not refused")
                             .unwrap();
-                    assert!(matches!(refused.0, ClipboardMsg::Abort { id: got } if got == id));
+                    assert!(matches!(
+                        refused.0,
+                        ClipboardMsg::Abort { id: got, reason: None } if got == id
+                    ));
                     assert!(status_rx.try_recv().is_err());
                 }
             }
@@ -429,7 +436,8 @@ mod tests {
                 ClipboardMsg::Offer { serial: 2, ref mime_types, ref files }
                     if mime_types.is_empty() && files.is_empty()
             ));
-            for (id, serial) in [(2, 1), (4, 2)] {
+            // The replaced offer is stale; the empty one offers nothing.
+            for (id, serial, reason) in [(2, 1, Some(AbortReason::Stale)), (4, 2, None)] {
                 bridge.on_peer_msg(
                     ClipboardMsg::Request {
                         id,
@@ -439,7 +447,7 @@ mod tests {
                     Bytes::new(),
                 );
                 let refused = rx.recv().await.unwrap();
-                assert!(matches!(refused.0, ClipboardMsg::Abort { id: got } if got == id));
+                assert_eq!(refused.0, ClipboardMsg::Abort { id, reason });
             }
             assert!(status_rx.try_recv().is_err());
         });
@@ -471,7 +479,13 @@ mod tests {
                 Bytes::new(),
             );
             let refused = rx.recv().await.unwrap();
-            assert!(matches!(refused.0, ClipboardMsg::Abort { id: 2 }));
+            assert!(matches!(
+                refused.0,
+                ClipboardMsg::Abort {
+                    id: 2,
+                    reason: Some(AbortReason::Stale)
+                }
+            ));
             assert!(status_rx.try_recv().is_err());
             bridge.on_peer_msg(
                 ClipboardMsg::Request {
@@ -565,7 +579,13 @@ mod tests {
                 .await
                 .expect("file request after a revocation was not refused")
                 .unwrap();
-            assert!(matches!(refused.0, ClipboardMsg::Abort { id: 2 }));
+            assert!(matches!(
+                refused.0,
+                ClipboardMsg::Abort {
+                    id: 2,
+                    reason: Some(AbortReason::Stale)
+                }
+            ));
         });
     }
 
@@ -590,7 +610,13 @@ mod tests {
                 .await
                 .expect("file opened before a revocation was neither served nor refused")
                 .unwrap();
-            assert!(matches!(refused.0, ClipboardMsg::Abort { id: 2 }));
+            assert!(matches!(
+                refused.0,
+                ClipboardMsg::Abort {
+                    id: 2,
+                    reason: Some(AbortReason::Stale)
+                }
+            ));
         });
     }
 
@@ -629,7 +655,13 @@ mod tests {
                 .await
                 .expect("serve in flight was not aborted")
                 .unwrap();
-            assert!(matches!(aborted.0, ClipboardMsg::Abort { id: 2 }));
+            assert!(matches!(
+                aborted.0,
+                ClipboardMsg::Abort {
+                    id: 2,
+                    reason: Some(AbortReason::Stale)
+                }
+            ));
             // The serve dropped its source, so the UI stops reading the
             // clipboard for it.
             tokio::time::timeout(std::time::Duration::from_secs(1), reply.closed())
@@ -666,7 +698,10 @@ mod tests {
             request_file(&bridge, 2, 1);
             assert!(matches!(
                 rx.recv().await.unwrap().0,
-                ClipboardMsg::Abort { id: 2 }
+                ClipboardMsg::Abort {
+                    id: 2,
+                    reason: Some(AbortReason::Stale)
+                }
             ));
             request_file(&bridge, 4, 4);
             assert!(matches!(
