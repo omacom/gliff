@@ -269,8 +269,15 @@ impl H264Decoder {
         // picture being decoded before the marking process frees a slot.
         let refs = (sps.max_num_ref_frames as usize).clamp(1, 16);
         let dpb_slots = refs + 1;
+        // NVIDIA's VA-API driver exports block-linear NV12 whose luma dmabuf
+        // is padded to 64 KiB. Vulkan reads such a surface wrongly (a green
+        // tint) unless the size is already a multiple of that: 8 blocks of
+        // 64 B x 128 rows, which a width of 512 guarantees for any height.
+        // The surface may be wider than the picture; the context stays at
+        // the coded size.
+        let alloc_w = decode_surface_width(&self.display.vendor, cw, self.max_width)?;
         let surfaces = (0..dpb_slots + 1)
-            .map(|_| Surface::new_nv12(&self.display, cw, ch, UsageHint::Decoder))
+            .map(|_| Surface::new_nv12(&self.display, alloc_w, ch, UsageHint::Decoder))
             .collect::<Result<Vec<_>>>()?;
         let targets: Vec<&Surface> = surfaces.iter().collect();
         let context = Context::new(&self.display, &self.config, cw, ch, &targets)?;
@@ -291,6 +298,25 @@ impl H264Decoder {
         self.poc = PocState::default();
         Ok(())
     }
+}
+
+/// Keep the NVIDIA workaround local to its VA-API driver. Other drivers
+/// retain their coded extent, and padding must still fit the driver's limit.
+fn decode_surface_width(vendor: &str, coded: u32, max: u32) -> Result<u32> {
+    let vendor = vendor.to_ascii_lowercase();
+    let width = if vendor.contains("nvidia") || vendor.contains("nvdec") {
+        coded
+            .checked_next_multiple_of(512)
+            .ok_or_else(|| Error::Unsupported("decoder surface width overflow".into()))?
+    } else {
+        coded
+    };
+    if width > max {
+        return Err(Error::Unsupported(format!(
+            "decoder surface width {width} exceeds the driver limit {max}"
+        )));
+    }
+    Ok(width)
 }
 
 /// The largest coded side accepted from any encoder, the client's decode
@@ -750,5 +776,30 @@ mod tests {
         assert_eq!(empty.display_size(), (0, 0));
         assert!(check_stream_size(&empty, (0, 0)).is_err());
         assert!(check_stream_size(&empty, (16, 16)).is_err());
+    }
+}
+
+#[cfg(test)]
+mod surface_width_tests {
+    use super::*;
+
+    #[test]
+    fn padding_is_only_applied_to_nvidia_and_stays_within_limits() {
+        for vendor in [
+            "NVIDIA VA-API driver",
+            "VA-API NVDEC driver [direct backend]",
+        ] {
+            assert_eq!(decode_surface_width(vendor, 1280, 4096).unwrap(), 1536);
+            assert_eq!(decode_surface_width(vendor, 4096, 4096).unwrap(), 4096);
+            assert!(decode_surface_width(vendor, 1280, 1400).is_err());
+            assert!(decode_surface_width(vendor, u32::MAX, u32::MAX).is_err());
+        }
+        for vendor in [
+            "Mesa Gallium driver",
+            "Intel iHD driver",
+            "Intel i965 driver",
+        ] {
+            assert_eq!(decode_surface_width(vendor, 1280, 1400).unwrap(), 1280);
+        }
     }
 }
