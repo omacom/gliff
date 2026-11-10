@@ -32,11 +32,19 @@ impl PasswordSharing {
             .name("gliff-password-sharing".into())
             .spawn(move || {
                 loop {
-                    if let Err(error) = instance.dispatch(&renew) {
-                        // Older Hyprland versions cannot run this Lua API.
-                        // Leave their protection in place and keep streaming.
-                        tracing::warn!(%error, "cannot temporarily enable 1Password capture");
-                        break;
+                    match instance.dispatch(&renew) {
+                        Ok(()) => {}
+                        Err(hypr_ipc::Error::Io(error)) => {
+                            // The lease expires safely during an outage; renew
+                            // it again once compositor IPC recovers.
+                            tracing::debug!(%error, "will retry 1Password capture lease");
+                        }
+                        Err(error) => {
+                            // Older Hyprland versions cannot run this Lua API.
+                            // Leave their protection in place and keep streaming.
+                            tracing::warn!(%error, "cannot temporarily enable 1Password capture");
+                            break;
+                        }
                     }
                     if !matches!(rx.recv_timeout(Duration::from_secs(1)), Err(RecvTimeoutError::Timeout)) {
                         break;
@@ -70,7 +78,7 @@ mod tests {
 
     // Exercise the real worker and IPC: even a failed renewal (which could
     // mean only its reply was lost) must be followed by a release.
-    fn worker_releases(renew_reply: &'static str) {
+    fn worker_releases(renew_reply: &'static str, reset_first: bool) {
         let dir = std::env::temp_dir().join(format!(
             "gliff-lease-{}-{}",
             std::process::id(),
@@ -81,7 +89,15 @@ mod tests {
         ));
         std::fs::create_dir(&dir).unwrap();
         let listener = UnixListener::bind(dir.join(".socket.sock")).unwrap();
+        let (renewed, renewal) = channel();
         let server = std::thread::spawn(move || {
+            if reset_first {
+                let (mut socket, _) = listener.accept().unwrap();
+                // Closing with unread request bytes produces an IPC read
+                // error, as when the compositor drops a connection.
+                socket.read_exact(&mut [0]).unwrap();
+                drop(socket);
+            }
             let mut commands = Vec::new();
             for reply in [renew_reply, "ok"] {
                 let (mut socket, _) = listener.accept().unwrap();
@@ -97,6 +113,9 @@ mod tests {
                 }
                 commands.push(String::from_utf8(bytes[..count].to_vec()).unwrap());
                 socket.write_all(reply.as_bytes()).unwrap();
+                if commands.len() == 1 {
+                    renewed.send(()).unwrap();
+                }
             }
             commands
         });
@@ -105,6 +124,7 @@ mod tests {
             dir: dir.clone(),
         })
         .unwrap();
+        renewal.recv_timeout(Duration::from_secs(10)).unwrap();
         drop(guard);
         let commands = server.join().unwrap();
         assert!(commands[0].contains("local connected = true;"));
@@ -117,11 +137,16 @@ mod tests {
 
     #[test]
     fn disconnect_releases_the_lease() {
-        worker_releases("ok");
+        worker_releases("ok", false);
     }
 
     #[test]
     fn failed_renewal_still_releases_the_lease() {
-        worker_releases("error");
+        worker_releases("error", false);
+    }
+
+    #[test]
+    fn temporary_ipc_failure_recovers_without_reconnecting() {
+        worker_releases("ok", true);
     }
 }
