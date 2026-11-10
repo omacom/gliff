@@ -63,6 +63,8 @@ tiers independently, so every pairing can be tested on one machine.
 
 ## Testing
 
+- `lua scripts/test-password-sharing.lua` checks the 1Password capture lease,
+  including crash expiry, overlapping connections, and config reloads.
 - **`scripts/check.sh`** runs what CI runs (`cargo fmt --check`, `cargo
   clippy --all-targets -- -D warnings`, `cargo test --workspace`); run it
   before every push, and `scripts/check.sh --fix` to apply the rustfmt and

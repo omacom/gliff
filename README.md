@@ -112,6 +112,12 @@ Changing the clipboard cancels unfinished pastes from this machine to the
 remote host. Wait for a file paste to finish before copying something else. Switching
 tabs also cancels unfinished pastes to the tab you leave.
 
+**1Password.** On Hyprland with Lua support, gliff temporarily allows
+1Password windows to be captured while connected. The normal screen-sharing
+rules return when the last gliff session disconnects, or within roughly five
+seconds if the server crashes. While connected, other screen-sharing apps
+can capture 1Password too. This does not change your saved configuration.
+
 **Slow links.** gliff measures the link and lowers the frame rate, then the
 colour detail, then the resolution, and raises them again when there is
 room. Two flags change the video, and you pass them to the server through

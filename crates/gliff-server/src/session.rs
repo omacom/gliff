@@ -220,6 +220,10 @@ where
     let mut msg_rx = spawn_reader(reader);
     let (writer, mut write_reports) = Writer::spawn(writer);
 
+    let _password_sharing = crate::password_sharing::PasswordSharing::start(instance.clone())
+        .map_err(|error| tracing::warn!(%error, "cannot start 1Password capture lease"))
+        .ok();
+
     capturer.request_frame().ok();
     let first_frame_deadline =
         tokio::time::Instant::from_std(Instant::now() + FIRST_FRAME_DEADLINE);

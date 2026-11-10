@@ -6,6 +6,7 @@
 
 mod clipboard;
 mod notify;
+mod password_sharing;
 mod rate;
 mod session;
 mod writer;
