@@ -57,6 +57,14 @@ bin/install
 
 This uses the current checkout, including fixes newer than the last release.
 
+If the remote machine does not have gliff yet, connecting to it offers to
+install it there for your user. Over the same ssh, the remote downloads the
+gliff package from its Omarchy repository, checks it against the repository
+checksum and the signature its own pacman keyring trusts, and copies it to
+`~/.local`; no password or sudo is needed. A file in `~/.local` that gliff
+did not put there is never replaced. To install system-wide instead, run
+`omarchy pkg add gliff` or `sudo pacman -S gliff` on that machine.
+
 To build from source, see [docs/development.md](docs/development.md).
 
 ## Use
@@ -121,6 +129,42 @@ room. Two flags change the video, and you pass them to the server through
 ```
 gliff --server-bin 'gliff-server --low-bandwidth' user@host
 ```
+
+**One mouse and keyboard for several machines.** `--control SIDE:HOST`
+places another machine beside this one's screens, with no window and no
+video: push the pointer past that edge (`left`, `right`, `above` or `below`)
+and it carries on across the other machine's screen, and the keyboard goes
+with it. Cross back over the same edge, or press the release hotkey
+(`Shift+Esc`, or a chord given to `--release-hotkey`), to come back. Give it
+once for each machine:
+
+```
+gliff --control left:user@laptop --control right:user@desktop
+```
+
+The other machine needs a `gliff-server` that knows `--control`; the pointer
+moves on its screen on the side facing this one. When its gliff-server is too
+old, gliff offers to install this computer's for your user there, and drives
+it with that one even where an older package comes first on its PATH. A
+machine that cannot be reached leaves its edge inactive until gliff connects
+to it again.
+
+The clipboard is shared with each machine in both directions, and
+`--no-clipboard` turns that off. A copy made on one driven machine reaches
+this one, not another driven machine, and stops being available here if its
+machine drops.
+
+**Machines that run RDP, VNC or RustDesk.** A Windows PC, a Mac, or any
+machine with a Remote Desktop server, a VNC server or RustDesk instead of
+gliff, gets a tab like the others: pick RDP, VNC or RustDesk from the badge
+at the start of the address bar and type the machine, or type
+`rdp://user@host`, `vnc://host` or `rustdesk://host`. Its
+tab shows its screen, and the mouse button drives it across the edge you
+pick for it, as with `--control`. gliff asks for the password once and keeps
+it in the desktop's keyring. A machine added as `user@host` that does not let
+ssh in is checked for each, and gliff offers to use what answers. See
+[docs/foreign.md](docs/foreign.md) for what each needs and what to know about
+their security.
 
 ## If something does not work
 

@@ -3,16 +3,19 @@ resolver = "2"
 members = [
     "crates/gliff-proto",
     "crates/gliff-transport",
+    "crates/gliff-bridge",
     "crates/hypr-ipc",
     "crates/hypr-wl",
     "crates/hypr-capture",
     "crates/hypr-input",
+    "crates/hypr-edge",
     "crates/gliff-va",
     "crates/gliff-vk",
     "crates/gliff-sw",
     "crates/gliff",
     "crates/gliff-server",
     "crates/gliff-probe",
+    "crates/gliff-foreign",
 ]
 
 [workspace.package]
@@ -30,13 +33,16 @@ undocumented_unsafe_blocks = "warn"
 [workspace.dependencies]
 gliff-proto = { path = "crates/gliff-proto" }
 gliff-transport = { path = "crates/gliff-transport" }
+gliff-bridge = { path = "crates/gliff-bridge" }
 hypr-ipc = { path = "crates/hypr-ipc" }
 hypr-wl = { path = "crates/hypr-wl" }
 hypr-capture = { path = "crates/hypr-capture" }
 hypr-input = { path = "crates/hypr-input" }
+hypr-edge = { path = "crates/hypr-edge" }
 gliff-va = { path = "crates/gliff-va" }
 gliff-vk = { path = "crates/gliff-vk" }
 gliff-sw = { path = "crates/gliff-sw" }
+gliff-foreign = { path = "crates/gliff-foreign" }
 openh264 = { version = "0.9", features = ["source"] }
 openh264-sys2 = "0.9"
 

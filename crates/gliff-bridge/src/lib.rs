@@ -1,12 +1,15 @@
 //! Joins the compositor's clipboard (`hypr_input::Clipboard`) to the peer
 //! (`gliff_transport::clipboard::Transfers`).
 //!
-//! Compositor to client: a new selection becomes an Offer of its mime types
-//! (a `text/uri-list` is read and turned into a file list); when the client
+//! The server joins them for a client. `gliff --control`, which has no window
+//! to own the clipboard, joins them for each machine it drives.
+//!
+//! Compositor to peer: a new selection becomes an Offer of its mime types
+//! (a `text/uri-list` is read and turned into a file list); when the peer
 //! asks for an item, the compositor's pipe for it is streamed out.
 //!
-//! Client to compositor: the client's Offer is advertised as our selection;
-//! when an application pastes, the item is fetched from the client straight
+//! Peer to compositor: the peer's Offer is advertised as our selection;
+//! when an application pastes, the item is fetched from the peer straight
 //! into the application's pipe. A file paste first spools every file, once
 //! per offer, then hands the application a URI list pointing at the spool.
 
@@ -58,7 +61,7 @@ struct RemoteOffer {
 pub struct Bridge {
     transfers: Transfers,
     jobs: Jobs,
-    compositor: Option<Clipboard>,
+    compositor: Option<Rc<Clipboard>>,
     local: Rc<RefCell<LocalOffer>>,
     remote: Rc<RefCell<RemoteOffer>>,
     /// Bumped per selection so a slow offer build for a stale one is dropped.
@@ -66,7 +69,7 @@ pub struct Bridge {
 }
 
 impl Bridge {
-    pub fn new(transfers: Transfers, jobs: Jobs, compositor: Option<Clipboard>) -> Self {
+    pub fn new(transfers: Transfers, jobs: Jobs, compositor: Option<Rc<Clipboard>>) -> Self {
         Self {
             transfers,
             jobs,
@@ -77,7 +80,7 @@ impl Bridge {
         }
     }
 
-    /// A message from the client.
+    /// A message from the peer.
     pub fn on_peer_msg(&self, msg: ClipboardMsg, payload: Bytes) {
         match self.transfers.on_msg(msg, payload) {
             Some(Event::Offer {
