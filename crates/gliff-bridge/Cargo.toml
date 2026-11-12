@@ -1,0 +1,17 @@
+[package]
+name = "gliff-bridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+tracing.workspace = true
+tokio = { workspace = true }
+bytes.workspace = true
+gliff-proto.workspace = true
+gliff-transport.workspace = true
+hypr-input.workspace = true

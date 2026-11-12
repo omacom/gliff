@@ -352,6 +352,11 @@ impl LoopState for State {
                 }
                 self.pointer.frame();
             }
+            InputCmd::SetLocks { layout, locked } => {
+                if let Some((dep, lat, lock, group)) = self.keys.set_locks(layout, &locked) {
+                    self.keyboard.modifiers(dep, lat, lock, group);
+                }
+            }
             InputCmd::SetKeymap(text) if text == self.keys.text => {}
             InputCmd::SetKeymap(text) => match KeyState::from_text(&text) {
                 Ok(mut ks) => {

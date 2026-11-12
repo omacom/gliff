@@ -1,0 +1,61 @@
+#!/bin/sh
+# Set up a tablet as one more screen for this user: the page and its VNC
+# bridge in ~/.local/share/gliff-tablet, and the two user units the tablet
+# button in gliff's window starts and stops. See docs/tablet.md.
+set -eu
+ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+DEST="${XDG_DATA_HOME:-$HOME/.local/share}/gliff-tablet"
+UNITS="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+# Where gliff's window keeps the password and tablet.env, which follows
+# XDG_CONFIG_HOME as the units here must too.
+CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/gliff"
+NOVNC_VERSION=0.6.2   # the last noVNC without ES modules: it runs on iOS 8
+NOVNC_SHA256=70a27fe472b901faef7235a61e01aed884ec8c2234a666844acfd9da7e5bcf9b
+WEBSOCKIFY_VERSION=0.13.0
+
+# The server needs --vnc: the installed one if it has it, else this tree's.
+SERVER="${GLIFF_SERVER:-}"
+if [ -z "$SERVER" ]; then
+    if command -v gliff-server >/dev/null && gliff-server --help 2>&1 | grep -q -- '--vnc'; then
+        SERVER="$(command -v gliff-server)"
+    elif [ -x "$ROOT/target/release/gliff-server" ] &&
+        "$ROOT/target/release/gliff-server" --help 2>&1 | grep -q -- '--vnc'; then
+        mkdir -p "$DEST"
+        install -m 755 "$ROOT/target/release/gliff-server" "$DEST/gliff-server"
+        SERVER="$DEST/gliff-server"
+    else
+        echo "No gliff-server with --vnc: install this fork, or run cargo build --release first." >&2
+        exit 1
+    fi
+fi
+
+mkdir -p "$DEST" "$UNITS"
+if [ ! -f "$DEST/novnc/include/rfb.js" ]; then
+    tarball="$(mktemp)"
+    trap 'rm -f "$tarball"' EXIT
+    curl -fsSL -o "$tarball" \
+        "https://github.com/novnc/noVNC/archive/refs/tags/v$NOVNC_VERSION.tar.gz"
+    echo "$NOVNC_SHA256  $tarball" | sha256sum -c --quiet
+    mkdir -p "$DEST/novnc"
+    tar -xzf "$tarball" -C "$DEST/novnc" --strip-components=1 \
+        "noVNC-$NOVNC_VERSION/include" "noVNC-$NOVNC_VERSION/images" \
+        "noVNC-$NOVNC_VERSION/LICENSE.txt"
+fi
+install -m 644 "$ROOT/tablet/tablet.html" "$DEST/novnc/tablet.html"
+install -m 644 "$ROOT/tablet/tablet-web.py" "$DEST/tablet-web.py"
+if [ ! -x "$DEST/venv/bin/python" ]; then
+    python3 -m venv "$DEST/venv"
+fi
+"$DEST/venv/bin/python" -m pip install --quiet --disable-pip-version-check \
+    "websockify==$WEBSOCKIFY_VERSION"
+
+# The units name the directories chosen here, so a custom XDG_DATA_HOME or
+# XDG_CONFIG_HOME works as the default does.
+fill() {
+    sed -e "s|@SERVER@|$SERVER|g" -e "s|@DATA@|$DEST|g" -e "s|@CONFIG@|$CONFIG|g" "$1"
+}
+fill "$ROOT/tablet/gliff-tablet-vnc.service" > "$UNITS/gliff-tablet-vnc.service"
+fill "$ROOT/tablet/gliff-tablet-web.service" > "$UNITS/gliff-tablet-web.service"
+systemctl --user daemon-reload
+echo "Installed. Open gliff and use the tablet button, or: systemctl --user start gliff-tablet-web gliff-tablet-vnc"
+echo "Let the tablet reach port 6080, for example: sudo ufw allow from <tablet address> to any port 6080 proto tcp"

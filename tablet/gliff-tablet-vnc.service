@@ -1,0 +1,10 @@
+[Unit]
+Description=gliff: a tablet as one more screen, served over VNC on 127.0.0.1
+
+[Service]
+Environment=RUST_LOG=info
+Environment=GLIFF_TABLET_POSITION=right GLIFF_TABLET_ALIGN=center GLIFF_TABLET_SIZE=1024x720
+EnvironmentFile=-@CONFIG@/tablet.env
+ExecStart=@SERVER@ --vnc 127.0.0.1:5900 --headless --size ${GLIFF_TABLET_SIZE} --position ${GLIFF_TABLET_POSITION} --align ${GLIFF_TABLET_ALIGN} --vnc-password-file @CONFIG@/vnc-password
+Restart=on-failure
+RestartSec=2

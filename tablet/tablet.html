@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Gliff</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Gliff">
+<link rel="apple-touch-icon" href="images/screen_57x57.png">
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #000; color: #ccc;
+    font: 13px -apple-system, Helvetica, sans-serif; overflow: hidden; }
+  #top { height: 0; }
+  body.standalone #top { height: 20px; }
+  #screen { position: absolute; left: 0; right: 0; text-align: center; overflow: hidden; }
+  #noVNC_canvas { display: inline-block; }
+  #bar { position: absolute; left: 0; right: 0; bottom: 0; height: 28px; line-height: 28px;
+    background: #111; border-top: 1px solid #222; padding: 0 6px; white-space: nowrap; }
+  #status { display: inline-block; max-width: 55%; overflow: hidden; text-overflow: ellipsis; vertical-align: top; }
+  #buttons { position: absolute; right: 6px; top: 0; }
+  button { font: inherit; color: #eee; background: #2a2a2a; border: 1px solid #444; border-radius: 4px;
+    height: 22px; margin-left: 6px; padding: 0 10px; -webkit-appearance: none; }
+  button:active { background: #444; }
+  #message { position: absolute; left: 0; right: 0; top: 40%; text-align: center; font-size: 18px; display: none; }
+  #message button { font-size: 16px; height: 36px; padding: 0 18px; margin-top: 14px; }
+  #help { position: absolute; left: 0; right: 0; top: 0; bottom: 0; background: rgba(0,0,0,.88);
+    display: none; text-align: center; font-size: 20px; line-height: 1.6; padding-top: 18%; }
+  #help .arrow { position: absolute; top: 4px; font-size: 34px; }
+  #help b { color: #fff; }
+</style>
+<script src="include/util.js"></script>
+</head>
+<body>
+<div id="top"></div>
+<div id="screen"><canvas id="noVNC_canvas" width="1024" height="20"></canvas></div>
+<div id="message"></div>
+<div id="help">
+  <div class="arrow" id="helpArrow">&#8593;</div>
+  This browser cannot show a page full screen.<br>
+  Tap <b>Share</b> (the box with the arrow, at the top), then<br>
+  <b>Add to Home Screen</b>.<br>
+  Open <b>Gliff</b> from that icon to see it full screen.<br><br>
+  <button id="helpClose">OK</button>
+</div>
+<div id="bar">
+  <span id="status">Loading…</span>
+  <span id="buttons">
+    <button id="fullscreen">Full Screen</button>
+    <button id="connect">Disconnect</button>
+    <button id="screenToggle">Remove Screen</button>
+  </span>
+</div>
+<script>
+"use strict";
+Util.load_scripts(["webutil.js", "base64.js", "websock.js", "des.js", "keysymdef.js",
+                   "keyboard.js", "input.js", "display.js", "inflator.js", "rfb.js", "keysym.js"]);
+
+var KEY = "gliff-vnc-password";
+var rfb = null;
+var wanted = true;        // the person wants to be connected
+var screenOn = true;      // the server has the screen up
+var connected = false;
+var retryTimer = null;
+var authFailed = false;
+var replaced = false;     // another viewer took the screen
+var settingsChanged = false;  // the bridge closed us to apply new settings
+var settings = { colors: "full", fps: 0 };  // from gliff's tablet dialog
+var frameTimer = null;
+
+function store(name, value) {
+  try { if (value === null) localStorage.removeItem(name); else localStorage.setItem(name, value); } catch (e) {}
+}
+function load(name) { try { return localStorage.getItem(name); } catch (e) { return null; } }
+
+function password() {
+  var pw = load(KEY);
+  if (!pw) {
+    pw = window.prompt("Password of the gliff screen:", "");
+    if (pw) store(KEY, pw);
+  }
+  return pw || "";
+}
+
+function status(text) { $D("status").textContent = text; }
+
+function message(text, buttonLabel, action) {
+  var m = $D("message");
+  if (!text) { m.style.display = "none"; m.innerHTML = ""; return; }
+  m.innerHTML = "";
+  var p = document.createElement("div");
+  p.textContent = text;
+  m.appendChild(p);
+  if (buttonLabel) {
+    var b = document.createElement("button");
+    b.textContent = buttonLabel;
+    b.onclick = action;
+    m.appendChild(b);
+  }
+  m.style.display = "block";
+}
+
+function layout() {
+  var top = $D("top").offsetHeight, bar = $D("bar").offsetHeight;
+  var s = $D("screen");
+  s.style.top = top + "px";
+  s.style.height = (window.innerHeight - top - bar) + "px";
+  if (rfb && connected) {
+    var scale = rfb.get_display().autoscale(window.innerWidth, window.innerHeight - top - bar, false);
+    rfb.get_mouse().set_scale(scale);
+  }
+}
+
+function fullscreenElement() {
+  return document.fullscreenElement || document.webkitFullscreenElement || null;
+}
+
+function fullscreen() {
+  var root = document.documentElement;
+  if (fullscreenElement()) {
+    (document.exitFullscreen || document.webkitExitFullscreen || function () {}).call(document);
+    return;
+  }
+  var enter = root.requestFullscreen || root.webkitRequestFullscreen;
+  if (enter) {
+    try { enter.call(root); } catch (e) {}
+  }
+  // iPad Safari before iOS 12 has no full screen for pages: explain the icon.
+  setTimeout(function () {
+    if (!fullscreenElement()) {
+      $D("helpArrow").style.left = (window.innerWidth > 700 ? window.innerWidth - 150 : window.innerWidth / 2) + "px";
+      $D("help").style.display = "block";
+    }
+  }, 400);
+}
+
+function buttons() {
+  $D("connect").textContent = wanted ? "Disconnect" : "Connect";
+  $D("connect").style.display = screenOn ? "inline-block" : "none";
+  $D("screenToggle").textContent = screenOn ? "Remove Screen" : "Put Screen Back";
+}
+
+// noVNC 0.6 drops its socket handlers once a connection closes, so each
+// connection gets a client of its own.
+function newClient() {
+  // 256 colors: one byte a pixel from the server's palette, a quarter of
+  // what full color takes to send and to draw.
+  return new RFB({ target: $D("noVNC_canvas"), encrypt: false,
+                   true_color: settings.colors !== "256",
+                   local_cursor: false, shared: true, view_only: false,
+                   onUpdateState: onState,
+                   onFBResize: function () { setTimeout(layout, 0); },
+                   onPasswordRequired: function (r) { store(KEY, null); r.sendPassword(password()); } });
+}
+
+function busy() {
+  return rfb && !(rfb._rfb_state in { disconnected: 1, failed: 1, fatal: 1 });
+}
+
+function connect() {
+  clearTimeout(retryTimer);
+  settingsChanged = false;
+  if (!wanted || !screenOn || connected || document.hidden || busy()) return;
+  message(null);
+  request("GET", "/settings", null, function (code, text) {
+    if (code === 200) {
+      var lines = text.split("\n");
+      for (var i = 0; i < lines.length; i++) {
+        var kv = lines[i].split("=");
+        if (kv[0] === "colors") settings.colors = kv[1];
+        if (kv[0] === "fps") settings.fps = parseInt(kv[1], 10) || 0;
+      }
+    }
+    if (!wanted || !screenOn || connected || document.hidden || busy()) return;
+    clearTimeout(frameTimer);
+    var port = window.location.port || (window.location.protocol === "https:" ? 443 : 80);
+    rfb = newClient();
+    rfb.connect(window.location.hostname, port, password(), "websockify?v=2");
+  });
+}
+
+function retrySoon() {
+  clearTimeout(retryTimer);
+  if (wanted && screenOn) retryTimer = setTimeout(connect, settingsChanged ? 200 : 2000);
+}
+
+// noVNC asks for the next frame as soon as it has drawn one. With a frame
+// rate set, hold that request back: the server gathers the changes in
+// between, and the tablet has time to answer touches.
+function limitFrames() {
+  var send = RFB.messages.fbUpdateRequests, last = 0;
+  RFB.messages.fbUpdateRequests = function (sock, cleanDirty, width, height) {
+    clearTimeout(frameTimer);
+    var wait = settings.fps > 0 ? 1000 / settings.fps - (Date.now() - last) : 0;
+    if (wait <= 0) {
+      last = Date.now();
+      return send(sock, cleanDirty, width, height);
+    }
+    frameTimer = setTimeout(function () {
+      last = Date.now();
+      try { send(sock, cleanDirty, width, height); sock.flush(); } catch (e) {}
+    }, wait);
+  };
+}
+
+function onState(r, state, oldstate, msg) {
+  if (r && r !== rfb) return;
+  connected = (state === "normal");
+  if (state === "normal") { status("Connected"); message(null); layout(); }
+  else if (state === "failed" && msg && /auth/i.test(msg)) {
+    store(KEY, null);
+    wanted = false;
+    authFailed = true;
+    status("Wrong password");
+    message("Wrong password.", "Try Again", function () { authFailed = false; wanted = true; buttons(); connect(); });
+  }
+  else if (state === "failed" && msg && /settings/.test(msg)) {
+    settingsChanged = true;
+    status("Applying new settings…");
+  }
+  else if (state === "failed" && msg && /replaced/.test(msg)) {
+    wanted = false;
+    replaced = true;
+    status("Another device took the screen");
+    message("Another device took the screen.", "Connect Here", function () { replaced = false; wanted = true; buttons(); connect(); });
+  }
+  else if (state === "disconnected") {
+    if (!replaced && !authFailed && !settingsChanged) status(wanted ? "Reconnecting…" : "Disconnected");
+    if (!wanted && !authFailed && !replaced) message("Disconnected.", "Connect", toggleConnect);
+    retrySoon();
+  }
+  else if (msg) status(msg);
+  buttons();
+}
+
+function toggleConnect() {
+  wanted = !wanted;
+  authFailed = false;
+  replaced = false;
+  buttons();
+  if (wanted) connect();
+  else { clearTimeout(retryTimer); if (connected) rfb.disconnect(); else onState(null, "disconnected"); }
+}
+
+function request(method, path, body, done) {
+  var x = new XMLHttpRequest();
+  x.open(method, path, true);
+  x.onreadystatechange = function () { if (x.readyState === 4) done(x.status, x.responseText.replace(/\s+$/, "")); };
+  x.send(body || null);
+}
+
+function showScreenOff() {
+  status("Screen removed");
+  message("The screen is removed from the desktop.", "Put Screen Back", toggleScreen);
+}
+
+function toggleScreen() {
+  var action = screenOn ? "off" : "on";
+  var pw = password();
+  if (!pw) return;
+  $D("screenToggle").disabled = true;
+  if (action === "off") { wanted = false; clearTimeout(retryTimer); if (connected) rfb.disconnect(); }
+  status(action === "on" ? "Putting the screen back…" : "Removing the screen…");
+  request("POST", "/screen", action + "\n" + pw, function (code, text) {
+    $D("screenToggle").disabled = false;
+    if (code === 403) { store(KEY, null); status("Wrong password"); return; }
+    if (code !== 200) { status("Error: " + (text || code)); return; }
+    screenOn = (text === "active" || text === "activating");
+    wanted = screenOn;
+    buttons();
+    if (screenOn) { status("Connecting…"); message(null); retryTimer = setTimeout(connect, 1500); }
+    else showScreenOff();
+  });
+}
+
+// Only the page in view holds the connection: the server takes one client
+// at a time, so a Safari tab and the home-screen icon would otherwise keep
+// taking it from each other.
+document.addEventListener("visibilitychange", function () {
+  if (document.hidden) {
+    clearTimeout(retryTimer);
+    if (rfb && connected) rfb.disconnect();
+  } else {
+    connect();
+  }
+}, false);
+
+window.onresize = function () { setTimeout(layout, 100); };
+window.onorientationchange = window.onresize;
+
+window.onscriptsload = function () {
+  // The password may come in the URL (#pw=...). It stays there so the icon
+  // that "Add to Home Screen" makes carries it: on iOS that icon opens with
+  // storage of its own, apart from Safari's.
+  var given = /[#&]pw=([^&]*)/.exec(window.location.hash);
+  if (given) store(KEY, decodeURIComponent(given[1]));
+  $D("fullscreen").onclick = fullscreen;
+  $D("helpClose").onclick = function () { $D("help").style.display = "none"; };
+  if (window.navigator.standalone) {
+    document.body.className = "standalone";
+    $D("fullscreen").style.display = "none";
+  }
+  WebUtil.init_logging("warn");
+  $D("connect").onclick = toggleConnect;
+  $D("screenToggle").onclick = toggleScreen;
+  layout();
+  limitFrames();
+  request("GET", "/screen", null, function (code, text) {
+    screenOn = (code !== 200) || text === "active" || text === "activating";
+    buttons();
+    if (screenOn) connect(); else showScreenOff();
+  });
+};
+</script>
+</body>
+</html>

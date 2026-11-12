@@ -118,6 +118,9 @@ pub struct CaptureConfig {
     pub shm_fallback: bool,
     /// Also run a cursor session and report shape/position.
     pub cursor: bool,
+    /// Have the compositor draw the cursor into each frame, for a client
+    /// that cannot draw it itself.
+    pub paint_cursors: bool,
     /// Refuse to allocate a ring for an output past this size; the capture
     /// then ends with an error.
     pub max_size: Option<SizeLimit>,
@@ -158,6 +161,7 @@ impl CaptureConfig {
             prefer_linear: true,
             shm_fallback: true,
             cursor: true,
+            paint_cursors: false,
             max_size: None,
         }
     }
