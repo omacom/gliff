@@ -73,6 +73,11 @@ struct Cli {
     /// GLIFF_CAPTURE environment variable.
     #[arg(long, value_parser = ["auto", "dmabuf", "shm"])]
     capture: Option<String>,
+    /// Bits per pixel per frame (per stream) the frame rate is chosen for:
+    /// the stream runs at the highest frame rate the link pays for at this
+    /// quality, up to the session's ceiling. Higher is sharper and slower.
+    #[arg(long, default_value_t = rate::QUALITY_BPP)]
+    quality_bpp: f64,
 }
 
 fn main() -> Result<()> {
@@ -105,6 +110,7 @@ fn main() -> Result<()> {
         video: gliff_sw::VideoMode::resolve(cli.video.as_deref()),
         full_chroma: cli.full_chroma,
         capture: hypr_capture::CaptureMode::resolve(cli.capture.as_deref()),
+        quality_bpp: cli.quality_bpp,
     };
 
     let rt = tokio::runtime::Builder::new_current_thread()
