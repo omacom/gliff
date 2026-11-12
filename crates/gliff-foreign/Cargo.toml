@@ -1,0 +1,38 @@
+[package]
+name = "gliff-foreign"
+description = "Show and drive machines that run an RDP server or RustDesk instead of gliff"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version = "1.94"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+bytes.workspace = true
+tokio = { workspace = true }
+gliff-proto.workspace = true
+ironrdp-tokio = "0.12"
+ironrdp-tls = { version = "0.3", features = ["rustls-ring"] }
+prost = "0.14"
+crypto_box = { version = "0.9", features = ["std"] }
+crypto_secretbox = { version = "0.1", features = ["std"] }
+sha2 = "0.10"
+rand_core = { version = "0.6", features = ["getrandom"] }
+ironrdp-connector = "0.12.0"
+ironrdp-session = "0.13.0"
+ironrdp-graphics = "0.11.0"
+ironrdp-input = "0.9.0"
+ironrdp-pdu = "0.11.0"
+ironrdp-core = "0.3.1"
+ironrdp-displaycontrol = "0.10.0"
+ironrdp-dvc = "0.10.0"
+ironrdp-svc = "0.10.0"
+
+[dev-dependencies]
+tracing-subscriber.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

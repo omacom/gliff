@@ -11,12 +11,20 @@ use serde::{Deserialize, Serialize};
 pub struct Config {
     #[serde(default, alias = "recent_machines")]
     pub machines: Vec<String>,
+    /// Where each machine's screen stands, for using it as a screen of this
+    /// one.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub monitors: std::collections::BTreeMap<String, crate::monitor::Settings>,
     /// The machines with a running session, in tab order of opening.
     #[serde(default)]
     pub open: Vec<String>,
     /// The machine the window showed last.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shown: Option<String>,
+    /// The certificate each RDP machine showed first, by SHA-256: another
+    /// one is refused, as ssh refuses a changed host key.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub certificates: std::collections::BTreeMap<String, String>,
 }
 
 impl Config {
@@ -53,7 +61,41 @@ impl Config {
             std::fs::create_dir_all(dir)?;
         }
         let text = toml::to_string(self).map_err(std::io::Error::other)?;
-        std::fs::write(path, text)
+        // Written beside under a name of its own and renamed over, so a
+        // reader never sees half a file.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(format!(".{}.{n}.tmp", std::process::id()));
+        let tmp = PathBuf::from(tmp);
+        std::fs::write(&tmp, text)?;
+        std::fs::rename(&tmp, path).inspect_err(|_| {
+            let _ = std::fs::remove_file(&tmp);
+        })
+    }
+
+    /// Load the config, `change` it and save it as one step. Other writers
+    /// in this process, and in other gliff processes, wait meanwhile, so
+    /// none loses what another changed. Returns what `change` returns.
+    pub fn update<R>(path: &Path, change: impl FnOnce(&mut Self) -> R) -> std::io::Result<R> {
+        static WRITING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _writing = WRITING.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let mut lock_path = path.as_os_str().to_owned();
+        lock_path.push(".lock");
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(PathBuf::from(lock_path))?;
+        // Released when `lock` closes.
+        rustix::fs::flock(&lock, rustix::fs::FlockOperation::LockExclusive)?;
+        let mut config = Self::load(path);
+        let result = change(&mut config);
+        config.save(path)?;
+        Ok(result)
     }
 
     fn parse(text: &str) -> Result<Self, toml::de::Error> {
@@ -80,6 +122,8 @@ impl Config {
     }
 
     pub fn forget(&mut self, machine: &str) {
+        self.monitors.remove(machine);
+        self.certificates.remove(machine);
         self.machines.retain(|m| m != machine);
         self.set_open(machine, false);
         if self.shown.as_deref() == Some(machine) {
@@ -95,6 +139,31 @@ impl Config {
             self.open.push(machine.to_string());
         } else if !open {
             self.open.retain(|m| m != machine);
+        }
+    }
+
+    /// Call `old` by `new` from now on, in its place in the list and with
+    /// its settings, as when a machine turns out to run RDP or RustDesk.
+    pub fn rename(&mut self, old: &str, new: &str) {
+        if old == new {
+            return;
+        }
+        if self.machines.iter().any(|m| m == new) {
+            self.machines.retain(|m| m != old);
+        } else if let Some(m) = self.machines.iter_mut().find(|m| *m == old) {
+            *m = new.to_string();
+        }
+        if let Some(settings) = self.monitors.remove(old) {
+            self.monitors.entry(new.to_string()).or_insert(settings);
+        }
+        self.certificates.remove(old);
+        let was_open = self.open.iter().any(|m| m == old);
+        self.set_open(old, false);
+        if was_open {
+            self.set_open(new, true);
+        }
+        if self.shown.as_deref() == Some(old) {
+            self.shown = Some(new.to_string());
         }
     }
 
@@ -117,6 +186,25 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_renamed_machine_keeps_its_place_and_settings() {
+        let mut c = Config::default();
+        c.remember("a");
+        c.remember("pc");
+        c.remember("b");
+        c.set_open("pc", true);
+        c.shown = Some("pc".into());
+        c.monitors.insert("pc".into(), Default::default());
+        c.rename("pc", "rdp://pc");
+        assert_eq!(c.machines, ["a", "rdp://pc", "b"]);
+        assert_eq!(c.open, ["rdp://pc"]);
+        assert_eq!(c.shown.as_deref(), Some("rdp://pc"));
+        assert!(c.monitors.contains_key("rdp://pc") && !c.monitors.contains_key("pc"));
+        // Onto a name already listed, the old entry goes.
+        c.rename("a", "b");
+        assert_eq!(c.machines, ["rdp://pc", "b"]);
+    }
 
     #[test]
     fn remember_appends_new_machines_once() {
@@ -224,6 +312,33 @@ mod tests {
     fn parse_reads_the_old_recent_machines_key() {
         let c = Config::parse("recent_machines = [\"a\", \"b\"]").unwrap();
         assert_eq!(c.machines, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn updates_from_many_threads_keep_every_change() {
+        let dir = std::env::temp_dir().join(format!("gliff-update-{}", std::process::id()));
+        let path = dir.join("config.toml");
+        std::thread::scope(|scope| {
+            for i in 0..8 {
+                let path = &path;
+                scope.spawn(move || {
+                    Config::update(path, |c| {
+                        c.certificates.insert(format!("pc{i}"), format!("FP{i}"));
+                    })
+                    .unwrap();
+                });
+            }
+        });
+        let c = Config::load(&path);
+        assert_eq!(c.certificates.len(), 8);
+        let left: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(left.iter().all(|n| !n.ends_with(".tmp")), "{left:?}");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(dir.join("config.toml.lock"));
+        let _ = std::fs::remove_dir(&dir);
     }
 
     #[test]
