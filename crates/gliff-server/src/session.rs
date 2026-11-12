@@ -43,6 +43,11 @@ pub struct Config {
     pub full_chroma: bool,
     /// What the capture ring is made of; `Shm` implies the CPU tier.
     pub capture: CaptureMode,
+    /// Cap on the stream and headless-output refresh, instead of the
+    /// client's monitor refresh.
+    pub max_fps: Option<u32>,
+    /// Per-stream bits per pixel the ladder picks the frame rate for.
+    pub quality_bpp: f64,
 }
 
 /// Events from the capture thread.
@@ -126,15 +131,18 @@ where
             features: features(),
         })
         .await?;
-    let ladder = Ladder::new(START_LEVEL);
-    let start_fps = ladder.level().fps_cap.min(MAX_FPS);
+    let ladder = Ladder::new(START_FPS, cfg.quality_bpp);
+    // The output's own refresh rate is the cadence ceiling: a 240 Hz output
+    // is streamed at up to 240 fps, not a fixed 60.
+    let max_fps = capped_fps(output.refresh_hz, cfg.max_fps);
+    let start_fps = ladder.rung().fps(max_fps);
     let fps_cmd = start_fps;
     let on_gpu = matches!(video, VideoTier::Gpu(_));
-    let started = match VideoStart::open(video, &cfg, &caps, &output, fps_cmd) {
+    let started = match VideoStart::open(video, &cfg, &caps, &output, fps_cmd, max_fps) {
         Ok(start) => Ok(start),
         Err(e) if on_gpu => {
             tracing::warn!(error = %format!("{e:#}"), "cannot start the GPU video pipeline; falling back to the CPU pipeline");
-            VideoStart::open(VideoTier::Cpu, &cfg, &caps, &output, fps_cmd)
+            VideoStart::open(VideoTier::Cpu, &cfg, &caps, &output, fps_cmd, max_fps)
         }
         Err(e) => Err(e),
     };
@@ -251,6 +259,8 @@ where
         frame_id: 0,
         want_keyframe: true,
         fps_cmd,
+        max_fps,
+        fps_cap_override: cfg.max_fps,
         encode_us: 0.0,
         next_send_at: Instant::now(),
         last_frame: None,
@@ -466,6 +476,11 @@ struct Session {
     /// The one commanded cadence: the pace timer and the encoder's
     /// programmed frame rate both use it.
     fps_cmd: u32,
+    /// The output's refresh rate in Hz: the session's frame-rate ceiling.
+    /// Follows the client's monitor for a headless output, unless capped.
+    max_fps: u32,
+    /// `--max-fps`: cap the output mode and cadence below the client's.
+    fps_cap_override: Option<u32>,
     /// Smoothed encode time, for the sustainable-fps clamp.
     encode_us: f64,
     /// The pace slot for the next frame.
@@ -479,23 +494,24 @@ struct Session {
     next_refine_at: Instant,
     /// The one-shot first-frame recapture has fired.
     recaptured: bool,
-    /// Quality levels the link rate picks from: fps first, then chroma,
-    /// then resolution.
+    /// The quality the link rate pays for: fps first, then chroma, never
+    /// resolution.
     ladder: Ladder,
     /// The full-quality fit size (the client's view); the active stream is
-    /// this scaled by the ladder level.
+    /// always this size.
     base_stream: (u32, u32),
-    /// The chroma the handshake negotiated; a ladder level may reduce the
+    /// The chroma the handshake negotiated; a ladder rung may reduce the
     /// active `chroma` to Single420.
     base_chroma: ChromaMode,
-    /// The fps cap in the last StreamConfig, so a pace-only level change
+    /// The fps cap in the last StreamConfig, so a pace-only ladder step
     /// still reaches the client.
     sent_fps_cap: u32,
     cursor_shape_id: u32,
 }
 
-/// The session-wide fps ceiling; ladder levels cap below it.
-const MAX_FPS: u32 = 60;
+/// The highest refresh rate a session will pace to, whatever an output
+/// reports: a bound on nonsense values, not a policy limit.
+const MAX_FPS_LIMIT: u32 = 480;
 /// Still-picture refinement: at most this many re-encodes of an unchanged
 /// frame, at least this far apart.
 const MAX_REFINES: u8 = 8;
@@ -503,9 +519,9 @@ const REFINE_EVERY: Duration = Duration::from_millis(200);
 /// A static screen produces no damage and so no first frame; after this
 /// long the capture is torn down and retried once with full damage.
 const FIRST_FRAME_DEADLINE: Duration = Duration::from_millis(700);
-/// The starting ladder level: 30 fps, full quality. It halves the first
-/// burst against level 0 while the controller measures available capacity.
-const START_LEVEL: usize = 1;
+/// The starting frame rate, at full quality. It holds the first burst down
+/// while the controller measures available capacity.
+const START_FPS: u32 = 30;
 
 impl Session {
     async fn on_client_msg(&mut self, msg: ClientMsg) -> Result<ControlFlow<()>> {
@@ -537,7 +553,7 @@ impl Session {
                 let dual = self.base_chroma == ChromaMode::Dual420;
                 let can_drop_aux = self.can_drop_aux();
                 let pixels = self.base_stream.0 as u64 * self.base_stream.1 as u64;
-                if let Some(level) = self.ladder.consider(
+                if let Some(rung) = self.ladder.consider(
                     now,
                     &self.link,
                     self.ctl.is_slow_start(),
@@ -545,10 +561,10 @@ impl Session {
                     pixels,
                     dual,
                     can_drop_aux,
-                    MAX_FPS,
+                    self.max_fps,
                 ) {
                     tracing::info!(
-                        level,
+                        aux = rung.aux,
                         fps_cap = self.fps_cap(),
                         rate_mbit = self
                             .link
@@ -600,7 +616,8 @@ impl Session {
                 width,
                 height,
                 scale,
-            } => self.resize(width, height, scale).await?,
+                refresh_hz,
+            } => self.resize(width, height, scale, refresh_hz).await?,
             ClientMsg::Ping { t } => self.writer.send(
                 ServerMsg::Pong {
                     t,
@@ -645,8 +662,15 @@ impl Session {
     /// Resize a headless output to the client's window at the client's
     /// scale, so the remote UI renders at the client's DPI, within the size
     /// it declared in Hello and the server's cap, and restart the encoder
-    /// at the new size.
-    async fn resize(&mut self, width: u32, height: u32, scale: f32) -> Result<()> {
+    /// at the new size. The output also takes the refresh rate of the
+    /// client's monitor, so its compositor renders at the client's cadence.
+    async fn resize(
+        &mut self,
+        width: u32,
+        height: u32,
+        scale: f32,
+        refresh_hz: Option<u32>,
+    ) -> Result<()> {
         let width = width.min(self.caps.max_width) & !1;
         let height = height.min(self.caps.max_height) & !1;
         let scale = if scale.is_finite() {
@@ -662,22 +686,33 @@ impl Session {
             return self.fit_mirror(width, height);
         }
         let (width, height) = headless_target(width, height, scale);
-        let same_size = (width, height) == (self.output.width, self.output.height);
+        let (old_w, old_h) = (self.output.width, self.output.height);
+        let old_hz = self.output.refresh_hz;
+        // A client that cannot say keeps the current refresh; either way
+        // --max-fps applies, including to the mode the output was created at.
+        let requested_hz = refresh_hz.filter(|hz| *hz > 0).unwrap_or(old_hz);
+        let hz = capped_fps(requested_hz, self.fps_cap_override);
+        self.output.refresh_hz = hz;
+        let same_size = (width, height) == (old_w, old_h);
         let same_scale = (scale - self.output.scale).abs() < 0.01;
-        if same_size && same_scale {
+        let same_hz = hz == old_hz;
+        if same_size && same_scale && same_hz {
             return Ok(());
         }
-        tracing::info!(width, height, scale, "resizing headless output");
+        tracing::info!(width, height, scale, hz, "resizing headless output");
         if let Err(e) = self
             .instance
-            .set_monitor_mode(&self.output.name, width, height, 60, scale)
+            .set_monitor_mode(&self.output.name, width, height, hz, scale)
         {
             tracing::warn!(error = %e, "could not resize the headless output");
+            self.output.refresh_hz = old_hz;
             return Ok(());
         }
         // Hyprland applies the mode asynchronously and may round the scale
         // so the logical size is whole; wait for it and use what it chose.
         let applied = self.wait_for_mode(width, height, scale).await;
+        self.max_fps = hz;
+        tracing::debug!(request_hz = ?refresh_hz, old_hz, hz, "headless cadence");
         if !same_size {
             let base = EncoderSettings::fit_extent(width, height, self.encoder_max);
             if base != (width, height) {
@@ -688,7 +723,6 @@ impl Session {
                 );
             }
             let old_base = self.base_stream;
-            let (old_w, old_h) = (self.output.width, self.output.height);
             self.base_stream = base;
             self.output.width = width;
             self.output.height = height;
@@ -697,14 +731,19 @@ impl Session {
                 self.base_stream = old_base;
                 self.output.width = old_w;
                 self.output.height = old_h;
+                self.output.refresh_hz = old_hz;
+                self.max_fps = old_hz;
                 let s = self.output.scale;
                 self.instance
-                    .set_monitor_mode(&self.output.name, old_w, old_h, 60, s)
+                    .set_monitor_mode(&self.output.name, old_w, old_h, old_hz, s)
                     .ok();
                 self.wait_for_mode(old_w, old_h, s).await;
                 self.inject(self.output.logical_extent());
                 return Ok(());
             }
+        } else if !same_hz {
+            // Only the cadence changed: re-pace and tell the client.
+            self.apply_stream_params()?;
         }
         self.output.scale = applied;
         self.inject(self.output.logical_extent());
@@ -948,9 +987,9 @@ impl Session {
             && self.link_has_room()
     }
 
-    /// The ladder level's frame-rate ceiling, bounded by the session's.
+    /// The ladder rung's frame-rate ceiling, bounded by the session's.
     fn fps_cap(&self) -> u32 {
-        self.ladder.level().fps_cap.min(MAX_FPS)
+        self.ladder.rung().fps(self.max_fps)
     }
 
     /// A rung may only drop the auxiliary stream when the client can
@@ -960,10 +999,10 @@ impl Session {
         self.caps.chroma.contains(&ChromaMode::Single420)
     }
 
-    /// The chroma the current ladder level allows, within what the client
+    /// The chroma the current ladder rung allows, within what the client
     /// advertised.
     fn active_chroma(&self) -> ChromaMode {
-        if self.ladder.level().aux || !self.can_drop_aux() {
+        if self.ladder.rung().aux || !self.can_drop_aux() {
             self.base_chroma
         } else {
             ChromaMode::Single420
@@ -974,9 +1013,11 @@ impl Session {
     /// can sustain.
     fn update_fps_cmd(&mut self) {
         let sustainable = if self.encode_us > 0.0 {
-            (1e6 / (self.encode_us * 1.1)).clamp(5.0, MAX_FPS as f64) as u32
+            // The floor is 5 fps unless the session's ceiling is lower.
+            let ceiling = self.max_fps as f64;
+            (1e6 / (self.encode_us * 1.1)).clamp(5.0_f64.min(ceiling), ceiling) as u32
         } else {
-            MAX_FPS
+            self.max_fps
         };
         self.fps_cmd = self.fps_cap().min(sustainable).max(1);
     }
@@ -999,26 +1040,28 @@ impl Session {
     }
 
     /// The single choke point for stream geometry: derive the active stream
-    /// from the full-quality fit size (`base_stream`) and the ladder level.
+    /// from the full-quality fit size (`base_stream`) and the ladder rung.
     /// A change of size or chroma rebuilds the encoder; an fps-only change
     /// updates the rate without one. Returns false when the encoder
     /// rejected the geometry; the caller sends the StreamConfig on success.
     fn apply_stream_params(&mut self) -> Result<bool> {
         self.update_fps_cmd();
-        let level = self.ladder.level();
         let chroma = self.active_chroma();
-        let want = EncoderSettings::fit_extent(
-            ((self.base_stream.0 as f32 * level.scale) as u32).max(2) & !1,
-            ((self.base_stream.1 as f32 * level.scale) as u32).max(2) & !1,
-            self.encoder_max,
-        );
+        // The stream is always the full fit size: the ladder trades frame
+        // rate and chroma, never resolution.
+        let want = self.base_stream;
         if want == self.stream && chroma == self.chroma {
+            // The ceiling may have moved (a refresh-only resize): rebound the
+            // controller without rebuilding the encoder.
+            let streams = if chroma == ChromaMode::Dual420 { 2 } else { 1 };
+            self.ctl
+                .reconfigure(want.0 as u64 * want.1 as u64, streams, self.max_fps);
             self.apply_rate();
             return Ok(true);
         }
         let streams = if chroma == ChromaMode::Dual420 { 2 } else { 1 };
         self.ctl
-            .reconfigure(want.0 as u64 * want.1 as u64, streams, MAX_FPS);
+            .reconfigure(want.0 as u64 * want.1 as u64, streams, self.max_fps);
         let settings = encoder_settings(
             want.0,
             want.1,
@@ -1033,7 +1076,6 @@ impl Session {
                     height = want.1,
                     ?chroma,
                     fps_cap = self.fps_cap(),
-                    level = self.ladder.index(),
                     "stream reconfigured"
                 );
                 self.encoder = encoder;
@@ -1097,12 +1139,7 @@ impl Session {
         self.encoder_max = stream_limit(gliff_sw::Encoder::MAX_SIZE, &self.caps)?;
         self.base_stream =
             EncoderSettings::fit_extent(self.base_stream.0, self.base_stream.1, self.encoder_max);
-        let level = self.ladder.level();
-        self.stream = EncoderSettings::fit_extent(
-            ((self.base_stream.0 as f32 * level.scale) as u32).max(2) & !1,
-            ((self.base_stream.1 as f32 * level.scale) as u32).max(2) & !1,
-            self.encoder_max,
-        );
+        self.stream = self.base_stream;
         let streams = if self.chroma == ChromaMode::Dual420 {
             2
         } else {
@@ -1111,7 +1148,7 @@ impl Session {
         self.ctl.reconfigure(
             self.stream.0 as u64 * self.stream.1 as u64,
             streams,
-            MAX_FPS,
+            self.max_fps,
         );
         self.settings = encoder_settings(
             self.stream.0,
@@ -1302,6 +1339,7 @@ impl VideoStart {
         caps: &ClientCaps,
         output: &SessionOutput,
         fps: u32,
+        max_fps: u32,
     ) -> Result<Self> {
         // The CPU tier defaults to one 4:2:0 stream: dual-stream 4:4:4
         // doubles the encode work, which the CPU pays for where the GPU
@@ -1329,7 +1367,7 @@ impl VideoStart {
         let ctl = RateController::new(
             stream.0 as u64 * stream.1 as u64,
             streams,
-            MAX_FPS,
+            max_fps,
             cfg.bitrate,
         );
         let settings = encoder_settings(
@@ -1583,6 +1621,8 @@ struct SessionOutput {
     height: u32,
     /// Output scale; the logical size the pointer works in is size / scale.
     scale: f32,
+    /// The output's refresh rate in Hz: the ceiling the stream paces to.
+    refresh_hz: u32,
     headless: Option<hypr_ipc::Instance>,
     awake: Option<KeepAwake>,
 }
@@ -1684,6 +1724,7 @@ fn setup_output(
                 m.height
             } & !1,
             scale: m.scale,
+            refresh_hz: refresh_hz(m.refresh_rate),
             headless: None,
             awake: None,
         });
@@ -1704,6 +1745,9 @@ fn setup_output(
         width: 0,
         height: 0,
         scale: 1.0,
+        // A new output renders at the client's cadence after the first
+        // Resize; 60 is only the mode it is created with.
+        refresh_hz: 60,
         headless: Some(instance.clone()),
         awake: None,
     };
@@ -1733,18 +1777,37 @@ fn setup_output(
         let Some(m) = mons.iter().find(|m| m.name == output.name) else {
             continue;
         };
-        applied = Some((m.width, m.height, m.scale));
+        applied = Some((m.width, m.height, m.scale, refresh_hz(m.refresh_rate)));
         if m.width == width && m.height == height {
             break;
         }
     }
-    let (w, h, scale) = applied.context("headless output vanished")?;
+    let (w, h, scale, hz) = applied.context("headless output vanished")?;
     output.width = w & !1;
     output.height = h & !1;
     output.scale = scale;
+    output.refresh_hz = hz;
     // An output added while the remote sleeps comes up switched off.
     output.awake = Some(KeepAwake::start(instance.clone(), output.name.clone())?);
     Ok(output)
+}
+
+/// The cadence a session may use: the output's refresh, lowered to an
+/// explicit cap when one is set.
+fn capped_fps(refresh_hz: u32, cap: Option<u32>) -> u32 {
+    cap.map_or(refresh_hz, |c| refresh_hz.min(c))
+        .clamp(1, MAX_FPS_LIMIT)
+}
+
+/// A refresh rate as a whole number of hertz, falling back to 60 when the
+/// compositor does not report one.
+fn refresh_hz(refresh_rate: f64) -> u32 {
+    let hz = refresh_rate.round();
+    if hz.is_finite() && (1.0..=1000.0).contains(&hz) {
+        hz as u32
+    } else {
+        60
+    }
 }
 
 /// A timed-out request may still finish in the compositor. An explicit

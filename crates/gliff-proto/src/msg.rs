@@ -194,6 +194,11 @@ pub enum ClientMsg {
         height: u32,
         #[n(2)]
         scale: f32,
+        /// Refresh rate of the monitor the client's window is on, in Hz, so
+        /// a headless output renders at the client's cadence. None when the
+        /// client could not read it, or predates this field.
+        #[n(3)]
+        refresh_hz: Option<u32>,
     },
     #[n(2)]
     Key {
@@ -938,6 +943,38 @@ mod tests {
     enum NewerPipeline {
         #[n(9)]
         Npu,
+    }
+
+    /// A `Resize` from a client that predates `refresh_hz`.
+    #[derive(Encode)]
+    enum OlderClientMsg {
+        #[n(1)]
+        Resize {
+            #[n(0)]
+            width: u32,
+            #[n(1)]
+            height: u32,
+            #[n(2)]
+            scale: f32,
+        },
+    }
+
+    #[test]
+    fn resize_from_an_older_client_has_no_refresh() {
+        let older = OlderClientMsg::Resize {
+            width: 2560,
+            height: 1600,
+            scale: 1.0,
+        };
+        assert_eq!(
+            minicbor::decode::<ClientMsg>(&minicbor::to_vec(&older).unwrap()).unwrap(),
+            ClientMsg::Resize {
+                width: 2560,
+                height: 1600,
+                scale: 1.0,
+                refresh_hz: None,
+            }
+        );
     }
 
     #[test]

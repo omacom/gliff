@@ -153,6 +153,13 @@ impl Instance {
         self.request_json("monitors all")
     }
 
+    /// The mapped windows, with the monitor each one is on and the process
+    /// that owns it. A client finds its own window by pid, and so the
+    /// monitor whose refresh rate it should ask the server to match.
+    pub fn clients(&self) -> Result<Vec<Client>> {
+        self.request_json("clients")
+    }
+
     /// Run a dispatcher. A legacy (hyprlang) config takes `dispatch <name>
     /// <args>`; a Lua config reads `dispatch` as `hl.dispatch(...)`, rejects
     /// that form, and takes the `hl.dsp` call in `lua` instead.
@@ -269,6 +276,19 @@ pub struct Monitor {
     /// False while DPMS has the monitor off; Hyprland does not render it.
     #[serde(default = "yes")]
     pub dpms_status: bool,
+}
+
+/// A mapped window, as far as gliff needs it: which process owns it and
+/// which monitor it is on.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Client {
+    #[serde(default)]
+    pub pid: i32,
+    /// The monitor's id, to match against [`Monitor::id`].
+    #[serde(default)]
+    pub monitor: i64,
+    #[serde(default)]
+    pub class: String,
 }
 
 fn yes() -> bool {

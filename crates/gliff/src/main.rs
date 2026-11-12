@@ -61,8 +61,8 @@ struct Cli {
     /// Remote gliff-server path.
     #[arg(long, default_value = "gliff-server")]
     server_bin: String,
-    /// Create a private headless output on the remote, sized and scaled to
-    /// this window, instead of mirroring the remote's focused screen.
+    /// Create a private headless output on the remote, sized, scaled and
+    /// paced to this window, instead of mirroring the remote's focused screen.
     #[arg(long, conflicts_with = "output")]
     headless: bool,
     /// Mirror the named remote output (e.g. `DP-1`) instead of the focused one.
@@ -75,6 +75,10 @@ struct Cli {
     /// click it again.
     #[arg(long, default_value = "shift+escape")]
     release_hotkey: String,
+    /// Cap the remote screen and the stream at this refresh rate (Hz)
+    /// instead of following the local monitor's. 0 follows the monitor.
+    #[arg(long, default_value_t = 0)]
+    max_fps: u32,
     /// Video pipeline: `gpu` (Vulkan compute + VA-API, falling back to the
     /// CPU when unavailable) or `cpu` (force OpenH264 on the CPU). Overrides
     /// the GLIFF_VIDEO environment variable.
@@ -123,6 +127,9 @@ struct App {
     /// Size of the video widget in device pixels, rounded down to even.
     view_size: Cell<(u32, u32)>,
     view_scale: Cell<f64>,
+    /// Refresh rate of the monitor the window is on, in Hz, so a headless
+    /// remote screen renders at this display's cadence. 0 when unknown.
+    monitor_refresh: Cell<u32>,
     /// Evdev codes currently held on the remote, so they can all be released
     /// when the keyboard is handed back to the local compositor.
     pressed_keys: RefCell<BTreeSet<u32>>,
@@ -178,6 +185,8 @@ struct Session {
     /// The size last asked of the server, so a pending resize is not repeated.
     resize_requested: Cell<(u32, u32)>,
     resize_scale: Cell<f64>,
+    /// The window's monitor refresh last sent, so a monitor change re-sends.
+    resize_refresh: Cell<u32>,
     /// The output zoom last asked of the decoder; a new worker starts at 1.
     zoom: Cell<u32>,
     /// The latest frame and its view, painted when the tab is shown.
@@ -191,6 +200,7 @@ impl Session {
     fn reset_resize(&self) {
         self.resize_requested.set((0, 0));
         self.resize_scale.set(0.0);
+        self.resize_refresh.set(0);
     }
 
     fn new(endpoint: Endpoint) -> Self {
@@ -213,6 +223,7 @@ impl Session {
             stream_scale: Cell::new(1.0),
             resize_requested: Cell::new((0, 0)),
             resize_scale: Cell::new(0.0),
+            resize_refresh: Cell::new(0),
             zoom: Cell::new(1),
             last_frame: RefCell::new(None),
             cursor: RefCell::new(None),
@@ -258,11 +269,16 @@ fn endpoints_from_cli(cli: &Cli) -> Vec<Endpoint> {
 fn ssh_endpoint(cli: &Cli, host: &str) -> Endpoint {
     let mut t = SshTarget::new(host.to_string());
     t.server_bin = cli.server_bin.clone();
-    t.server_args = match (&cli.output, cli.headless) {
+    let mut args = match (&cli.output, cli.headless) {
         (Some(name), _) => vec!["--output".into(), name.clone()],
         (None, true) => vec!["--headless".into()],
         (None, false) => vec!["--output".into(), "auto".into()],
     };
+    if cli.max_fps > 0 {
+        args.push("--max-fps".into());
+        args.push(cli.max_fps.to_string());
+    }
+    t.server_args = args;
     Endpoint::Ssh(t)
 }
 
@@ -417,6 +433,7 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         local_clipboard: RefCell::new(None),
         view_size: Cell::new((0, 0)),
         view_scale: Cell::new(1.0),
+        monitor_refresh: Cell::new(0),
         pressed_keys: RefCell::new(BTreeSet::new()),
         released: Cell::new(false),
         config_path: Config::default_path(),
@@ -430,6 +447,7 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
     });
     install_input_handlers(&ui, &video, &window, hotkey);
     install_resize_handler(&ui);
+    watch_monitor_refresh(&ui);
     install_address_bar(&ui, &connect_btn);
     refresh_tabs(&ui);
 
@@ -1228,8 +1246,10 @@ fn reconnect_status(error: Option<&str>, attempt: u32) -> String {
 
 /// Pull decoded frames on the GTK main loop, latest-wins. The shown session
 /// paints them; every session keeps its latest for when its tab is shown.
+/// Polled every 2 ms so a 120-240 Hz remote screen is not held to the
+/// polling rate; a tick with no frame is two `try_recv` calls.
 fn poll_frames(ui: Rc<App>, s: Rc<Session>, rx: Receiver<Picture>, generation: u64) {
-    glib::timeout_add_local(Duration::from_millis(8), move || {
+    glib::timeout_add_local(Duration::from_millis(2), move || {
         if s.generation.get() != generation {
             return glib::ControlFlow::Break;
         }
@@ -2137,28 +2157,73 @@ fn install_fullscreen_bars(
 fn install_resize_handler(ui: &Rc<App>) {
     // A Picture has no resize signal, so poll its allocation; the one-shot
     // timer sends only once the size has held for 200 ms.
-    let ui = ui.clone();
+    let poll_ui = ui.clone();
     glib::timeout_add_local(Duration::from_millis(100), move || {
-        let scale = device_scale(&ui);
-        ui.frame.set_scale(scale);
-        request_zoom(&ui);
+        let scale = device_scale(&poll_ui);
+        poll_ui.frame.set_scale(scale);
+        request_zoom(&poll_ui);
         let (w, h) = (
-            ui.video.width() as f64 * scale,
-            ui.video.height() as f64 * scale,
+            poll_ui.video.width() as f64 * scale,
+            poll_ui.video.height() as f64 * scale,
         );
         let size = (
             w.max(0.0).round() as u32 & !1,
             h.max(0.0).round() as u32 & !1,
         );
-        let scale_changed = ui.view_scale.replace(scale) != scale;
-        if size != ui.view_size.get() || scale_changed {
-            ui.view_size.set(size);
-            let ui = ui.clone();
+        let scale_changed = poll_ui.view_scale.replace(scale) != scale;
+        if size != poll_ui.view_size.get() || scale_changed {
+            poll_ui.view_size.set(size);
+            let ui = poll_ui.clone();
             glib::timeout_add_local_once(Duration::from_millis(200), move || {
                 if ui.view_size.get() == size {
                     request_resize(&ui);
                 }
             });
+        }
+        glib::ControlFlow::Continue
+    });
+}
+
+/// A headless remote screen follows the refresh rate of the display the
+/// window is shown on, and the window can move to another monitor without
+/// resizing, so re-send the size when that rate changes. The Hyprland
+/// requests can block for seconds on a busy compositor, so they run on a
+/// worker and only the result reaches the GTK thread. `--max-fps` caps the
+/// rate sent, which also caps a `--connect` server.
+fn watch_monitor_refresh(ui: &Rc<App>) {
+    let (tx, rx) = channel::<Option<u32>>();
+    let spawned = std::thread::Builder::new()
+        .name("gliff-refresh".into())
+        .spawn(move || {
+            let mut last = None;
+            loop {
+                let hz = window_refresh_hz();
+                if last != Some(hz) {
+                    last = Some(hz);
+                    if tx.send(hz).is_err() {
+                        break;
+                    }
+                }
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        });
+    if let Err(e) = spawned {
+        tracing::warn!(error = %e, "cannot watch the monitor refresh rate");
+        return;
+    }
+    let ui = ui.clone();
+    glib::timeout_add_local(Duration::from_millis(250), move || {
+        let Some(hz) = rx.try_iter().last() else {
+            return glib::ControlFlow::Continue;
+        };
+        let cap = ui.cli.max_fps;
+        let hz = match hz {
+            Some(hz) if cap > 0 => hz.min(cap),
+            Some(hz) => hz,
+            None => cap,
+        };
+        if ui.monitor_refresh.replace(hz) != hz {
+            request_resize(&ui);
         }
         glib::ControlFlow::Continue
     });
@@ -2198,23 +2263,54 @@ fn request_resize(ui: &App) {
     };
     let size = ui.view_size.get();
     let scale = device_scale(ui);
+    let refresh = ui.monitor_refresh.get();
     if size.0 < 64
         || size.1 < 64
         || (s.resize_scale.get() == scale
+            && s.resize_refresh.get() == refresh
             && (size == s.server_view.get() || size == s.resize_requested.get()))
     {
         return;
     }
     s.resize_requested.set(size);
     s.resize_scale.set(scale);
+    s.resize_refresh.set(refresh);
     send_to(
         &s,
         ClientMsg::Resize {
             width: size.0,
             height: size.1,
             scale: scale as f32,
+            refresh_hz: (refresh > 0).then_some(refresh),
         },
     );
+}
+
+/// The refresh rate (Hz) of the Hyprland monitor holding the gliff window,
+/// rounded to a whole number: a headless remote screen should render at the
+/// cadence of the display it is shown on. None when it cannot be read (a
+/// non-Hyprland client, or before the window is mapped).
+fn window_refresh_hz() -> Option<u32> {
+    let instance = hypr_ipc::Instance::discover(None).ok()?;
+    let pid = std::process::id() as i32;
+    let monitors = instance.monitors().ok()?;
+    // Our own window's monitor when it is mapped, else the focused one (the
+    // window is normally focused), else the leftmost enabled output.
+    let mine = instance
+        .clients()
+        .ok()
+        .and_then(|clients| clients.into_iter().find(|c| c.pid == pid))
+        .map(|c| c.monitor);
+    let monitor = mine
+        .and_then(|id| monitors.iter().find(|m| m.id == id))
+        .or_else(|| monitors.iter().find(|m| m.focused))
+        .or_else(|| monitors.iter().find(|m| !m.disabled && !m.name.is_empty()))?;
+    let hz = monitor.refresh_rate.round();
+    if hz.is_finite() && (1.0..=1000.0).contains(&hz) {
+        Some(hz as u32)
+    } else {
+        None
+    }
 }
 
 /// GTK button number to evdev `BTN_*`. GDK numbers left, middle and right
