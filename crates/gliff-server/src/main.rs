@@ -1,6 +1,6 @@
 //! gliff-server: captures a Hyprland output, encodes it as Dual420 4:4:4, and
 //! serves it to one client over the gliff protocol. `--stdio` (spawned by ssh)
-//! or `--listen` (dev, localhost).
+//! or `--listen` (dev, localhost). `--vnc` serves it to VNC clients instead.
 
 #![forbid(unsafe_code)]
 
@@ -8,12 +8,13 @@ mod clipboard;
 mod notify;
 mod rate;
 mod session;
+mod vnc;
 mod writer;
 
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{ArgGroup, Parser};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 
@@ -23,12 +24,32 @@ use hypr_wl::Target;
 #[command(
     name = "gliff-server",
     version,
-    about = "Serve a Hyprland session over the gliff protocol"
+    about = "Serve a Hyprland session over the gliff protocol",
+    group(ArgGroup::new("screen").args(["headless", "output"]))
 )]
 struct Cli {
     /// Serve over stdin/stdout (spawned by ssh). stdout carries the protocol.
-    #[arg(long, conflicts_with = "listen")]
+    #[arg(long, conflicts_with_all = ["listen", "vnc"])]
     stdio: bool,
+    /// Serve the output to VNC clients on this address, such as
+    /// `0.0.0.0:5900`, until stopped. With `--headless` the output is a
+    /// new screen of `--size`, kept while clients come and go.
+    #[arg(long, conflicts_with = "listen", requires = "screen")]
+    vnc: Option<String>,
+    /// The VNC screen's size in pixels, for a device's display.
+    #[arg(long, requires = "vnc", requires = "headless", default_value = "1024x768", value_parser = parse_size)]
+    size: (u32, u32),
+    /// The VNC screen's scale: 2 for a high-density display.
+    #[arg(long, requires = "vnc", requires = "headless", default_value_t = 1.0, value_parser = parse_scale)]
+    scale: f32,
+    /// A file whose first line is the VNC password. VNC Authentication uses
+    /// its first 8 characters. `GLIFF_VNC_PASSWORD` works too.
+    #[arg(long, requires = "vnc", conflicts_with = "vnc_no_password")]
+    vnc_password_file: Option<PathBuf>,
+    /// Serve VNC without a password: anyone who reaches the address controls
+    /// this desktop.
+    #[arg(long, requires = "vnc")]
+    vnc_no_password: bool,
     /// Dev only: listen on a TCP address (no auth; localhost).
     #[arg(long)]
     listen: Option<String>,
@@ -43,6 +64,15 @@ struct Cli {
     /// window instead of mirroring.
     #[arg(long)]
     headless: bool,
+    /// Where the headless output goes among this machine's screens:
+    /// `right`, `left`, `above` or `below` of them. The default lets
+    /// Hyprland choose.
+    #[arg(long, requires = "headless", value_parser = ["right", "left", "above", "below"])]
+    position: Option<String>,
+    /// How the headless output lines up along that side: `start` (top or
+    /// left edges), `center` or `end` (bottom or right edges).
+    #[arg(long, requires = "position", value_parser = ["start", "center", "end"], default_value = "start")]
+    align: String,
     /// Hyprland instance signature (default: newest).
     #[arg(long)]
     instance: Option<String>,
@@ -99,6 +129,19 @@ fn main() -> Result<()> {
         } else {
             Some(cli.output.clone().unwrap_or_else(|| "auto".into()))
         },
+        placement: cli.position.as_deref().map(|side| session::Placement {
+            side: match side {
+                "left" => session::Edge::Left,
+                "above" => session::Edge::Above,
+                "below" => session::Edge::Below,
+                _ => session::Edge::Right,
+            },
+            align: match cli.align.as_str() {
+                "center" => session::Align::Center,
+                "end" => session::Align::End,
+                _ => session::Align::Start,
+            },
+        }),
         render_node,
         low_bandwidth: cli.low_bandwidth,
         bitrate: cli.bitrate,
@@ -107,11 +150,24 @@ fn main() -> Result<()> {
         capture: hypr_capture::CaptureMode::resolve(cli.capture.as_deref()),
     };
 
+    let vnc = match &cli.vnc {
+        Some(listen) => Some(vnc::Config {
+            listen: listen.clone(),
+            password: vnc_password(&cli)?,
+            mode: (cli.size.0, cli.size.1, cli.scale),
+            name: format!("{} (gliff)", hostname()),
+        }),
+        None => None,
+    };
+
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
     let local = tokio::task::LocalSet::new();
     local.block_on(&rt, async move {
+        if let Some(vnc) = vnc {
+            return vnc::run(cfg, vnc).await;
+        }
         if let Some(addr) = cli.listen {
             let addresses: Vec<_> = tokio::net::lookup_host(&addr).await?.collect();
             validate_listen_addresses(&addresses, cli.allow_remote)?;
@@ -146,6 +202,68 @@ where
     }
 }
 
+/// `WIDTHxHEIGHT`, each between 64 and 4096 pixels.
+/// A scale from 0.5 to 4, as a client's resize takes.
+fn parse_scale(text: &str) -> Result<f32, String> {
+    match text.parse::<f32>() {
+        Ok(s) if s.is_finite() && (0.5..=4.0).contains(&s) => Ok(s),
+        _ => Err(format!("{text:?} is not a scale from 0.5 to 4")),
+    }
+}
+
+fn parse_size(text: &str) -> Result<(u32, u32), String> {
+    let (w, h) = text
+        .split_once(['x', 'X'])
+        .ok_or_else(|| format!("{text:?} is not WIDTHxHEIGHT"))?;
+    let side = |s: &str| -> Result<u32, String> {
+        let v: u32 = s
+            .trim()
+            .parse()
+            .map_err(|_| format!("{s:?} is not a number"))?;
+        if (64..=4096).contains(&v) {
+            Ok(v)
+        } else {
+            Err(format!("{v} is not between 64 and 4096"))
+        }
+    };
+    Ok((side(w)?, side(h)?))
+}
+
+/// The VNC password, from `--vnc-password-file` or `GLIFF_VNC_PASSWORD`;
+/// `None` only with `--vnc-no-password`.
+fn vnc_password(cli: &Cli) -> Result<Option<Vec<u8>>> {
+    if cli.vnc_no_password {
+        tracing::warn!(
+            "serving VNC without a password: anyone who reaches it controls this desktop"
+        );
+        return Ok(None);
+    }
+    let text = match &cli.vnc_password_file {
+        Some(path) => std::fs::read_to_string(path)
+            .with_context(|| format!("read {}", path.display()))?,
+        None => std::env::var("GLIFF_VNC_PASSWORD").map_err(|_| {
+            anyhow::anyhow!(
+                "VNC needs a password: --vnc-password-file, GLIFF_VNC_PASSWORD, or --vnc-no-password"
+            )
+        })?,
+    };
+    let password = text.lines().next().unwrap_or("").as_bytes().to_vec();
+    anyhow::ensure!(!password.is_empty(), "the VNC password is empty");
+    if password.len() > gliff_vnc::auth::MAX_PASSWORD {
+        tracing::warn!(
+            "VNC Authentication only checks the first {} characters of the password",
+            gliff_vnc::auth::MAX_PASSWORD
+        );
+    }
+    Ok(Some(password))
+}
+
+fn hostname() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .map(|h| h.trim().to_string())
+        .unwrap_or_else(|_| "Hyprland".into())
+}
+
 /// In --stdio mode nothing else may hold fd 1, or it would corrupt the wire.
 fn assert_stdout_is_free() -> Result<()> {
     // A best-effort check: stdout must be a pipe or socket, not a tty.
@@ -169,6 +287,14 @@ fn validate_listen_addresses(addresses: &[std::net::SocketAddr], allow_remote: b
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn scales_must_be_finite_and_in_range() {
+        assert_eq!(parse_scale("2"), Ok(2.0));
+        for bad in ["0", "-1", "NaN", "inf", "8", "x"] {
+            assert!(parse_scale(bad).is_err(), "{bad}");
+        }
+    }
+
     #[test]
     fn development_listener_requires_loopback_or_explicit_opt_in() {
         for addr in ["0.0.0.0:9000", "[::]:9000", "192.168.1.2:9000"] {

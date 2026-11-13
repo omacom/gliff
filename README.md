@@ -122,6 +122,18 @@ room. Two flags change the video, and you pass them to the server through
 gliff --server-bin 'gliff-server --low-bandwidth' user@host
 ```
 
+**Any device as a screen.** `gliff-server --vnc` serves a new screen of
+this machine to VNC clients, so an old tablet or laptop with a VNC viewer
+can stand beside your monitors as one more of them:
+
+```
+gliff-server --vnc 0.0.0.0:5900 --headless --size 1024x768 \
+    --position right --vnc-password-file ~/.config/gliff/vnc-password
+```
+
+See [docs/vnc.md](docs/vnc.md) for the options, the clients it works with,
+and what to know about VNC's security.
+
 ## If something does not work
 
 - Run `gliff-probe all` on each machine. It checks the compositor, the GPU
@@ -150,5 +162,6 @@ gliff --server-bin 'gliff-server --low-bandwidth' user@host
   and Hyprland do, and what is tested where.
 - [docs/development.md](docs/development.md): building, running on one
   machine, and the tests.
+- [docs/vnc.md](docs/vnc.md): serving a screen to VNC clients.
 
 gliff is released under the MIT license.

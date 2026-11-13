@@ -1,0 +1,21 @@
+[package]
+name = "gliff-vnc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "The VNC (RFB) protocol for gliff-server: handshake, pixel formats and encodings"
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror.workspace = true
+tokio = { workspace = true }
+flate2 = "1"
+des = "0.8"
+xkbcommon.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }
+proptest.workspace = true

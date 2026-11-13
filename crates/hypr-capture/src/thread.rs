@@ -450,7 +450,7 @@ fn run_loop(
     let session =
         state
             .copy_mgr
-            .create_session(&source, manager::Options::empty(), &qh, Kind::Screen);
+            .create_session(&source, screen_options(&state.cfg), &qh, Kind::Screen);
     state.source = Some(source);
     state.session = Some(session);
 
@@ -459,6 +459,14 @@ fn run_loop(
     }
     let _ = ready_tx.send(Ok(()));
     Ok(hypr_wl::run_loop(conn, queue, rx, state)?)
+}
+
+fn screen_options(cfg: &CaptureConfig) -> manager::Options {
+    if cfg.paint_cursors {
+        manager::Options::PaintCursors
+    } else {
+        manager::Options::empty()
+    }
 }
 
 pub fn list_outputs(target: &Target) -> Result<Vec<OutputInfo>> {
