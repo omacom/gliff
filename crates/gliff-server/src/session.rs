@@ -8,6 +8,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use bytes::Bytes;
@@ -62,6 +63,11 @@ enum Incoming {
     },
     Stopped,
     Error(String),
+}
+
+fn ended_by(signal: &str) -> ControlFlow<()> {
+    tracing::info!(signal, "ending the session");
+    ControlFlow::Break(())
 }
 
 fn now_ms() -> u64 {
@@ -264,11 +270,41 @@ where
         cursor_shape_id: 0,
     };
 
+    let lock_supported = session
+        .caps
+        .features
+        .iter()
+        .any(|feature| feature == gliff_proto::FEATURE_LOCK);
+    let mut lock_on_end = crate::lock::LockOnEnd::new(session.instance.clone());
+    let mut hangup = signal(SignalKind::hangup())?;
+    let mut terminate = signal(SignalKind::terminate())?;
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    let mut last_heard = Instant::now();
+    let mut liveness = tokio::time::interval(LIVENESS_PING);
+    liveness.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         let flow = tokio::select! {
             msg = msg_rx.recv() => match msg {
-                Some(Inbound::Msg(msg)) => session.on_client_msg(msg).await?,
+                Some(Inbound::Msg(ClientMsg::LockScreen)) => {
+                    last_heard = Instant::now();
+                    if lock_supported {
+                        let instance = session.instance.clone();
+                        tokio::task::spawn_blocking(move || crate::lock::lock(&instance));
+                    }
+                    ControlFlow::Continue(())
+                }
+                Some(Inbound::Msg(ClientMsg::LockOnDisconnect { enabled })) => {
+                    last_heard = Instant::now();
+                    lock_on_end.armed = enabled && lock_supported;
+                    tracing::info!(enabled = lock_on_end.armed, "lock on disconnect");
+                    ControlFlow::Continue(())
+                }
+                Some(Inbound::Msg(msg)) => {
+                    last_heard = Instant::now();
+                    session.on_client_msg(msg).await?
+                }
                 Some(Inbound::Clipboard(msg, payload)) => {
+                    last_heard = Instant::now();
                     clipboard.on_peer_msg(msg, payload);
                     ControlFlow::Continue(())
                 }
@@ -292,6 +328,18 @@ where
                 }
                 ControlFlow::Continue(())
             }
+            _ = liveness.tick(), if lock_on_end.armed => {
+                if last_heard.elapsed() > LIVENESS_TIMEOUT {
+                    tracing::info!("client stopped answering; ending the session");
+                    ControlFlow::Break(())
+                } else {
+                    session.writer.send(ServerMsg::Ping { t: now_ms() }, Vec::new());
+                    ControlFlow::Continue(())
+                }
+            }
+            _ = hangup.recv() => ended_by("SIGHUP"),
+            _ = terminate.recv() => ended_by("SIGTERM"),
+            _ = interrupt.recv() => ended_by("SIGINT"),
             ev = cap_rx.recv() => session.on_capture(ev)?,
             report = write_reports.recv() => {
                 let elapsed = report.context("writer task ended")??;
@@ -506,6 +554,12 @@ const FIRST_FRAME_DEADLINE: Duration = Duration::from_millis(700);
 /// The starting ladder level: 30 fps, full quality. It halves the first
 /// burst against level 0 while the controller measures available capacity.
 const START_LEVEL: usize = 1;
+/// While the screen should lock when the connection ends, the client is
+/// pinged this often, and the session ends once it has been silent for the
+/// timeout: a client that loses power or its network never closes the
+/// connection.
+const LIVENESS_PING: Duration = Duration::from_secs(5);
+const LIVENESS_TIMEOUT: Duration = Duration::from_secs(15);
 
 impl Session {
     async fn on_client_msg(&mut self, msg: ClientMsg) -> Result<ControlFlow<()>> {
@@ -623,6 +677,7 @@ impl Session {
                 self.inject(InputCmd::SetKeymap(keymap))
             }
             ClientMsg::Keymap { .. } => {}
+            ClientMsg::LockScreen | ClientMsg::LockOnDisconnect { .. } => {}
             ClientMsg::Hello { .. } => anyhow::bail!("unexpected second Hello"),
         }
         Ok(ControlFlow::Continue(()))
