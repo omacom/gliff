@@ -1,7 +1,6 @@
 //! One client session: output setup, the capture/encode/send loop, and input.
 
 use std::ops::{ControlFlow, Deref, DerefMut};
-use std::os::fd::AsFd;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -21,9 +20,10 @@ use gliff_sw::VideoMode;
 use gliff_transport::clipboard::progress::Jobs;
 use gliff_transport::clipboard::{outbound_channel, Side, Transfers};
 use gliff_transport::Framed;
-use gliff_vk::{DmabufPlane, EncodedFrame, Encoder, EncoderSettings, Gpu};
+use gliff_vk::{EncodedFrame, Encoder, EncoderSettings, Gpu};
 
-use crate::rate::{cpu_rebuild_due, Ladder, LinkEstimator, RateController};
+use crate::encode::{EncodeThread, Encoded, EncoderSpec, VideoEncoder};
+use crate::rate::{Ladder, LinkEstimator, RateController};
 use crate::writer::Writer;
 use hypr_capture::{CaptureConfig, CaptureEvent, CaptureMode, CapturedFrame, Capturer, SizeLimit};
 use hypr_input::{Axis as InAxis, Clipboard, ClipboardEvent, Input, InputCmd, InputConfig};
@@ -105,10 +105,19 @@ where
         cfg.target.instance().context("find Hyprland instance"),
     )
     .await?;
-    let output = report_setup(&mut writer, setup_output(&instance, &cfg, &caps)).await?;
+    // Open the GPU while a headless setup waits for its output.
+    let opening = {
+        let (mode, capture, render_node) = (cfg.video, cfg.capture, cfg.render_node.clone());
+        tokio::task::spawn_blocking(move || VideoTier::open(mode, capture, &render_node))
+    };
+    let output = setup_output(&instance, &cfg, &caps);
+    // Join the open before any setup error returns, so it never outlives
+    // the session.
+    let video = opening.await.context("open the video pipeline");
+    let output = report_setup(&mut writer, output).await?;
     tracing::info!(output = %output.name, output.width, output.height, headless = output.is_headless(), "session output ready");
 
-    let video = VideoTier::open(cfg.video, cfg.capture, &cfg.render_node);
+    let video = report_setup(&mut writer, video).await?;
     let codec = Codec::H264;
     writer
         .write_msg(&ServerMsg::HelloAck {
@@ -245,6 +254,7 @@ where
         chroma,
         settings,
         encoder,
+        in_flight: None,
         pending: None,
         capture_asked: true,
         blocked_noted: false,
@@ -292,7 +302,7 @@ where
                 }
                 ControlFlow::Continue(())
             }
-            ev = cap_rx.recv() => session.on_capture(ev)?,
+            ev = cap_rx.recv() => session.on_capture(ev).await?,
             report = write_reports.recv() => {
                 let elapsed = report.context("writer task ended")??;
                 // A write that took longer than a frame interval means the
@@ -324,8 +334,13 @@ where
             // The guard must not test the deadline itself, or the arm would
             // disarm exactly while waiting for it.
             _ = tokio::time::sleep_until(tokio::time::Instant::from_std(session.next_send_at)),
-                if session.pending.is_some() && session.link_has_room() =>
+                if session.pending.is_some() && session.in_flight.is_none() && session.link_has_room() =>
             {
+                ControlFlow::Continue(())
+            }
+            // Last, so the other arms' borrows of `session` end first.
+            done = session.encoder.finished(), if session.in_flight.is_some() => {
+                session.finish_encode(done?)?;
                 ControlFlow::Continue(())
             }
         };
@@ -378,6 +393,17 @@ where
             .await;
     }
     step
+}
+
+/// Run a Hyprland IPC call on tokio's blocking pool. The reader and writer
+/// tasks keep running while the compositor answers (its socket times out
+/// after 5 s), though the awaiting `select!` arm still holds up the others.
+async fn ipc<T: Send + 'static>(
+    instance: &hypr_ipc::Instance,
+    call: impl FnOnce(&hypr_ipc::Instance) -> hypr_ipc::Result<T> + Send + 'static,
+) -> Result<T> {
+    let instance = instance.clone();
+    Ok(tokio::task::spawn_blocking(move || call(&instance)).await??)
 }
 
 /// What the reader task hands the session.
@@ -454,7 +480,10 @@ struct Session {
     codec: Codec,
     chroma: ChromaMode,
     settings: EncoderSettings,
-    encoder: VideoEncoder,
+    encoder: EncodeThread<VideoEncoder>,
+    /// The encode on the encoder thread. There is at most one: a second
+    /// would pin another capture ring slot and queue behind the first.
+    in_flight: Option<InFlight>,
     /// The newest captured frame not yet encoded.
     pending: Option<CapturedFrame>,
     capture_asked: bool,
@@ -494,6 +523,47 @@ struct Session {
     cursor_shape_id: u32,
 }
 
+/// What `finish_encode` needs from the dispatch of the frame in flight.
+struct InFlight {
+    /// When the frame went to the encoder thread. Pacing and the link's
+    /// send time run from here, not from the encode's completion.
+    t0: Instant,
+    stream: (u32, u32),
+    /// A refinement pass of the kept still frame.
+    refine: bool,
+    /// The frame waited on the byte cap before it was dispatched.
+    blocked: bool,
+}
+
+/// What a finished encode means for the session.
+enum Finished {
+    Send(EncodedFrame),
+    /// The output changed during the encode (a resize or mirror change).
+    /// The encoder has advanced past a frame the client never gets.
+    Stale,
+    /// The first GPU encode failed: move to the CPU tier.
+    FallBack(anyhow::Error),
+}
+
+impl Finished {
+    /// `first_gpu_encode` holds on the GPU tier until an encode succeeds. A
+    /// failure then falls back, even for a stale frame; a later failure
+    /// ends the session.
+    fn judge(
+        result: Result<EncodedFrame>,
+        first_gpu_encode: bool,
+        frame: (u32, u32),
+        output: (u32, u32),
+    ) -> Result<Self> {
+        match result {
+            Err(e) if first_gpu_encode => Ok(Self::FallBack(e)),
+            Err(e) => Err(e),
+            Ok(_) if frame != output => Ok(Self::Stale),
+            Ok(encoded) => Ok(Self::Send(encoded)),
+        }
+    }
+}
+
 /// The session-wide fps ceiling; ladder levels cap below it.
 const MAX_FPS: u32 = 60;
 /// Still-picture refinement: at most this many re-encodes of an unchanged
@@ -531,7 +601,10 @@ impl Session {
                     );
                     self.apply_rate();
                 }
-                if self.pending.is_none() && self.link.inflight_bytes() == 0 {
+                if self.pending.is_none()
+                    && self.in_flight.is_none()
+                    && self.link.inflight_bytes() == 0
+                {
                     self.ctl.note_idle(now);
                 }
                 let dual = self.base_chroma == ChromaMode::Dual420;
@@ -668,10 +741,7 @@ impl Session {
             return Ok(());
         }
         tracing::info!(width, height, scale, "resizing headless output");
-        if let Err(e) = self
-            .instance
-            .set_monitor_mode(&self.output.name, width, height, 60, scale)
-        {
+        if let Err(e) = self.set_mode(width, height, scale).await {
             tracing::warn!(error = %e, "could not resize the headless output");
             return Ok(());
         }
@@ -698,9 +768,7 @@ impl Session {
                 self.output.width = old_w;
                 self.output.height = old_h;
                 let s = self.output.scale;
-                self.instance
-                    .set_monitor_mode(&self.output.name, old_w, old_h, 60, s)
-                    .ok();
+                self.set_mode(old_w, old_h, s).await.ok();
                 self.wait_for_mode(old_w, old_h, s).await;
                 self.inject(self.output.logical_extent());
                 return Ok(());
@@ -748,7 +816,7 @@ impl Session {
         let mut seen = None;
         for _ in 0..10 {
             tokio::time::sleep(Duration::from_millis(50)).await;
-            let Ok(mons) = self.instance.monitors() else {
+            let Ok(mons) = ipc(&self.instance, |i| i.monitors()).await else {
                 continue;
             };
             if let Some(m) = mons
@@ -764,19 +832,23 @@ impl Session {
         seen.unwrap_or(scale)
     }
 
-    fn on_capture(&mut self, ev: Option<Incoming>) -> Result<ControlFlow<()>> {
+    async fn set_mode(&self, width: u32, height: u32, scale: f32) -> Result<()> {
+        let name = self.output.name.clone();
+        ipc(&self.instance, move |i| {
+            i.set_monitor_mode(&name, width, height, 60, scale)
+        })
+        .await
+    }
+
+    async fn on_capture(&mut self, ev: Option<Incoming>) -> Result<ControlFlow<()>> {
         match ev {
             Some(Incoming::Frame(image)) => {
-                if self.require_shm && !image.buffer.is_shm() {
-                    return Ok(ControlFlow::Continue(()));
-                }
                 let size = image.extent();
                 if !self.output.is_headless() && size != (self.output.width, self.output.height) {
                     self.output.width = size.0;
                     self.output.height = size.1;
-                    if let Some(monitor) = self
-                        .instance
-                        .monitors()?
+                    if let Some(monitor) = ipc(&self.instance, |i| i.monitors())
+                        .await?
                         .iter()
                         .find(|m| m.name == self.output.name)
                     {
@@ -793,6 +865,11 @@ impl Session {
                         self.want_keyframe = true;
                     }
                     tracing::info!(width = size.0, height = size.1, "mirrored output resized");
+                }
+                // Checked after the resize, whose finished encode can switch
+                // the capture to wl_shm.
+                if self.require_shm && !image.buffer.is_shm() {
+                    return Ok(ControlFlow::Continue(()));
                 }
                 self.pending = Some(image);
                 self.capture_asked = false;
@@ -840,8 +917,9 @@ impl Session {
         Ok(ControlFlow::Continue(()))
     }
 
-    /// Encode and queue the pending frame if the link has room and the pace
-    /// slot is due, then ask the capture thread for the next one.
+    /// Send the pending frame to the encoder thread if no encode is in
+    /// flight, the link has room and the pace slot is due, then ask the
+    /// capture thread for the next one, which overlaps the encode.
     fn pump_encoder(&mut self) -> Result<()> {
         let now = Instant::now();
         // Only a wait on the byte cap is congestion; count it once per
@@ -855,18 +933,13 @@ impl Session {
             self.ctl.note_blocked_at_cap();
             self.blocked_noted = true;
         }
-        if self.link_has_room() && now >= self.next_send_at {
+        if self.in_flight.is_none() && self.link_has_room() && now >= self.next_send_at {
             if let Some(frame) = self.pending.take() {
                 // A frame captured before a resize took effect is stale.
                 if self.matches_output(&frame) {
-                    if self.encode_and_send(&frame, false)?.is_none() {
-                        return Ok(());
-                    }
-                    // Keep the frame: an idle link refines the still picture
-                    // toward sharp, and a ladder step re-keyframes it at once.
-                    self.last_frame = Some(frame);
-                    self.refines = 0;
-                    self.next_refine_at = now + REFINE_EVERY;
+                    // This frame replaces the kept one; free its ring slot.
+                    self.last_frame = None;
+                    self.dispatch_encode(frame, false)?;
                 }
             } else if now >= self.next_refine_at && self.refines < MAX_REFINES {
                 if let Some(frame) = self.last_frame.take() {
@@ -874,19 +947,7 @@ impl Session {
                         // Re-encode the same buffer (import-cache hit) so a
                         // frame that arrived soft under a low budget
                         // converges to sharp while nothing changes on screen.
-                        let Some(bytes) = self.encode_and_send(&frame, true)? else {
-                            return Ok(());
-                        };
-                        self.refines += 1;
-                        self.next_refine_at = now + REFINE_EVERY;
-                        if (bytes as f64) < self.refined_done_bytes() {
-                            // Converged: keep the frame for ladder steps,
-                            // stop spending link on it.
-                            self.refines = MAX_REFINES;
-                        } else {
-                            tracing::debug!(bytes, n = self.refines, "refined still frame");
-                        }
-                        self.last_frame = Some(frame);
+                        self.dispatch_encode(frame, true)?;
                     }
                 }
             }
@@ -943,6 +1004,7 @@ impl Session {
 
     fn can_refine(&self) -> bool {
         self.pending.is_none()
+            && self.in_flight.is_none()
             && self.last_frame.is_some()
             && self.refines < MAX_REFINES
             && self.link_has_room()
@@ -1004,6 +1066,10 @@ impl Session {
     /// updates the rate without one. Returns false when the encoder
     /// rejected the geometry; the caller sends the StreamConfig on success.
     fn apply_stream_params(&mut self) -> Result<bool> {
+        // The frame in flight was coded under the current config, so it goes
+        // out (or, after a resize, is dropped) before a new StreamConfig. Its
+        // result can switch the tier.
+        self.finish_in_flight()?;
         self.update_fps_cmd();
         let level = self.ladder.level();
         let chroma = self.active_chroma();
@@ -1026,8 +1092,12 @@ impl Session {
             self.fps_cmd,
             self.ctl.vbv_ms(self.fps_cmd),
         );
-        match VideoEncoder::new(&self.video, &settings, chroma == ChromaMode::Dual420) {
-            Ok(encoder) => {
+        match self.encoder.rebuild(EncoderSpec {
+            video: self.video.clone(),
+            settings: settings.clone(),
+            dual: chroma == ChromaMode::Dual420,
+        }) {
+            Ok(()) => {
                 tracing::info!(
                     width = want.0,
                     height = want.1,
@@ -1036,7 +1106,6 @@ impl Session {
                     level = self.ladder.index(),
                     "stream reconfigured"
                 );
-                self.encoder = encoder;
                 self.settings = settings;
                 self.stream = want;
                 self.chroma = chroma;
@@ -1091,7 +1160,8 @@ impl Session {
 
     /// Refit the stream for CPU encoding and notify the client before its
     /// first CPU frame. Used both for a failed first GPU encode and when a
-    /// later capture-ring allocation falls back to shared memory.
+    /// later capture-ring allocation falls back to shared memory, each time
+    /// with no encode in flight.
     fn fall_back_to_cpu(&mut self) -> Result<()> {
         self.video = VideoTier::Cpu;
         self.encoder_max = stream_limit(gliff_sw::Encoder::MAX_SIZE, &self.caps)?;
@@ -1120,11 +1190,11 @@ impl Session {
             self.fps_cmd,
             self.ctl.vbv_ms(self.fps_cmd),
         );
-        self.encoder = VideoEncoder::new(
-            &self.video,
-            &self.settings,
-            self.chroma == ChromaMode::Dual420,
-        )?;
+        self.encoder.rebuild(EncoderSpec {
+            video: self.video.clone(),
+            settings: self.settings.clone(),
+            dual: self.chroma == ChromaMode::Dual420,
+        })?;
         self.encode_us = 0.0;
         self.want_keyframe = true;
         self.refines = 0;
@@ -1133,26 +1203,60 @@ impl Session {
         Ok(())
     }
 
-    /// Encode `frame` and queue it; returns the coded byte count.
-    /// `app_limited` marks a send that does not use the capacity we have
-    /// (a refinement pass), so it cannot lower the rate estimate.
-    fn encode_and_send(
-        &mut self,
-        frame: &CapturedFrame,
-        app_limited: bool,
-    ) -> Result<Option<usize>> {
+    /// Send `frame` to the encoder thread. `refine` marks a refinement pass,
+    /// a send that does not use the capacity we have, so it cannot lower
+    /// the rate estimate.
+    fn dispatch_encode(&mut self, frame: CapturedFrame, refine: bool) -> Result<()> {
         // A resize can make GBM allocation fail after GPU encoding has
         // already succeeded. Switch tiers before importing the shm frame.
         if frame.buffer.is_shm() && matches!(self.video, VideoTier::Gpu(_)) {
             tracing::warn!("capture fell back to wl_shm; falling back to the CPU pipeline");
             self.fall_back_to_cpu()?;
         }
-        let (width, height) = self.stream;
         let key = std::mem::take(&mut self.want_keyframe);
-        let t0 = Instant::now();
-        let encoded = match self.encoder.encode(frame, self.stream, key) {
-            Ok(e) => e,
-            Err(e) if matches!(self.video, VideoTier::Gpu(_)) && !self.gpu_encoded => {
+        self.in_flight = Some(InFlight {
+            t0: Instant::now(),
+            stream: self.stream,
+            refine,
+            blocked: std::mem::take(&mut self.blocked_noted),
+        });
+        self.encoder.encode(frame, self.stream, key);
+        Ok(())
+    }
+
+    /// Wait for the encode in flight, if any, and queue its frame.
+    fn finish_in_flight(&mut self) -> Result<()> {
+        if self.in_flight.is_some() {
+            let done = self
+                .encoder
+                .wait()?
+                .context("the encoder thread lost the frame in flight")?;
+            self.finish_encode(done)?;
+        }
+        Ok(())
+    }
+
+    /// Queue a finished encode for the client, and keep its frame for
+    /// still-picture refinement.
+    fn finish_encode(&mut self, done: Encoded<CapturedFrame>) -> Result<()> {
+        let Some(job) = self.in_flight.take() else {
+            return Ok(());
+        };
+        let first_gpu_encode = matches!(self.video, VideoTier::Gpu(_)) && !self.gpu_encoded;
+        let output = (self.output.width, self.output.height);
+        let encoded = match Finished::judge(
+            done.result,
+            first_gpu_encode,
+            done.frame.extent(),
+            output,
+        )? {
+            Finished::Send(encoded) => encoded,
+            Finished::Stale => {
+                self.gpu_encoded = true;
+                self.want_keyframe = true;
+                return Ok(());
+            }
+            Finished::FallBack(e) => {
                 tracing::warn!(error = %format!("{e:#}"), "the first GPU encode failed; falling back to the CPU pipeline");
                 self.fall_back_to_cpu()?;
                 // A tiled NVIDIA dmabuf cannot be read by the CPU. Replace
@@ -1165,12 +1269,12 @@ impl Session {
                 self.encode_us = 0.0;
                 self.capturer().use_shm()?;
                 self.capture_asked = true;
-                return Ok(None);
+                return Ok(());
             }
-            Err(e) => return Err(e),
         };
         self.gpu_encoded = true;
-        let enc_us = t0.elapsed().as_micros();
+        let (width, height) = job.stream;
+        let enc_us = done.took.as_micros();
         let aux = encoded.aux.unwrap_or_default();
         let msg = ServerMsg::VideoFrame {
             frame_id: self.frame_id,
@@ -1201,27 +1305,48 @@ impl Session {
         // samples may only raise the rate estimate.
         let now = Instant::now();
         let cap = self.link.cap_bytes(now, self.ctl.is_slow_start());
-        let app_limited = app_limited
-            || (!self.blocked_noted
+        let app_limited = job.refine
+            || (!job.blocked
                 && self.link.inflight_bytes() + total as u64 + self.link.est_frame_bytes() <= cap);
         self.writer.send(msg, vec![encoded.main, aux]);
         self.ctl.note_frame_sent(now);
-        self.link.on_sent(t0, self.frame_id, total, app_limited);
+        self.link.on_sent(job.t0, self.frame_id, total, app_limited);
         self.note_encode_time(enc_us as f64);
         // Pace from the encode start so a slow encode adds no extra wait;
         // after an idle gap or a stall the cadence restarts one interval
         // after this encode, so resuming never sends a burst.
         let interval = self.frame_interval();
-        self.next_send_at = (self.next_send_at + interval).max(t0 + interval);
-        self.blocked_noted = false;
+        self.next_send_at = (self.next_send_at + interval).max(job.t0 + interval);
         self.frame_id += 1;
-        Ok(Some(total))
+        self.next_refine_at = now + REFINE_EVERY;
+        if job.refine {
+            self.refines += 1;
+            if (total as f64) < self.refined_done_bytes() {
+                // Converged: keep the frame for ladder steps,
+                // stop spending link on it.
+                self.refines = MAX_REFINES;
+            } else {
+                tracing::debug!(bytes = total, n = self.refines, "refined still frame");
+            }
+        } else {
+            self.refines = 0;
+        }
+        // Keep the frame: an idle link refines the still picture toward
+        // sharp, and a ladder step re-keyframes it at once.
+        self.last_frame = Some(done.frame);
+        if self.want_keyframe {
+            // Asked for during the encode: the kept frame answers at once.
+            self.refines = 0;
+            self.next_refine_at = now;
+        }
+        Ok(())
     }
 }
 
 /// The selected video pipeline: Vulkan compute and VA-API on the GPU, or
 /// OpenH264 on the CPU for machines without them.
-enum VideoTier {
+#[derive(Clone)]
+pub(crate) enum VideoTier {
     Gpu(Arc<Gpu>),
     Cpu,
 }
@@ -1230,7 +1355,7 @@ impl VideoTier {
     /// Open the requested tier. In `Gpu` mode a machine without Vulkan
     /// compute or a VA-API H.264 encoder falls back to the CPU instead of
     /// failing; a GPU whose encoder cannot then be created falls back in
-    /// `VideoStart`, and one whose first encode fails in `encode_and_send`.
+    /// `VideoStart`, and one whose first encode fails in `finish_encode`.
     fn open(mode: VideoMode, capture: CaptureMode, render_node: &std::path::Path) -> Self {
         if mode == VideoMode::Cpu {
             tracing::info!("using the CPU video pipeline as requested");
@@ -1292,7 +1417,7 @@ struct VideoStart {
     encoder_max: (u32, u32),
     ctl: RateController,
     settings: EncoderSettings,
-    encoder: VideoEncoder,
+    encoder: EncodeThread<VideoEncoder>,
 }
 
 impl VideoStart {
@@ -1339,8 +1464,12 @@ impl VideoStart {
             fps,
             ctl.vbv_ms(fps),
         );
-        let encoder = VideoEncoder::new(&video, &settings, chroma == ChromaMode::Dual420)
-            .context("create encoder")?;
+        let encoder = EncodeThread::spawn(EncoderSpec {
+            video: video.clone(),
+            settings: settings.clone(),
+            dual: chroma == ChromaMode::Dual420,
+        })
+        .context("create encoder")?;
         Ok(Self {
             video,
             chroma,
@@ -1350,124 +1479,6 @@ impl VideoStart {
             settings,
             encoder,
         })
-    }
-}
-
-enum VideoEncoder {
-    Gpu(Box<Encoder>),
-    Cpu(Box<gliff_sw::Encoder>),
-}
-
-impl VideoEncoder {
-    fn new(tier: &VideoTier, settings: &EncoderSettings, dual: bool) -> Result<Self> {
-        match tier {
-            VideoTier::Gpu(gpu) => Ok(Self::Gpu(Box::new(Encoder::new(
-                gpu,
-                settings.clone(),
-                dual,
-            )?))),
-            VideoTier::Cpu => Ok(Self::Cpu(Box::new(gliff_sw::Encoder::new(
-                gliff_sw::EncoderSettings {
-                    width: settings.width,
-                    height: settings.height,
-                    bitrate: settings.bitrate,
-                    framerate: settings.framerate,
-                },
-                dual,
-            )?))),
-        }
-    }
-
-    /// Change the CBR target, the frame rate it is spread over, and (GPU
-    /// only) the rate-control buffer window, from the next frame on. The
-    /// CPU encoder has no VBV knob; OpenH264 manages its own buffer. It
-    /// also cannot change its rate live — every change re-creates the
-    /// encoders and costs a keyframe — so `cpu_rebuild_due` paces the
-    /// rebuilds: a congestion cut at once, other moves only when large and
-    /// at most every two seconds.
-    fn set_rate(&mut self, bitrate: u32, framerate: u32, vbv_ms: u32) {
-        match self {
-            Self::Gpu(enc) => enc.set_rate(bitrate, framerate, vbv_ms),
-            Self::Cpu(enc) => {
-                let s = enc.settings();
-                if cpu_rebuild_due(
-                    (s.bitrate, s.framerate),
-                    (bitrate, framerate),
-                    enc.rebuilt_at().elapsed(),
-                ) {
-                    enc.set_rate(bitrate, framerate);
-                }
-            }
-        }
-    }
-
-    /// Encode a captured frame at `stream` size: the GPU imports the dmabuf
-    /// and scales in its split shader; the CPU maps the buffer and scales
-    /// the pixels before converting.
-    fn encode(
-        &mut self,
-        frame: &CapturedFrame,
-        stream: (u32, u32),
-        force_keyframe: bool,
-    ) -> Result<EncodedFrame> {
-        match self {
-            Self::Gpu(enc) => {
-                anyhow::ensure!(
-                    !frame.buffer.is_shm(),
-                    "the GPU tier needs dmabuf capture, but capture fell back to wl_shm (no linear \
-                     dmabuf, no dmabuf global or no render node); run with --video cpu"
-                );
-                let info = &frame.buffer.info;
-                let fourcc = drm_fourcc::DrmFourcc::try_from(info.fourcc).map_err(|_| {
-                    anyhow::anyhow!("capture fourcc {:#x} is not a DRM format", info.fourcc)
-                })?;
-                let plane = DmabufPlane {
-                    fd: info.fd.as_fd(),
-                    width: info.width,
-                    height: info.height,
-                    offset: info.planes[0].offset,
-                    stride: info.planes[0].stride,
-                    fourcc,
-                    modifier: info.modifier,
-                };
-                // The import is cached per ring buffer; the generation changes
-                // when the ring is reallocated (resize), so old imports are
-                // never reused.
-                let buffer_key = (frame.buffer.generation << 32) | frame.buffer.index as u64;
-                Ok(enc.encode_dmabuf_transformed(
-                    buffer_key,
-                    &plane,
-                    frame.transform,
-                    force_keyframe,
-                )?)
-            }
-            Self::Cpu(enc) => {
-                let t0 = Instant::now();
-                let image = frame.read_bgra()?;
-                tracing::debug!(
-                    read_us = t0.elapsed().as_micros(),
-                    "read the captured frame"
-                );
-                let (w, h) = (stream.0 as usize, stream.1 as usize);
-                let pixels = if (image.width, image.height) == (w, h) {
-                    image.pixels
-                } else {
-                    gliff_proto::color::downscale_bgra(
-                        &image.pixels,
-                        image.width,
-                        image.height,
-                        w,
-                        h,
-                    )
-                };
-                let f = enc.encode_bgra(&pixels, force_keyframe)?;
-                Ok(EncodedFrame {
-                    main: f.main,
-                    aux: f.aux,
-                    keyframe: f.keyframe,
-                })
-            }
-        }
     }
 }
 
@@ -1534,11 +1545,13 @@ impl Drop for KeepAwake {
     }
 }
 
-// Runs before the fields drop, so held keys are released before the
-// capture thread ends, as the threads and output in `ServedOutput` go after.
+// Runs before the fields drop, so held keys are released and the encoder
+// thread ends before the capture thread, as the threads and output in
+// `ServedOutput` go after.
 impl Drop for Session {
     fn drop(&mut self) {
         self.inject(InputCmd::ReleaseAll);
+        self.encoder.stop();
     }
 }
 
@@ -2059,5 +2072,30 @@ mod tests {
         assert_eq!(headless_target(16384, 16384, 1.0), (2880, 2880));
         assert_eq!(headless_target(u32::MAX, u32::MAX, 1.5), (2880, 2880));
         assert_eq!(headless_target(8192, 4608, 1.25), (3840, 2160));
+    }
+
+    #[test]
+    fn a_frame_coded_across_a_resize_is_stale() {
+        let judge = |frame| {
+            let coded = Ok(EncodedFrame {
+                main: vec![1],
+                aux: None,
+                keyframe: false,
+            });
+            Finished::judge(coded, true, frame, (1280, 720)).unwrap()
+        };
+        assert!(matches!(judge((1920, 1080)), Finished::Stale));
+        assert!(matches!(judge((1280, 720)), Finished::Send(_)));
+    }
+
+    #[test]
+    fn only_a_failed_first_gpu_encode_falls_back() {
+        let failed = || Err(anyhow::anyhow!("encode failed"));
+        // The failure wins over a resize during the encode.
+        assert!(matches!(
+            Finished::judge(failed(), true, (1920, 1080), (1280, 720)),
+            Ok(Finished::FallBack(_))
+        ));
+        assert!(Finished::judge(failed(), false, (1280, 720), (1280, 720)).is_err());
     }
 }

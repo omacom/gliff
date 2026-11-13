@@ -20,8 +20,8 @@ pub struct Display {
 }
 
 // SAFETY: libva serialises the calls on one display behind its own lock,
-// and gliff drives each display from the thread that opened it; the Arc is
-// only for shared ownership by the surfaces.
+// and gliff drives each display from one thread at a time; the Arc is only
+// for shared ownership by the surfaces.
 unsafe impl Send for Display {}
 // SAFETY: as above.
 unsafe impl Sync for Display {}
