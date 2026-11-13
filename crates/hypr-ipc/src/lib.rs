@@ -188,6 +188,15 @@ impl Instance {
         )
     }
 
+    /// Put the cursor at a point of the layout, in logical coordinates.
+    pub fn move_cursor(&self, x: i32, y: i32) -> Result<()> {
+        self.dispatcher(
+            &format!("movecursor {x} {y}"),
+            &format!("hl.dsp.cursor.move({{ x = {x}, y = {y} }})"),
+            || true,
+        )
+    }
+
     pub fn get_option(&self, name: &str) -> Result<OptionValue> {
         self.request_json(&format!("getoption {name}"))
     }
@@ -389,6 +398,20 @@ mod tests {
             matches!(result, Err(Error::Command { response, .. }) if response == "monitor not found")
         );
         assert_eq!(commands, ["dispatch dpms on gliff-7"]);
+    }
+
+    #[test]
+    fn moves_the_cursor_with_either_config() {
+        let (result, commands) =
+            against_socket(&["error: lua syntax", "ok"], |i| i.move_cursor(12, -40));
+        assert!(result.is_ok());
+        assert_eq!(
+            commands,
+            [
+                "dispatch movecursor 12 -40",
+                "dispatch hl.dsp.cursor.move({ x = 12, y = -40 })",
+            ]
+        );
     }
 
     #[test]

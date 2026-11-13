@@ -5,6 +5,7 @@
 #![forbid(unsafe_code)]
 
 mod clipboard;
+mod control;
 mod notify;
 mod rate;
 mod session;
@@ -29,6 +30,12 @@ struct Cli {
     /// Serve over stdin/stdout (spawned by ssh). stdout carries the protocol.
     #[arg(long, conflicts_with = "listen")]
     stdio: bool,
+    /// Serve no picture, only this machine's keyboard and pointer, to a
+    /// `gliff --control` whose screens are on this side of this machine's:
+    /// `left`, `right`, `above` or `below`. The pointer moves on the screen
+    /// at that side.
+    #[arg(long, conflicts_with_all = ["output", "headless"], value_parser = ["left", "right", "above", "below"])]
+    control: Option<String>,
     /// Dev only: listen on a TCP address (no auth; localhost).
     #[arg(long)]
     listen: Option<String>,
@@ -107,6 +114,7 @@ fn main() -> Result<()> {
         capture: hypr_capture::CaptureMode::resolve(cli.capture.as_deref()),
     };
 
+    let control = cli.control.as_deref().and_then(hypr_edge::Side::parse);
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -123,21 +131,30 @@ fn main() -> Result<()> {
             tracing::info!(%peer, "client connected");
             stream.set_nodelay(true)?;
             let (rd, wr) = tokio::io::split(stream);
-            serve(rd, wr, cfg).await
+            serve(rd, wr, cfg, control).await
         } else {
             let rd = tokio::io::stdin();
             let wr = tokio::io::stdout();
-            serve(rd, wr, cfg).await
+            serve(rd, wr, cfg, control).await
         }
     })
 }
 
-async fn serve<R, W>(rd: R, wr: W, cfg: session::Config) -> Result<()>
+async fn serve<R, W>(
+    rd: R,
+    wr: W,
+    cfg: session::Config,
+    control: Option<hypr_edge::Side>,
+) -> Result<()>
 where
     R: AsyncRead + Unpin + 'static,
     W: AsyncWrite + Unpin + 'static,
 {
-    match session::run(rd, wr, cfg).await {
+    let served = match control {
+        Some(side) => control::run(rd, wr, cfg.target, side).await,
+        None => session::run(rd, wr, cfg).await,
+    };
+    match served {
         Ok(()) => Ok(()),
         Err(e) => {
             tracing::error!(error = %e, "session ended with error");
