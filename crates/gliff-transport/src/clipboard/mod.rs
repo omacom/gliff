@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use gliff_proto::clipboard::{Assembler, ChunkError, SendWindow, CHUNK, WINDOW};
-use gliff_proto::{ClipboardFile, ClipboardItem, ClipboardMsg};
+use gliff_proto::{AbortReason, ClipboardFile, ClipboardItem, ClipboardMsg};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, Notify};
 use tokio::task::AbortHandle;
@@ -56,6 +56,11 @@ pub enum Event {
 pub enum TransferError {
     #[error("the peer aborted the transfer")]
     Aborted,
+    /// The peer refused because the offer named is no longer current
+    /// ([`AbortReason::Stale`]) before any data arrived; a paste ends as
+    /// cancelled, not failed.
+    #[error("the offer was replaced")]
+    Stale,
     #[error("the peer went away")]
     PeerGone,
     #[error("no progress for {} s", IDLE_TIMEOUT.as_secs())]
@@ -76,6 +81,16 @@ pub trait ChunkSink {
 pub trait ChunkSource {
     fn next(&mut self) -> impl std::future::Future<Output = io::Result<Option<Bytes>>>;
 }
+
+/// The error a [`ChunkSource`] returns to refuse a serve because the offer it
+/// reads from is no longer current; the peer is told the offer is stale.
+pub fn stale_offer(why: &'static str) -> io::Error {
+    io::Error::other(StaleOffer(why))
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct StaleOffer(&'static str);
 
 /// Any `AsyncWrite` (a paste pipe, a spool file) as a sink.
 pub struct WriteSink<W>(pub W);
@@ -222,7 +237,7 @@ impl Transfers {
             ClipboardMsg::Request { id, serial, item } => {
                 if id % 2 == self.inner.borrow().our_parity() {
                     tracing::warn!(id, "clipboard request with our own id parity refused");
-                    self.send_later(ClipboardMsg::Abort { id });
+                    self.send_later(ClipboardMsg::Abort { id, reason: None });
                     return None;
                 }
                 return Some(Event::Request { id, serial, item });
@@ -251,10 +266,10 @@ impl Transfers {
                 };
                 if let Some(Err(e)) = acked {
                     tracing::warn!(id, error = %e, "bad clipboard ack");
-                    self.abort_outgoing(id);
+                    self.abort_outgoing(id, None);
                 }
             }
-            ClipboardMsg::Abort { id } => {
+            ClipboardMsg::Abort { id, reason } => {
                 let (outgoing, incoming) = {
                     let mut inner = self.inner.borrow_mut();
                     (inner.outgoing.remove(&id), inner.incoming.remove(&id))
@@ -263,7 +278,15 @@ impl Transfers {
                     o.task.abort();
                 }
                 if let Some(i) = incoming {
-                    let _ = i.chunks.try_send(Chunk::Fail(TransferError::Aborted));
+                    // Once bytes reached the sink, the paste is truncated
+                    // whatever the peer's reason, so it is a failure.
+                    let e = match reason {
+                        Some(AbortReason::Stale) if i.assembler.received == 0 => {
+                            TransferError::Stale
+                        }
+                        _ => TransferError::Aborted,
+                    };
+                    let _ = i.chunks.try_send(Chunk::Fail(e));
                 }
             }
         }
@@ -303,24 +326,24 @@ impl Transfers {
         let removed = self.inner.borrow_mut().incoming.remove(&id);
         if let Some(i) = removed {
             let _ = i.chunks.try_send(Chunk::Fail(e));
-            self.send_later(ClipboardMsg::Abort { id });
+            self.send_later(ClipboardMsg::Abort { id, reason: None });
         }
     }
 
-    fn abort_outgoing(&self, id: u32) {
+    fn abort_outgoing(&self, id: u32, reason: Option<AbortReason>) {
         let removed = self.inner.borrow_mut().outgoing.remove(&id);
         if let Some(o) = removed {
             o.task.abort();
-            self.send_later(ClipboardMsg::Abort { id });
+            self.send_later(ClipboardMsg::Abort { id, reason });
         }
     }
 
-    /// Abort every transfer we are serving and tell the peer, for when the
-    /// offer they came from is withdrawn.
+    /// Abort every transfer we are serving and tell the peer its offer is
+    /// stale, for when the offer they came from is withdrawn.
     pub fn abort_serving(&self) {
         let ids: Vec<u32> = self.inner.borrow().outgoing.keys().copied().collect();
         for id in ids {
-            self.abort_outgoing(id);
+            self.abort_outgoing(id, Some(AbortReason::Stale));
         }
     }
 
@@ -401,7 +424,17 @@ impl Transfers {
             if let Err(e) = result {
                 tracing::warn!(id, error = %e, "clipboard serve failed");
                 if still_ours {
-                    let _ = out.send((ClipboardMsg::Abort { id }, Bytes::new())).await;
+                    let reason = match &e {
+                        TransferError::Io(e)
+                            if e.get_ref().is_some_and(|e| e.is::<StaleOffer>()) =>
+                        {
+                            Some(AbortReason::Stale)
+                        }
+                        _ => None,
+                    };
+                    let _ = out
+                        .send((ClipboardMsg::Abort { id, reason }, Bytes::new()))
+                        .await;
                 }
             }
         })
@@ -424,7 +457,16 @@ impl Transfers {
 
     /// Decline the peer's request `id`.
     pub fn refuse(&self, id: u32) {
-        self.send_later(ClipboardMsg::Abort { id });
+        self.send_later(ClipboardMsg::Abort { id, reason: None });
+    }
+
+    /// Decline the peer's request `id` because the offer it names is no
+    /// longer ours to serve, so the peer ends its paste quietly.
+    pub fn refuse_stale(&self, id: u32) {
+        self.send_later(ClipboardMsg::Abort {
+            id,
+            reason: Some(AbortReason::Stale),
+        });
     }
 
     /// Send the peer a message, e.g. an offer.
@@ -533,8 +575,10 @@ impl Drop for FetchGuard {
             .remove(&self.id)
             .is_some();
         if removed {
-            self.transfers
-                .send_later(ClipboardMsg::Abort { id: self.id });
+            self.transfers.send_later(ClipboardMsg::Abort {
+                id: self.id,
+                reason: None,
+            });
         }
     }
 }
@@ -724,7 +768,16 @@ mod tests {
             let sent = tokio::time::timeout(Duration::from_millis(200), b_rx.recv())
                 .await
                 .unwrap();
-            assert!(matches!(sent, Some((ClipboardMsg::Abort { id: 2 }, _))));
+            assert!(matches!(
+                sent,
+                Some((
+                    ClipboardMsg::Abort {
+                        id: 2,
+                        reason: None
+                    },
+                    _
+                ))
+            ));
         });
     }
 
@@ -752,6 +805,159 @@ mod tests {
                 .await;
             assert!(matches!(r, Err(TransferError::Aborted)), "{r:?}");
             assert!(a.inner.borrow().incoming.is_empty());
+        });
+    }
+
+    #[test]
+    fn a_stale_refusal_ends_the_paste_quietly() {
+        run(async {
+            tokio::time::pause();
+            let (a, b, _ae, be) = pair();
+            let reports = Rc::new(RefCell::new(Vec::new()));
+            let r = reports.clone();
+            let jobs = progress::Jobs::new(move |_, p| r.borrow_mut().push(p));
+            for stale in [true, false] {
+                let (b, be) = (b.clone(), be.clone());
+                tokio::task::spawn_local(async move {
+                    loop {
+                        let req = be.borrow_mut().pop();
+                        if let Some(Event::Request { id, .. }) = req {
+                            if stale {
+                                b.refuse_stale(id);
+                            } else {
+                                b.refuse(id);
+                            }
+                            return;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                });
+                let a = a.clone();
+                // Asserted out here: a panic inside the job's task is lost.
+                let fetched = Rc::new(RefCell::new(None));
+                let f = fetched.clone();
+                jobs.run("text".into(), None, |_| async move {
+                    let r = a
+                        .fetch(
+                            ClipboardItem::Mime("x".into()),
+                            0,
+                            MemorySink::default(),
+                            None,
+                        )
+                        .await;
+                    *f.borrow_mut() = Some(match &r {
+                        Err(TransferError::Stale) => "stale",
+                        Err(TransferError::Aborted) => "aborted",
+                        _ => "other",
+                    });
+                    r.map(|_| ())
+                });
+                tokio::time::sleep(progress::QUIET * 2).await;
+                let expected = if stale { "stale" } else { "aborted" };
+                assert_eq!(*fetched.borrow(), Some(expected));
+                let got: Vec<_> = reports.borrow_mut().drain(..).map(|p| p.state).collect();
+                if stale {
+                    assert!(got.is_empty(), "{got:?}");
+                } else {
+                    // A bare Abort, all an older peer sends, is still a failure.
+                    assert!(
+                        matches!(got.as_slice(), [progress::State::Failed(_)]),
+                        "{got:?}"
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn a_stale_abort_after_data_is_a_failure() {
+        run(async {
+            let (a, b, _ae, be) = pair();
+            let reports = Rc::new(RefCell::new(Vec::new()));
+            let r = reports.clone();
+            let jobs = progress::Jobs::new(move |_, p| r.borrow_mut().push(p));
+            // The source hands over one chunk and then stays open.
+            let (tx, source) = mpsc::channel::<io::Result<Bytes>>(1);
+            tx.send(Ok(Bytes::from(vec![1u8; CHUNK]))).await.unwrap();
+            let fetched = Rc::new(RefCell::new(None));
+            let f = fetched.clone();
+            let a2 = a.clone();
+            jobs.run("PNG image".into(), None, |_| async move {
+                let r = a2
+                    .fetch(
+                        ClipboardItem::Mime("image/png".into()),
+                        0,
+                        MemorySink::default(),
+                        None,
+                    )
+                    .await;
+                *f.borrow_mut() = Some(matches!(r, Err(TransferError::Aborted)));
+                r.map(|_| ())
+            });
+            let id = loop {
+                if let Some(Event::Request { id, .. }) = be.borrow_mut().pop() {
+                    break id;
+                }
+                tokio::task::yield_now().await;
+            };
+            b.serve(id, source);
+            while a
+                .inner
+                .borrow()
+                .incoming
+                .get(&id)
+                .is_none_or(|i| i.assembler.received == 0)
+            {
+                tokio::task::yield_now().await;
+            }
+            // The offer is revoked mid-paste: the sink already holds part of
+            // the item, so the paste must fail, not end quietly.
+            b.abort_serving();
+            for _ in 0..20 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(*fetched.borrow(), Some(true));
+            let got: Vec<_> = reports.borrow_mut().drain(..).map(|p| p.state).collect();
+            assert!(
+                matches!(got.as_slice(), [progress::State::Failed(_)]),
+                "{got:?}"
+            );
+            drop(tx);
+        });
+    }
+
+    #[test]
+    fn a_serve_cut_for_a_stale_offer_says_so() {
+        run(async {
+            let (out, mut rx) = outbound_channel();
+            let t = Transfers::new(out, Side::Client);
+            let aborted = |rx: &mut mpsc::Receiver<(ClipboardMsg, Bytes)>| {
+                let next = rx.try_recv();
+                match next {
+                    Ok((ClipboardMsg::Abort { id, reason }, _)) => (id, reason),
+                    other => panic!("expected an abort, got {other:?}"),
+                }
+            };
+            // The source refuses the serve itself, as a stale or a failed read.
+            for (id, error, reason) in [
+                (2, stale_offer("withdrawn"), Some(AbortReason::Stale)),
+                (4, io::Error::other("broken"), None),
+            ] {
+                let (tx, source) = mpsc::channel::<io::Result<Bytes>>(1);
+                tx.send(Err(error)).await.unwrap();
+                t.serve(id, source);
+                for _ in 0..5 {
+                    tokio::task::yield_now().await;
+                }
+                assert_eq!(aborted(&mut rx), (id, reason));
+            }
+            // A revocation cuts a serve in flight as stale.
+            let (_tx, source) = mpsc::channel::<io::Result<Bytes>>(1);
+            t.serve(6, source);
+            tokio::task::yield_now().await;
+            t.abort_serving();
+            tokio::task::yield_now().await;
+            assert_eq!(aborted(&mut rx), (6, Some(AbortReason::Stale)));
         });
     }
 

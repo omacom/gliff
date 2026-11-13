@@ -773,7 +773,7 @@ fn serve_test(node: &std::path::Path, addr: &str, frames: usize, video: VideoMod
                         ClipboardItem::Mime(m) if m == OCTET => send_file.clone().unwrap_or_default(),
                         ClipboardItem::Mime(m) if is_text_mime(m) => send_clip.clone().unwrap_or_default().into_bytes(),
                         ClipboardItem::File(_) if send_files.path_for(&item).is_some() => std::fs::read(send_files.path_for(&item).unwrap())?,
-                        _ => { writer.write_msg(&ClientMsg::ClipboardAbort { id }).await?; continue; }
+                        _ => { writer.write_msg(&ClientMsg::ClipboardAbort { id, reason: None }).await?; continue; }
                     };
                     eprintln!("  serving {} bytes for {item:?}", bytes.len());
                     serving = Some((id, bytes, 0, 0));
