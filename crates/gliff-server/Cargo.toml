@@ -22,6 +22,7 @@ gliff-sw.workspace = true
 drm-fourcc.workspace = true
 hypr-capture.workspace = true
 hypr-input.workspace = true
+hypr-edge.workspace = true
 hypr-ipc.workspace = true
 hypr-wl.workspace = true
 dbus = "0.9"
