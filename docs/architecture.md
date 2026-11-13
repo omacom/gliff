@@ -82,6 +82,15 @@ Every crate with `unsafe` documents the safety requirements at each block.
   break those rules cannot absorb; the rules are at the top of
   `crates/gliff-proto/src/msg.rs`.
 
+- **Ending a session.** A dropped link or a `ServerMsg::Error` such as
+  `ERROR_SETUP` (256) makes the client reconnect; codes 1 to 255 mean the
+  two ends cannot work together, so it stops. SIGTERM or SIGINT on
+  `gliff-server` sends `ERROR_ENDED_BY_HOST` (257), waits up to 500 ms for
+  it to be written, tears the session down in order (held keys released, a
+  headless output removed) and exits 0. The client then leaves that tab
+  disconnected until it is clicked. Clients that predate code 257 reconnect
+  as they would after any other error.
+
 - **Why not UDP.** Measured on 2026-09-14 between two Wi-Fi machines over
   Tailscale's direct path (MTU 1280, 330-380 Mbit/s of SSH throughput, RTT
   3-12 ms with contention spikes): a 1856x1238 Dual420 mirror ran at 58 fps

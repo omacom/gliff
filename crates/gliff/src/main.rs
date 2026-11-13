@@ -1448,6 +1448,18 @@ fn poll_status(ui: Rc<App>, s: Rc<Session>, rx: Receiver<Status>, generation: u6
                     s.gave_up.set(true);
                     return glib::ControlFlow::Break;
                 }
+                Status::EndedByHost(message) => {
+                    s.last_error.borrow_mut().take();
+                    tracing::info!(machine = %s.name, %message, "session ended by the host");
+                    set_status(
+                        &ui,
+                        &s,
+                        "Disconnected by the host. Click the tab to reconnect.",
+                    );
+                    show_disconnected(&ui, &s);
+                    s.gave_up.set(true);
+                    return glib::ControlFlow::Break;
+                }
                 Status::Closed => {
                     show_disconnected(&ui, &s);
                     schedule_reconnect(ui.clone(), s.clone(), generation, None);

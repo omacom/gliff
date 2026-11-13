@@ -14,7 +14,7 @@ use bytes::Bytes;
 use gliff_proto::clipboard::CHUNK;
 use gliff_proto::{
     features, is_incompatible, version_mismatch, ChromaMode, ClientCaps, ClientMsg, ClipboardFile,
-    ClipboardMsg, Codec, ServerMsg, VideoPipeline, PROTOCOL_VERSION,
+    ClipboardMsg, Codec, ServerMsg, VideoPipeline, ERROR_ENDED_BY_HOST, PROTOCOL_VERSION,
 };
 use gliff_sw::VideoMode;
 use gliff_transport::clipboard::progress::Progress;
@@ -108,12 +108,38 @@ pub enum Status {
     /// The two ends speak different protocol versions, so retrying cannot
     /// help.
     Incompatible(String),
+    /// The host ended the session on purpose, so it is not reconnected.
+    EndedByHost(String),
     Closed,
 }
 
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
 struct Incompatible(String);
+
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct EndedByHost(String);
+
+fn server_error(code: u16, message: String) -> anyhow::Error {
+    if is_incompatible(code) {
+        Incompatible(message).into()
+    } else if code == ERROR_ENDED_BY_HOST {
+        EndedByHost(message).into()
+    } else {
+        anyhow::anyhow!("server error {code}: {message}")
+    }
+}
+
+fn error_status(e: anyhow::Error) -> Status {
+    e.downcast::<Incompatible>()
+        .map(|Incompatible(message)| Status::Incompatible(message))
+        .or_else(|e| {
+            e.downcast::<EndedByHost>()
+                .map(|EndedByHost(message)| Status::EndedByHost(message))
+        })
+        .unwrap_or_else(|e| Status::Error(e.to_string()))
+}
 
 /// A remote cursor image: `argb` holds `width` x `height` BGRA pixels.
 pub struct CursorShape {
@@ -359,10 +385,7 @@ impl Worker {
             }
         });
         if let Err(e) = result {
-            let _ = status.send(match e.downcast::<Incompatible>() {
-                Ok(Incompatible(message)) => Status::Incompatible(message),
-                Err(e) => Status::Error(e.to_string()),
-            });
+            let _ = status.send(error_status(e));
         } else {
             let _ = status.send(Status::Closed);
         }
@@ -524,12 +547,7 @@ where
                 )?;
                 break (cfg, pipeline);
             }
-            ServerMsg::Error { code, message, .. } if is_incompatible(code) => {
-                return Err(Incompatible(message).into())
-            }
-            ServerMsg::Error { code, message, .. } => {
-                anyhow::bail!("server error {code}: {message}")
-            }
+            ServerMsg::Error { code, message, .. } => return Err(server_error(code, message)),
             other => anyhow::bail!("unexpected message before StreamConfig: {other:?}"),
         }
     };
@@ -893,12 +911,7 @@ where
                 let _ = out_tx.send((ClientMsg::Pong { t }, Bytes::new()));
             }
             ServerMsg::CursorPos { .. } | ServerMsg::Pong { .. } => {}
-            ServerMsg::Error { code, message, .. } if is_incompatible(code) => {
-                return Err(Incompatible(message).into())
-            }
-            ServerMsg::Error { code, message, .. } => {
-                anyhow::bail!("server error {code}: {message}")
-            }
+            ServerMsg::Error { code, message, .. } => return Err(server_error(code, message)),
             ServerMsg::HelloAck { .. } => {}
             other => {
                 if let Ok(clip) = other.into_clipboard() {
@@ -1235,7 +1248,7 @@ mod stream_tests {
 #[cfg(test)]
 mod session_tests {
     use super::*;
-    use gliff_proto::SessionInfo;
+    use gliff_proto::{SessionInfo, ERROR_SETUP, ERROR_VERSION};
     use std::future::Future;
     use std::sync::mpsc::Receiver;
     use std::time::Duration;
@@ -1567,5 +1580,13 @@ mod session_tests {
             assert_eq!((latest.width, latest.argb.len()), (24, 24 * 8 * 4));
         })
         .unwrap();
+    }
+
+    #[test]
+    fn server_error_codes_map_to_statuses() {
+        let status = |code| error_status(server_error(code, "m".into()));
+        assert!(matches!(status(ERROR_VERSION), Status::Incompatible(m) if m == "m"));
+        assert!(matches!(status(ERROR_ENDED_BY_HOST), Status::EndedByHost(m) if m == "m"));
+        assert!(matches!(status(ERROR_SETUP), Status::Error(m) if m == "server error 256: m"));
     }
 }
