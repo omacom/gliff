@@ -40,6 +40,11 @@ pub fn features() -> Vec<String> {
     FEATURES.iter().map(|f| f.to_string()).collect()
 }
 
+/// Listed by a `gliff-server --control` that takes
+/// [`ClientMsg::KeyboardLocks`]. Not in [`FEATURES`]: a video session does
+/// not take it.
+pub const FEATURE_KEYBOARD_LOCKS: &str = "keyboard-locks";
+
 /// `ServerMsg::Error` codes. Codes 1 to 255 mean the two ends cannot work
 /// together, so reconnecting would fail the same way; a new code in that
 /// range is fatal even to clients that predate it.
@@ -298,6 +303,17 @@ pub enum ClientMsg {
     Pong {
         #[n(0)]
         t: u64,
+    },
+    /// The client's locked keyboard state, so keys typed on the server's
+    /// keyboard use the same layout and locks (Caps Lock, Num Lock): the
+    /// layout index in the keymap sent, and the locked modifiers by name.
+    /// Only to a server that listed [`FEATURE_KEYBOARD_LOCKS`].
+    #[n(17)]
+    KeyboardLocks {
+        #[n(0)]
+        layout: u32,
+        #[n(1)]
+        locked: Vec<String>,
     },
 }
 
