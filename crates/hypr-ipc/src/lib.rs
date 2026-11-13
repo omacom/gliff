@@ -213,7 +213,7 @@ impl Instance {
     ) -> Result<()> {
         let keyword = format!("keyword monitor {name},{width}x{height}@{hz},auto,{scale}");
         match self.dispatch(&keyword) {
-            Err(Error::Command { response, .. }) if response.contains("non-legacy") => {
+            Err(Error::Command { response, .. }) if keywords_rejected(&response) => {
                 self.dispatch(&format!(
                     "eval hl.monitor({{ output = \"{name}\", mode = \"{width}x{height}@{hz}\", position = \"auto\", scale = {scale} }})"
                 ))
@@ -221,6 +221,13 @@ impl Instance {
             other => other,
         }
     }
+}
+
+/// Whether Hyprland turned a `keyword` request down because the config is
+/// Lua: older releases say the keyword is for a non-legacy config, 0.57
+/// and later no longer know the request at all.
+fn keywords_rejected(response: &str) -> bool {
+    response.contains("non-legacy") || response == "unknown request"
 }
 
 /// Round a mode down until `scale` divides it into whole logical pixels.
@@ -303,6 +310,15 @@ impl OptionValue {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lua_configs_reject_keywords_in_either_wording() {
+        assert!(keywords_rejected(
+            "keyword is not available in a non-legacy config"
+        ));
+        assert!(keywords_rejected("unknown request"));
+        assert!(!keywords_rejected("invalid monitor rule"));
+    }
 
     #[test]
     fn discovers_newest_live_instance() {
