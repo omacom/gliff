@@ -19,7 +19,7 @@ use gliff_proto::{
 use gliff_sw::VideoMode;
 use gliff_transport::clipboard::progress::Progress;
 use gliff_transport::clipboard::{outbound_channel, Side, Transfers};
-use gliff_transport::{spawn_ssh, Framed, SshTarget};
+use gliff_transport::{spawn_ssh, Framed, SshFailure, SshTarget};
 use gliff_vk::{Decoder, DisplayFrame, Gpu};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc::{self, unbounded_channel, UnboundedReceiver};
@@ -105,6 +105,9 @@ pub enum Status {
         progress: Progress,
     },
     Error(String),
+    /// ssh could not log in, so retrying cannot help, and each attempt
+    /// counts against this client at the remote sshd.
+    Denied(String),
     /// The two ends speak different protocol versions, so retrying cannot
     /// help.
     Incompatible(String),
@@ -344,8 +347,8 @@ impl Worker {
                     .await
                 }
                 Endpoint::Ssh(ref target) => {
-                    let ssh = spawn_ssh(target)?;
-                    session(
+                    let mut ssh = spawn_ssh(target)?;
+                    let ended = session(
                         ssh.stdout,
                         ssh.stdin,
                         self.video,
@@ -354,18 +357,33 @@ impl Worker {
                         self.input,
                         self.keymap,
                     )
-                    .await
+                    .await;
+                    // When ssh itself gave up, the session only saw its
+                    // pipe close. ssh's last line says why.
+                    match (ended, ssh.stderr.failure(&mut ssh.child).await) {
+                        (Err(e), _) if e.is::<Incompatible>() => Err(e),
+                        (_, Some(failure)) => Err(failure.into()),
+                        (ended, None) => ended,
+                    }
                 }
             }
         });
-        if let Err(e) = result {
-            let _ = status.send(match e.downcast::<Incompatible>() {
-                Ok(Incompatible(message)) => Status::Incompatible(message),
-                Err(e) => Status::Error(e.to_string()),
-            });
-        } else {
-            let _ = status.send(Status::Closed);
-        }
+        let _ = status.send(match result {
+            Ok(()) => Status::Closed,
+            Err(e) => failed_status(e),
+        });
+    }
+}
+
+/// The status for a connection that ended on `e`.
+fn failed_status(e: anyhow::Error) -> Status {
+    match e.downcast::<Incompatible>() {
+        Ok(Incompatible(message)) => Status::Incompatible(message),
+        Err(e) => match e.downcast::<SshFailure>() {
+            Ok(failure) if failure.denied => Status::Denied(failure.message),
+            Ok(failure) => Status::Error(failure.message),
+            Err(e) => Status::Error(e.to_string()),
+        },
     }
 }
 
@@ -994,6 +1012,34 @@ fn cursor_payload_fits(width: u32, height: u32, argb_len: u32) -> bool {
 #[cfg(test)]
 mod stream_tests {
     use super::*;
+    #[test]
+    fn a_refused_ssh_login_is_not_an_error_to_retry() {
+        let failure = |message: &str, denied| {
+            anyhow::Error::from(SshFailure {
+                message: message.into(),
+                denied,
+            })
+        };
+        let denied = "user@host: Permission denied (publickey).";
+        assert!(matches!(
+            failed_status(failure(denied, true)),
+            Status::Denied(message) if message == denied
+        ));
+        let refused = "ssh: connect to host desk port 22: Connection refused";
+        assert!(matches!(
+            failed_status(failure(refused, false)),
+            Status::Error(message) if message == refused
+        ));
+        assert!(matches!(
+            failed_status(Incompatible("update gliff".into()).into()),
+            Status::Incompatible(_)
+        ));
+        assert!(matches!(
+            failed_status(anyhow::anyhow!("io: Broken pipe (os error 32)")),
+            Status::Error(message) if message == "io: Broken pipe (os error 32)"
+        ));
+    }
+
     #[test]
     fn reject_invalid_stream_geometry_before_creating_a_decoder() {
         for size in [

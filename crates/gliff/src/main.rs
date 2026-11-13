@@ -1440,6 +1440,14 @@ fn poll_status(ui: Rc<App>, s: Rc<Session>, rx: Receiver<Status>, generation: u6
                     schedule_reconnect(ui.clone(), s.clone(), generation, Some(&e));
                     return glib::ControlFlow::Break;
                 }
+                Status::Denied(e) => {
+                    tracing::error!(machine = %s.name, error = %e, "ssh login refused");
+                    set_status(&ui, &s, &reconnect_status(Some(&e), MAX_RETRIES + 1));
+                    *s.last_error.borrow_mut() = Some(e);
+                    show_disconnected(&ui, &s);
+                    s.gave_up.set(true);
+                    return glib::ControlFlow::Break;
+                }
                 Status::Incompatible(message) => {
                     *s.last_error.borrow_mut() = Some(message.clone());
                     tracing::error!(machine = %s.name, error = %message, "incompatible server");
