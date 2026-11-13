@@ -762,6 +762,8 @@ dependencies = [
  "hypr-input",
  "hypr-ipc",
  "hypr-wl",
+ "rustix 1.1.4",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
