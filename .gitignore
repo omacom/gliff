@@ -4,3 +4,4 @@ target/
 /pkgbuild/pkg/
 /pkgbuild/src/
 *.pkg.tar.zst
+__pycache__/
