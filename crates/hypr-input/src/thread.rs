@@ -247,6 +247,20 @@ impl State {
         self.pointer.frame();
     }
 
+    fn release_held(&mut self) {
+        let t = now_ms();
+        for code in std::mem::take(&mut self.pressed_keys) {
+            self.keyboard.key(t, code, 0);
+            if let Some((dep, lat, lock, group)) = self.keys.update(code, false) {
+                self.keyboard.modifiers(dep, lat, lock, group);
+            }
+        }
+        for b in std::mem::take(&mut self.pressed_buttons) {
+            self.pointer.button(t, b, wl_pointer::ButtonState::Released);
+        }
+        self.pointer.frame();
+    }
+
     /// A `wl_output` burst for the bound output finished. Hyprland (0.56,
     /// and current main) silently stops delivering a bound virtual pointer's
     /// motion after the output's mode changes — the pointer stays frozen
@@ -389,6 +403,7 @@ impl LoopState for State {
             },
             InputCmd::SetExtent { width, height } => self.binding.set_extent(width, height),
             InputCmd::ReleaseAll => self.release_all(),
+            InputCmd::ReleaseHeld => self.release_held(),
             InputCmd::Stop => self.stop(),
         }
         let _ = self.conn.flush();
@@ -453,7 +468,7 @@ mod tests {
     use super::*;
     use std::io::Read;
     use std::os::unix::net::UnixStream;
-    use wayland_client::Proxy;
+    use wayland_client::{EventQueue, Proxy};
 
     struct Registry;
     impl Dispatch<WlRegistry, ()> for Registry {
@@ -468,9 +483,10 @@ mod tests {
         }
     }
 
-    // Decode the actual outgoing Wayland key requests, including their device
-    // IDs. No compositor is needed: the socket peer records requests only.
-    fn key_requests(peer: &mut UnixStream) -> Vec<(u32, u32, bool)> {
+    // Decode the actual outgoing Wayland requests as (object ID, opcode,
+    // arguments). No compositor is needed: the socket peer records requests
+    // only.
+    fn requests(peer: &mut UnixStream) -> Vec<(u32, u32, Vec<u32>)> {
         let mut bytes = Vec::new();
         let mut buf = [0; 4096];
         loop {
@@ -481,7 +497,7 @@ mod tests {
                 Err(e) => panic!("read Wayland requests: {e}"),
             }
         }
-        let mut keys = Vec::new();
+        let mut out = Vec::new();
         let mut at = 0;
         while at < bytes.len() {
             let word = |offset| u32::from_ne_bytes(bytes[offset..offset + 4].try_into().unwrap());
@@ -489,17 +505,25 @@ mod tests {
             let header = word(at + 4);
             let size = (header >> 16) as usize;
             assert!(size >= 8 && at + size <= bytes.len());
-            if header & 0xffff == 1 && size == 20 {
-                keys.push((id, word(at + 12), word(at + 16) != 0));
-            }
+            let args = (at + 8..at + size).step_by(4).map(word).collect();
+            out.push((id, header & 0xffff, args));
             at += size;
         }
-        keys
+        out
     }
 
-    #[test]
-    fn held_keys_move_to_the_replacement_keyboard() {
-        let (socket, mut peer) = UnixStream::pair().unwrap();
+    // The virtual keyboard's key requests, including their device IDs.
+    fn key_requests(peer: &mut UnixStream) -> Vec<(u32, u32, bool)> {
+        requests(peer)
+            .into_iter()
+            .filter(|(_, opcode, args)| *opcode == 1 && args.len() == 3)
+            .map(|(id, _, args)| (id, args[1], args[2] != 0))
+            .collect()
+    }
+
+    // An input thread state over a socket whose peer records the requests.
+    fn recorded_state() -> (State, UnixStream, EventQueue<State>) {
+        let (socket, peer) = UnixStream::pair().unwrap();
         peer.set_nonblocking(true).unwrap();
         let conn = Connection::from_socket(socket).unwrap();
         let registry_queue = conn.new_event_queue::<Registry>();
@@ -510,7 +534,6 @@ mod tests {
         let seat_proxy: WlSeat = registry.bind(2, 1, &qh, ());
         let ptr_mgr: ZwlrVirtualPointerManagerV1 = registry.bind(3, 2, &qh, ());
         let keyboard = kb_mgr.create_virtual_keyboard(&seat_proxy, &qh, ());
-        let old_id = keyboard.id().protocol_id();
         let mut state = State {
             sink: Box::new(|_| {}),
             conn: conn.clone(),
@@ -532,6 +555,14 @@ mod tests {
             quit: false,
         };
         state.upload_keymap().unwrap();
+        (state, peer, queue)
+    }
+
+    #[test]
+    fn held_keys_move_to_the_replacement_keyboard() {
+        let (mut state, mut peer, _queue) = recorded_state();
+        let conn = state.conn.clone();
+        let old_id = state.keyboard.id().protocol_id();
         state.on_cmd(InputCmd::Key {
             code: 42,
             pressed: true,
@@ -575,6 +606,44 @@ mod tests {
         conn.flush().unwrap();
         assert!(key_requests(&mut peer).is_empty());
         assert!(state.retired.is_empty());
+    }
+
+    #[test]
+    fn releasing_held_input_keeps_caps_lock() {
+        let (mut state, mut peer, _queue) = recorded_state();
+        let keyboard = state.keyboard.id().protocol_id();
+        let pointer = state.pointer.id().protocol_id();
+        // Caps Lock on, then Shift and the left button held.
+        for (code, pressed) in [(58, true), (58, false), (42, true)] {
+            state.on_cmd(InputCmd::Key { code, pressed });
+        }
+        state.on_cmd(InputCmd::Button {
+            button: 272,
+            pressed: true,
+        });
+        requests(&mut peer);
+        state.on_cmd(InputCmd::ReleaseHeld);
+        let sent = requests(&mut peer);
+        let keys: Vec<_> = sent
+            .iter()
+            .filter(|(id, opcode, _)| *id == keyboard && *opcode == 1)
+            .map(|(_, _, args)| (args[1], args[2]))
+            .collect();
+        assert_eq!(keys, [(42, 0)]);
+        let mods = sent
+            .iter()
+            .rfind(|(id, opcode, _)| *id == keyboard && *opcode == 2)
+            .map(|(_, _, args)| args.clone());
+        // Nothing depressed, Lock (mod index 1) still locked, layout 0.
+        assert_eq!(mods, Some(vec![0, 0, 1 << 1, 0]));
+        let buttons: Vec<_> = sent
+            .iter()
+            .filter(|(id, opcode, _)| *id == pointer && *opcode == 2)
+            .map(|(_, _, args)| (args[1], args[2]))
+            .collect();
+        assert_eq!(buttons, [(272, 0)]);
+        assert!(state.pressed_keys.is_empty());
+        assert!(state.pressed_buttons.is_empty());
     }
 
     // 2560x1440 at scale 1.25 has a logical size of 2048x1152, which only

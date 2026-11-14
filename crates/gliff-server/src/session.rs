@@ -1,8 +1,10 @@
 //! One client session: output setup, the capture/encode/send loop, and input.
 
+use std::cell::RefCell;
 use std::ops::{ControlFlow, Deref, DerefMut};
 use std::os::fd::AsFd;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -23,6 +25,7 @@ use gliff_transport::clipboard::{outbound_channel, Side, Transfers};
 use gliff_transport::Framed;
 use gliff_vk::{DmabufPlane, EncodedFrame, Encoder, EncoderSettings, Gpu};
 
+use crate::heartbeat::{Effect, Heartbeat, GRACE_HEADLESS, GRACE_MIRROR, PING_EVERY};
 use crate::rate::{cpu_rebuild_due, Ladder, LinkEstimator, RateController};
 use crate::writer::Writer;
 use hypr_capture::{CaptureConfig, CaptureEvent, CaptureMode, CapturedFrame, Capturer, SizeLimit};
@@ -149,7 +152,8 @@ where
     } = report_setup(&mut writer, started).await?;
     // Pipelined behind HelloAck, never waited on: the Pong seeds the
     // round-trip estimate, usually before the first frame ack arrives.
-    writer.write_msg(&ServerMsg::Ping { t: now_ms() }).await?;
+    let ping = now_ms();
+    writer.write_msg(&ServerMsg::Ping { t: ping }).await?;
     writer
         .write_msg(&stream_config(
             codec,
@@ -217,8 +221,26 @@ where
         compositor_clipboard,
     );
 
-    let mut msg_rx = spawn_reader(reader);
-    let (writer, mut write_reports) = Writer::spawn(writer);
+    // The liveness clock starts here, so slow capture or input setup above
+    // never counts as client silence. The reader and writer tasks run on
+    // this thread and apply their events to it as they happen.
+    // Legacy clients keep the pre-heartbeat liveness contract.
+    let heartbeat_enabled = caps
+        .features
+        .iter()
+        .any(|f| f == gliff_proto::FEATURE_HEARTBEAT);
+    let heartbeat = Rc::new(RefCell::new(Heartbeat::new(
+        Instant::now(),
+        grace_for(output.is_headless()),
+    )));
+    heartbeat.borrow_mut().sent(ping);
+    let mut msg_rx = spawn_reader(reader, heartbeat.clone());
+    let (writer, mut write_reports) = Writer::spawn(writer, {
+        let heartbeat = heartbeat.clone();
+        move |at| heartbeat.borrow_mut().written(at)
+    });
+    let mut pings = tokio::time::interval_at(tokio::time::Instant::now() + PING_EVERY, PING_EVERY);
+    pings.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     capturer.request_frame().ok();
     let first_frame_deadline =
@@ -267,7 +289,13 @@ where
     loop {
         let flow = tokio::select! {
             msg = msg_rx.recv() => match msg {
-                Some(Inbound::Msg(msg)) => session.on_client_msg(msg).await?,
+                Some(Inbound::Msg { msg, epoch }) => {
+                    let current = heartbeat.borrow().input_epoch();
+                    match admit(msg, epoch, current) {
+                        Some(msg) => session.on_client_msg(msg).await?,
+                        None => ControlFlow::Continue(()),
+                    }
+                }
                 Some(Inbound::Clipboard(msg, payload)) => {
                     clipboard.on_peer_msg(msg, payload);
                     ControlFlow::Continue(())
@@ -320,6 +348,16 @@ where
             {
                 ControlFlow::Continue(())
             }
+            _ = pings.tick(), if heartbeat_enabled => {
+                let t = heartbeat.borrow_mut().ping(now_ms());
+                session.writer.send(ServerMsg::Ping { t }, Vec::new());
+                ControlFlow::Continue(())
+            }
+            // A silent client: release its held input at the first missed
+            // deadline, and end the session once the grace period has passed.
+            effect = heartbeat_due(&heartbeat, heartbeat_enabled) => {
+                act(effect, |cmd| session.inject(cmd))
+            }
             // The pace timer: fires when a frame waits only on the cadence.
             // The guard must not test the deadline itself, or the arm would
             // disarm exactly while waiting for it.
@@ -364,6 +402,83 @@ where
     }
 }
 
+/// How long a silent client keeps its session, by output kind.
+fn grace_for(headless: bool) -> Duration {
+    if headless {
+        GRACE_HEADLESS
+    } else {
+        GRACE_MIRROR
+    }
+}
+
+/// Wait for the heartbeat's deadline and check it. The session loop makes
+/// this future again on every pass, so a message or a Ping that moved the
+/// deadline is seen.
+async fn heartbeat_due(heartbeat: &RefCell<Heartbeat>, enabled: bool) -> Option<Effect> {
+    if !enabled {
+        std::future::pending::<()>().await;
+    }
+    let at = heartbeat.borrow().deadline();
+    tokio::time::sleep_until(tokio::time::Instant::from_std(at)).await;
+    // A slow compositor IPC call may have stalled this runtime. Let the
+    // reader apply Pongs already in the socket before declaring a loss.
+    tokio::task::yield_now().await;
+    heartbeat
+        .borrow_mut()
+        .check(tokio::time::Instant::now().into_std())
+}
+
+/// Act on what the heartbeat decided: release held input when the client
+/// went silent, or end the session once the grace period has run out.
+fn act(effect: Option<Effect>, mut inject: impl FnMut(InputCmd)) -> ControlFlow<()> {
+    match effect {
+        None => ControlFlow::Continue(()),
+        Some(Effect::Release) => {
+            tracing::warn!("client stopped answering; releasing held input");
+            // Not ReleaseAll: the client is likely to come back, and its
+            // Caps Lock and layout must still match.
+            inject(InputCmd::ReleaseHeld);
+            ControlFlow::Continue(())
+        }
+        Some(Effect::End) => {
+            tracing::info!("client silent past the grace period; ending the session");
+            ControlFlow::Break(())
+        }
+    }
+}
+
+/// Apply one message to the heartbeat as the reader receives it, and return
+/// the input epoch it was received in (`None` while the client is lost). A
+/// Pong is matched here, so a Pong that restores input does so before any
+/// message queued behind it, and before the grace period can end.
+fn receive(heartbeat: &mut Heartbeat, now: Instant, msg: &ClientMsg) -> Option<u64> {
+    heartbeat.arrived(now);
+    if let ClientMsg::Pong { t } = msg {
+        if heartbeat.pong(*t) {
+            tracing::info!("client answering again; accepting input");
+        }
+    }
+    heartbeat.input_epoch()
+}
+
+/// Decide whether the session handles a message. Input is dropped unless it
+/// was received in the current input epoch: input received while the client
+/// was lost may be stale, and input received before a loss would press keys
+/// again after the release, however late the session gets to it.
+fn admit(msg: ClientMsg, epoch: Option<u64>, current: Option<u64>) -> Option<ClientMsg> {
+    let input = matches!(
+        msg,
+        ClientMsg::Key { .. }
+            | ClientMsg::PointerMotion { .. }
+            | ClientMsg::PointerButton { .. }
+            | ClientMsg::PointerAxis { .. }
+    );
+    if input && (epoch.is_none() || epoch != current) {
+        return None;
+    }
+    Some(msg)
+}
+
 /// Pass a setup step's result through, first telling the client why the
 /// session cannot start when the step failed; otherwise all the client sees
 /// is the connection closing.
@@ -382,15 +497,21 @@ where
 
 /// What the reader task hands the session.
 enum Inbound {
-    Msg(ClientMsg),
+    /// A message with the input epoch it was received in.
+    Msg { msg: ClientMsg, epoch: Option<u64> },
     /// A clipboard message with the chunk that followed it (empty otherwise).
     Clipboard(ClipboardMsg, Bytes),
 }
 
 /// Drain the socket on its own task so a burst of input (a mouse drag) can
 /// never starve frame capture and a blocked write can never block reads.
-/// Clipboard chunks are read here so the socket stays framed.
-fn spawn_reader<R>(mut reader: Framed<R>) -> UnboundedReceiver<Inbound>
+/// Clipboard chunks are read here so the socket stays framed. Each message
+/// reaches the heartbeat as it is read, so liveness does not depend on how
+/// long it then waits in the queue.
+fn spawn_reader<R>(
+    mut reader: Framed<R>,
+    heartbeat: Rc<RefCell<Heartbeat>>,
+) -> UnboundedReceiver<Inbound>
 where
     R: AsyncRead + Unpin + 'static,
 {
@@ -406,7 +527,10 @@ where
                 }
             };
             let inbound = match msg.into_clipboard() {
-                Err(msg) => Inbound::Msg(msg),
+                Err(msg) => {
+                    let epoch = receive(&mut heartbeat.borrow_mut(), Instant::now(), &msg);
+                    Inbound::Msg { msg, epoch }
+                }
                 Ok(clip) => {
                     let payload = match &clip {
                         ClipboardMsg::Data { data_len, .. } if *data_len as usize <= CHUNK => {
@@ -418,6 +542,7 @@ where
                         ClipboardMsg::Data { .. } => break,
                         _ => Bytes::new(),
                     };
+                    heartbeat.borrow_mut().arrived(Instant::now());
                     Inbound::Clipboard(clip, payload)
                 }
             };
@@ -1905,6 +2030,251 @@ fn stream_limit(encoder: (u32, u32), caps: &ClientCaps) -> Result<(u32, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn input_msgs() -> [ClientMsg; 4] {
+        [
+            ClientMsg::Key {
+                keycode: 30,
+                pressed: true,
+            },
+            ClientMsg::PointerMotion { x: 1.0, y: 1.0 },
+            ClientMsg::PointerButton {
+                button: 272,
+                pressed: true,
+            },
+            ClientMsg::PointerAxis {
+                axis: gliff_proto::Axis::Vertical,
+                value: 1.0,
+                discrete: None,
+                stop: false,
+            },
+        ]
+    }
+
+    fn key() -> ClientMsg {
+        ClientMsg::Key {
+            keycode: 30,
+            pressed: true,
+        }
+    }
+
+    fn secs(s: u64) -> Duration {
+        Duration::from_secs(s)
+    }
+
+    /// Run the deadline arm at `now`, collecting what it injects.
+    fn deadline(hb: &mut Heartbeat, now: Instant, cmds: &mut Vec<InputCmd>) -> ControlFlow<()> {
+        act(hb.check(now), |c| cmds.push(c))
+    }
+
+    /// The session handles a message the reader queued with `epoch`.
+    fn handled(hb: &Heartbeat, msg: ClientMsg, epoch: Option<u64>) -> bool {
+        admit(msg, epoch, hb.input_epoch()).is_some()
+    }
+
+    #[test]
+    fn held_input_is_released_when_the_client_goes_silent() {
+        let t0 = Instant::now();
+        let mut hb = Heartbeat::new(t0, GRACE_MIRROR);
+        let mut cmds = Vec::new();
+        assert!(deadline(&mut hb, t0 + secs(29), &mut cmds).is_continue());
+        assert!(cmds.is_empty());
+        assert!(deadline(&mut hb, t0 + secs(30), &mut cmds).is_continue());
+        assert!(matches!(cmds.as_slice(), [InputCmd::ReleaseHeld]));
+    }
+
+    #[test]
+    fn input_received_while_lost_is_dropped() {
+        let t0 = Instant::now();
+        let mut hb = Heartbeat::new(t0, GRACE_MIRROR);
+        for msg in input_msgs() {
+            let epoch = receive(&mut hb, t0 + secs(1), &msg);
+            assert!(handled(&hb, msg, epoch));
+        }
+        assert!(deadline(&mut hb, t0 + secs(31), &mut Vec::new()).is_continue());
+        for msg in input_msgs() {
+            let epoch = receive(&mut hb, t0 + secs(32), &msg);
+            assert!(!handled(&hb, msg, epoch));
+        }
+        // Other messages still reach the session.
+        let epoch = receive(&mut hb, t0 + secs(32), &ClientMsg::RequestKeyframe);
+        assert!(handled(&hb, ClientMsg::RequestKeyframe, epoch));
+    }
+
+    #[test]
+    fn a_stale_pong_does_not_restore_input() {
+        let t0 = Instant::now();
+        let mut hb = Heartbeat::new(t0, GRACE_MIRROR);
+        let old = hb.ping(1000);
+        assert!(deadline(&mut hb, t0 + secs(30), &mut Vec::new()).is_continue());
+        // A Pong for a Ping sent before the loss, then a key press sent
+        // before the client slept.
+        receive(&mut hb, t0 + secs(31), &ClientMsg::Pong { t: old });
+        let epoch = receive(&mut hb, t0 + secs(31), &key());
+        assert!(!handled(&hb, key(), epoch));
+        let fresh = hb.ping(1000);
+        receive(&mut hb, t0 + secs(33), &ClientMsg::Pong { t: fresh });
+        let epoch = receive(&mut hb, t0 + secs(33), &key());
+        assert!(handled(&hb, key(), epoch));
+    }
+
+    #[test]
+    fn stale_input_received_before_the_loss_is_still_dropped() {
+        let t0 = Instant::now();
+        let mut hb = Heartbeat::new(t0, GRACE_MIRROR);
+        // Received while alive, but still queued when the release goes out.
+        let epoch = receive(&mut hb, t0 + secs(1), &key());
+        let mut cmds = Vec::new();
+        assert!(deadline(&mut hb, t0 + secs(31), &mut cmds).is_continue());
+        assert!(matches!(cmds.as_slice(), [InputCmd::ReleaseHeld]));
+        assert!(!handled(&hb, key(), epoch));
+        // Still dropped once the client is back.
+        let fresh = hb.ping(1000);
+        receive(&mut hb, t0 + secs(35), &ClientMsg::Pong { t: fresh });
+        assert!(!hb.is_lost());
+        assert!(!handled(&hb, key(), epoch));
+    }
+
+    #[test]
+    fn a_recovery_pong_behind_a_long_backlog_prevents_expiry() {
+        let t0 = Instant::now();
+        let mut hb = Heartbeat::new(t0, GRACE_MIRROR);
+        assert!(deadline(&mut hb, t0 + secs(30), &mut Vec::new()).is_continue());
+        let fresh = hb.ping(1000);
+        // The client comes back with a burst of resizes and the Pong behind
+        // them; the session is busy with the first resize for minutes.
+        let mut queued = Vec::new();
+        for n in 0..100 {
+            let msg = ClientMsg::Resize {
+                width: 1280 + n,
+                height: 720,
+                scale: 1.0,
+            };
+            let epoch = receive(&mut hb, t0 + secs(40), &msg);
+            queued.push((msg, epoch));
+        }
+        let pong = ClientMsg::Pong { t: fresh };
+        let epoch = receive(&mut hb, t0 + secs(41), &pong);
+        queued.push((pong, epoch));
+        let epoch = receive(&mut hb, t0 + secs(41), &key());
+        queued.push((key(), epoch));
+        // It keeps answering while the session works through the backlog.
+        let t = hb.ping(2000);
+        receive(&mut hb, t0 + secs(85), &ClientMsg::Pong { t });
+        let mut cmds = Vec::new();
+        let flow = deadline(&mut hb, t0 + secs(30) + GRACE_MIRROR, &mut cmds);
+        assert!(flow.is_continue());
+        assert!(cmds.is_empty());
+        // The key sent after the Pong is handled when the session gets to it.
+        let (msg, epoch) = queued.pop().unwrap();
+        assert!(handled(&hb, msg, epoch));
+    }
+
+    #[tokio::test]
+    async fn the_reader_applies_messages_to_the_heartbeat_as_it_reads_them() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let t0 = Instant::now();
+                let hb = Rc::new(RefCell::new(Heartbeat::new(t0, GRACE_MIRROR)));
+                hb.borrow_mut().check(t0 + secs(30));
+                let fresh = hb.borrow_mut().ping(1000);
+                let (socket, peer) = tokio::io::duplex(1024);
+                let mut rx = spawn_reader(Framed::new(socket), hb.clone());
+                let mut client = Framed::new(peer);
+                client
+                    .write_msg(&ClientMsg::Pong { t: fresh })
+                    .await
+                    .unwrap();
+                client.write_msg(&key()).await.unwrap();
+                // Nothing taken off the queue yet, and the client is back.
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while hb.borrow().is_lost() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                let Some(Inbound::Msg { epoch, .. }) = rx.recv().await else {
+                    panic!("expected the Pong")
+                };
+                assert_eq!(epoch, Some(1));
+                let Some(Inbound::Msg { msg, epoch }) = rx.recv().await else {
+                    panic!("expected the key")
+                };
+                assert!(handled(&hb.borrow(), msg, epoch));
+            })
+            .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queued_reader_activity_prevents_a_false_loss_after_a_runtime_stall() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let t0 = tokio::time::Instant::now().into_std();
+                let hb = Rc::new(RefCell::new(Heartbeat::new(t0, GRACE_MIRROR)));
+                hb.borrow_mut().written(t0);
+                tokio::time::advance(secs(11)).await;
+                let reader = hb.clone();
+                tokio::task::spawn_local(async move {
+                    reader
+                        .borrow_mut()
+                        .arrived(tokio::time::Instant::now().into_std());
+                });
+                assert_eq!(heartbeat_due(&hb, true).await, None);
+                assert!(!hb.borrow().is_lost());
+            })
+            .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn legacy_clients_do_not_enter_heartbeat_loss_or_expiry() {
+        let t0 = tokio::time::Instant::now().into_std();
+        let hb = RefCell::new(Heartbeat::new(t0, GRACE_MIRROR));
+        assert!(tokio::time::timeout(secs(600), heartbeat_due(&hb, false))
+            .await
+            .is_err());
+        assert!(!hb.borrow().is_lost());
+        assert_eq!(hb.borrow().input_epoch(), Some(0));
+    }
+
+    /// The session loop's deadline arm, on tokio's clock: nothing before the
+    /// deadline, a release at it, and the end once the grace has passed.
+    #[tokio::test(start_paused = true)]
+    async fn the_deadline_arm_releases_then_ends_on_time() {
+        let t0 = tokio::time::Instant::now().into_std();
+        let hb = RefCell::new(Heartbeat::new(t0, GRACE_MIRROR));
+        let early = tokio::time::timeout(secs(29), heartbeat_due(&hb, true)).await;
+        assert!(early.is_err());
+        assert_eq!(heartbeat_due(&hb, true).await, Some(Effect::Release));
+        assert_eq!(tokio::time::Instant::now().into_std(), t0 + secs(30));
+        // A message while lost does not move the end.
+        hb.borrow_mut().arrived(t0 + secs(40));
+        assert_eq!(heartbeat_due(&hb, true).await, Some(Effect::End));
+        assert_eq!(
+            tokio::time::Instant::now().into_std(),
+            t0 + secs(30) + GRACE_MIRROR
+        );
+    }
+
+    #[test]
+    fn grace_expiry_ends_the_session_for_both_output_kinds() {
+        let t0 = Instant::now();
+        let lost_at = t0 + secs(30);
+        for headless in [true, false] {
+            let grace = grace_for(headless);
+            let mut hb = Heartbeat::new(t0, grace);
+            let mut cmds = Vec::new();
+            assert!(deadline(&mut hb, lost_at, &mut cmds).is_continue());
+            // Messages without a fresh Pong do not hold the session open.
+            receive(&mut hb, lost_at + secs(5), &key());
+            assert!(deadline(&mut hb, lost_at + grace - secs(1), &mut cmds).is_continue());
+            assert!(deadline(&mut hb, lost_at + grace, &mut cmds).is_break());
+            assert_eq!(cmds.len(), 1);
+        }
+        assert_eq!(grace_for(true), Duration::from_secs(300));
+        assert_eq!(grace_for(false), Duration::from_secs(60));
+    }
+
     #[test]
     fn slow_dpms_ipc_does_not_block_the_streaming_runtime() {
         let (started, ready) = std::sync::mpsc::channel();

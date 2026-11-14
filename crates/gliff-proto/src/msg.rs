@@ -34,7 +34,8 @@ pub const PROTOCOL_VERSION: u16 = 1;
 
 /// Optional behaviours this build supports, exchanged in the handshake. A
 /// behaviour is used only when both ends list it.
-pub const FEATURES: &[&str] = &[];
+pub const FEATURE_HEARTBEAT: &str = "heartbeat";
+pub const FEATURES: &[&str] = &[FEATURE_HEARTBEAT];
 
 pub fn features() -> Vec<String> {
     FEATURES.iter().map(|f| f.to_string()).collect()
@@ -454,9 +455,10 @@ pub enum ServerMsg {
         #[n(0)]
         id: u32,
     },
-    /// Sent right after HelloAck; the client answers with `ClientMsg::Pong`
-    /// ahead of anything else, seeding the server's round-trip estimate
-    /// before the first frame is acked.
+    /// Sent after HelloAck, and periodically while streaming when the client
+    /// advertises `FEATURE_HEARTBEAT`. The client
+    /// answers every Ping with `ClientMsg::Pong`, including on a still screen.
+    /// The first reply seeds the server's round-trip estimate.
     #[n(12)]
     Ping {
         #[n(0)]
