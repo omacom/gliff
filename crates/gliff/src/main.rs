@@ -18,6 +18,7 @@ use std::collections::BTreeSet;
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, sync_channel, Receiver};
 use std::time::{Duration, Instant};
 
@@ -58,6 +59,14 @@ struct Cli {
     /// to open a tab for each.
     #[arg(long)]
     connect: Vec<String>,
+    /// Show the gliff-server whose protocol arrives on stdin and leaves on
+    /// stdout. The machine running that server starts this over ssh to use
+    /// this screen as one of its own; the window closes when it stops.
+    #[arg(long, conflicts_with_all = ["host", "connect"])]
+    stdio: bool,
+    /// Open the window fullscreen.
+    #[arg(long)]
+    fullscreen: bool,
     /// Remote gliff-server path.
     #[arg(long, default_value = "gliff-server")]
     server_bin: String,
@@ -223,10 +232,18 @@ impl Session {
 }
 
 fn main() -> glib::ExitCode {
+    let cli = Cli::parse();
+    // Before anything can print or start a thread: with --stdio, stdout
+    // carries the protocol, and ssh started us outside the desktop session.
+    if cli.stdio {
+        if let Err(e) = net::take_stdio().and_then(|()| find_desktop_session()) {
+            eprintln!("gliff: {e:#}");
+            return glib::ExitCode::FAILURE;
+        }
+    }
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
-    let cli = Cli::parse();
     // GTK uses the program name as the Wayland app ID.
     glib::set_prgname(Some(APP_NAME));
     let app = adw::Application::builder().build();
@@ -241,11 +258,48 @@ fn main() -> glib::ExitCode {
     app.connect_activate(move |app| build_ui(app, &cli));
     // GTK owns argv parsing; we already parsed with clap, so pass none.
     let empty: Vec<String> = vec![];
-    app.run_with_args(&empty)
+    let code = app.run_with_args(&empty);
+    if STDIO_FAILED.load(Ordering::Relaxed) {
+        return glib::ExitCode::FAILURE;
+    }
+    code
+}
+
+/// A --stdio stream ended on an error rather than by either side closing
+/// it: the process exits unsuccessfully, so the machine that started it
+/// can tell the user why.
+static STDIO_FAILED: AtomicBool = AtomicBool::new(false);
+
+/// End a --stdio window on `error`, already logged. Its last stderr line
+/// is the reason the other machine shows.
+fn fail_stdio(ui: &App, error: &str) {
+    eprintln!("{error}");
+    STDIO_FAILED.store(true, Ordering::Relaxed);
+    ui.window.close();
+}
+
+/// A command run over ssh has no `WAYLAND_DISPLAY`: show the window on the
+/// user's running Hyprland session, the way gliff-server finds it.
+fn find_desktop_session() -> anyhow::Result<()> {
+    if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        return Ok(());
+    }
+    let runtime_dir = hypr_ipc::runtime_dir()?;
+    let instance = hypr_ipc::Instance::discover(None)?;
+    let display = instance.wayland_display()?;
+    // Single-threaded still: nothing else reads the environment yet.
+    std::env::set_var("XDG_RUNTIME_DIR", runtime_dir);
+    std::env::set_var("WAYLAND_DISPLAY", display);
+    std::env::set_var("HYPRLAND_INSTANCE_SIGNATURE", &instance.signature);
+    Ok(())
 }
 
 /// The endpoints named on the command line, if any.
 fn endpoints_from_cli(cli: &Cli) -> Vec<Endpoint> {
+    if cli.stdio {
+        let peer = stdio_peer(std::env::var("SSH_CONNECTION").ok().as_deref());
+        return vec![Endpoint::Stdio(peer)];
+    }
     if !cli.connect.is_empty() {
         return cli.connect.iter().cloned().map(Endpoint::Tcp).collect();
     }
@@ -266,11 +320,20 @@ fn ssh_endpoint(cli: &Cli, host: &str) -> Endpoint {
     Endpoint::Ssh(t)
 }
 
+/// The machine at the other end of a --stdio session: the client address
+/// in ssh's `SSH_CONNECTION`, when there is one.
+fn stdio_peer(ssh_connection: Option<&str>) -> String {
+    ssh_connection
+        .and_then(|c| c.split_whitespace().next())
+        .unwrap_or("stdio")
+        .to_owned()
+}
+
 /// The tab name for an endpoint.
 fn machine_name(endpoint: &Endpoint) -> &str {
     match endpoint {
         Endpoint::Ssh(t) => t.host.as_str(),
-        Endpoint::Tcp(addr) => addr.as_str(),
+        Endpoint::Tcp(addr) | Endpoint::Stdio(addr) => addr.as_str(),
     }
 }
 
@@ -501,10 +564,18 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         *ui.local_clipboard.borrow_mut() = watch;
     }
 
+    if cli.fullscreen {
+        window.fullscreen();
+    }
     window.present();
     // Reconnect the machines that were connected when the window last
     // closed, then any named on the command line, which is shown first.
-    let config = Config::load(&ui.config_path);
+    // A --stdio window shows only the machine that started it.
+    let config = if cli.stdio {
+        Config::default()
+    } else {
+        Config::load(&ui.config_path)
+    };
     let from_cli = endpoints_from_cli(cli);
     for machine in &config.open {
         open_session(&ui, ssh_endpoint(cli, machine));
@@ -590,11 +661,13 @@ fn install_address_bar(ui: &Rc<App>, connect_btn: &gtk::Button) {
 }
 
 /// Show the address bar in place of the +, or fold it back. With no tabs
-/// the address bar is all there is, so it stays.
+/// the address bar is all there is, so it stays. A --stdio window has
+/// neither: it closes with its one stream, and would take any other
+/// machine opened in it along.
 fn show_address_bar(ui: &App, show: bool) {
-    let show = show || ui.tabs.first_child().is_none();
+    let show = !ui.cli.stdio && (show || ui.tabs.first_child().is_none());
     ui.add_revealer.set_reveal_child(show);
-    ui.add_btn.set_visible(!show);
+    ui.add_btn.set_visible(!show && !ui.cli.stdio);
     // A folded address bar must not keep the focus GTK gave it when the
     // window opened, or hovering the picture would never capture.
     if !show && address_bar_in_use(&ui.window, &ui.entry) {
@@ -606,7 +679,7 @@ fn show_address_bar(ui: &App, show: bool) {
 /// is already connected.
 fn connect_from_address_bar(ui: &Rc<App>) {
     let machine = ui.entry.text().trim().to_string();
-    if machine.is_empty() {
+    if machine.is_empty() || ui.cli.stdio {
         return;
     }
     ui.entry.set_text("");
@@ -767,7 +840,11 @@ fn find_session(ui: &App, name: &str) -> Option<Rc<Session>> {
 /// not remembered yet (a first connect still in progress, or a dev
 /// `--connect`).
 fn tab_names(ui: &App) -> Vec<String> {
-    let mut names = Config::load(&ui.config_path).machines;
+    let mut names = if ui.cli.stdio {
+        Vec::new()
+    } else {
+        Config::load(&ui.config_path).machines
+    };
     for s in ui.sessions.borrow().iter() {
         if !names.contains(&s.name) {
             names.push(s.name.clone());
@@ -1009,6 +1086,11 @@ fn stop_session(ui: &Rc<App>, name: &str) {
     let Some(s) = find_session(ui, name) else {
         return;
     };
+    // A --stdio window exists for its one session.
+    if matches!(s.endpoint, Endpoint::Stdio(_)) {
+        ui.window.close();
+        return;
+    }
     let was_active = is_active(ui, &s);
     if was_active {
         release_pressed_keys(ui);
@@ -1183,6 +1265,15 @@ fn remember_machine(ui: &Rc<App>, s: &Session) {
 /// The status keeps the error that ended the connection, if any, so it stays
 /// on screen while the reconnects run.
 fn schedule_reconnect(ui: Rc<App>, s: Rc<Session>, generation: u64, error: Option<&str>) {
+    // Only the machine at the other end can start a --stdio session again;
+    // a window left open would keep its screen.
+    if matches!(s.endpoint, Endpoint::Stdio(_)) {
+        match error {
+            Some(error) => fail_stdio(&ui, error),
+            None => ui.window.close(),
+        }
+        return;
+    }
     let n = s.retries.get() + 1;
     s.retries.set(n);
     if let Some(error) = error {
@@ -1446,6 +1537,9 @@ fn poll_status(ui: Rc<App>, s: Rc<Session>, rx: Receiver<Status>, generation: u6
                     set_status(&ui, &s, &message);
                     show_disconnected(&ui, &s);
                     s.gave_up.set(true);
+                    if matches!(s.endpoint, Endpoint::Stdio(_)) {
+                        fail_stdio(&ui, &message);
+                    }
                     return glib::ControlFlow::Break;
                 }
                 Status::Closed => {
@@ -2066,10 +2160,13 @@ fn install_fullscreen_bars(
             if fullscreen_btn.is_active() != full {
                 fullscreen_btn.set_active(full);
             }
-            if full {
+            // The notify can repeat a state, as when the window starts
+            // fullscreen: move the header only when it is not there yet.
+            let in_content = header.parent().as_ref() == Some(content.upcast_ref());
+            if full && in_content {
                 content.remove(&header);
                 top.set_child(Some(&header));
-            } else {
+            } else if !full && !in_content {
                 top.set_reveal_child(false);
                 top.set_child(None::<&gtk::Widget>);
                 content.prepend(&header);
@@ -2240,6 +2337,14 @@ fn device_scale(ui: &App) -> f64 {
 mod tests {
     use super::*;
     use std::cell::RefCell;
+
+    #[test]
+    fn a_stdio_window_is_named_after_the_ssh_client() {
+        let connection = "192.168.1.31 51234 192.168.1.70 22";
+        assert_eq!(stdio_peer(Some(connection)), "192.168.1.31");
+        assert_eq!(stdio_peer(Some("")), "stdio");
+        assert_eq!(stdio_peer(None), "stdio");
+    }
 
     type Input = tokio::sync::mpsc::UnboundedReceiver<clipboard::ToWorker>;
 
