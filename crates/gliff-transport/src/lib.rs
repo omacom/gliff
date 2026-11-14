@@ -22,6 +22,8 @@ use minicbor::{Decode, Encode};
 use std::io::IoSlice;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+pub mod viewers;
+
 pub use ssh::{spawn_ssh, SshTarget};
 
 #[derive(Debug, thiserror::Error)]
@@ -265,6 +267,7 @@ mod tests {
                 chroma: vec![ChromaMode::Dual420],
                 features: vec![],
             },
+            origin: None,
         };
         let payload = vec![7u8; 5000];
         let p2 = vec![9u8; 100];
