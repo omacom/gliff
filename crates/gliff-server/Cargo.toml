@@ -25,3 +25,8 @@ hypr-input.workspace = true
 hypr-ipc.workspace = true
 hypr-wl.workspace = true
 dbus = "0.9"
+
+rustix.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

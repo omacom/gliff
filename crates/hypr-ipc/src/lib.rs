@@ -153,6 +153,10 @@ impl Instance {
         self.request_json("monitors all")
     }
 
+    pub fn workspaces(&self) -> Result<Vec<Workspace>> {
+        self.request_json("workspaces")
+    }
+
     /// Run a dispatcher. A legacy (hyprlang) config takes `dispatch <name>
     /// <args>`; a Lua config reads `dispatch` as `hl.dispatch(...)`, rejects
     /// that form, and takes the `hl.dsp` call in `lua` instead.
@@ -170,6 +174,32 @@ impl Instance {
             }
             other => other,
         }
+    }
+
+    /// Move a workspace, with its windows, onto `monitor`.
+    pub fn move_workspace_to_monitor(&self, workspace: &str, monitor: &str) -> Result<()> {
+        self.dispatcher(
+            &format!("moveworkspacetomonitor {workspace} {monitor}"),
+            &format!(
+                "hl.dsp.workspace.move({{ workspace = {}, monitor = \"{monitor}\" }})",
+                lua_str(workspace)
+            ),
+            || true,
+        )
+    }
+
+    /// Show `workspace` on `monitor`, which it must be on, and focus it.
+    pub fn show_workspace(&self, monitor: &str, workspace: &str) -> Result<()> {
+        self.dispatcher(
+            &format!("focusmonitor {monitor}"),
+            &format!("hl.dsp.focus({{ monitor = \"{monitor}\" }})"),
+            || true,
+        )?;
+        self.dispatcher(
+            &format!("workspace {workspace}"),
+            &format!("hl.dsp.focus({{ workspace = {} }})", lua_str(workspace)),
+            || true,
+        )
     }
 
     /// Switch one monitor's DPMS on or off, leaving the others alone.
@@ -223,6 +253,13 @@ impl Instance {
     }
 }
 
+/// `s` as a quoted Lua string. A workspace name can hold quotes and
+/// backslashes.
+// ponytail: Rust's string escapes (\", \\, \n, \u{..}) are all valid in Lua 5.3+.
+fn lua_str(s: &str) -> String {
+    format!("{s:?}")
+}
+
 /// Round a mode down until `scale` divides it into whole logical pixels.
 /// Hyprland rejects a scale that leaves a fractional logical size ("Invalid
 /// scale ... failed to find a clean divisor") and falls back to one of its
@@ -266,6 +303,8 @@ pub struct Monitor {
     pub focused: bool,
     #[serde(default)]
     pub disabled: bool,
+    #[serde(default)]
+    pub active_workspace: WorkspaceRef,
     /// False while DPMS has the monitor off; Hyprland does not render it.
     #[serde(default = "yes")]
     pub dpms_status: bool,
@@ -273,6 +312,56 @@ pub struct Monitor {
 
 fn yes() -> bool {
     true
+}
+
+/// A workspace as a monitor refers to it.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct WorkspaceRef {
+    pub id: i64,
+    #[serde(default)]
+    pub name: String,
+}
+
+impl WorkspaceRef {
+    pub fn selector(&self) -> String {
+        workspace_selector(self.id, &self.name)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Workspace {
+    /// Negative for named and special (scratchpad) workspaces.
+    pub id: i64,
+    #[serde(default)]
+    pub name: String,
+    /// The monitor's name.
+    pub monitor: String,
+    #[serde(default)]
+    pub windows: u32,
+}
+
+impl Workspace {
+    /// A scratchpad. Named workspaces have negative IDs too, so only the
+    /// name tells them apart.
+    pub fn is_special(&self) -> bool {
+        // Hyprland names every special workspace `special:<name>`; a regular
+        // named workspace may still start with "special".
+        self.name.starts_with("special:")
+    }
+
+    pub fn selector(&self) -> String {
+        workspace_selector(self.id, &self.name)
+    }
+}
+
+/// How dispatchers address a workspace: by ID, or by name when it is named
+/// and its ID is negative.
+pub fn workspace_selector(id: i64, name: &str) -> String {
+    if id > 0 {
+        id.to_string()
+    } else {
+        format!("name:{name}")
+    }
 }
 
 fn one() -> f32 {
@@ -392,6 +481,19 @@ mod tests {
     }
 
     #[test]
+    fn quotes_workspace_names_for_lua() {
+        const LUA: &str = "error: dispatch in lua is a shorthand for hl.dispatch(...)";
+        let (result, commands) = against_socket(&[LUA, "ok"], |i| {
+            i.move_workspace_to_monitor(r#"name:notes"2026\x"#, "gliff-7")
+        });
+        assert!(result.is_ok());
+        assert_eq!(
+            commands[1],
+            r#"dispatch hl.dsp.workspace.move({ workspace = "name:notes\"2026\\x", monitor = "gliff-7" })"#
+        );
+    }
+
+    #[test]
     fn cancelled_keep_awake_does_not_start_or_retry_ipc() {
         let (result, commands) = against_socket(&[], |i| i.set_dpms_if("gliff-7", true, || false));
         assert!(result.is_ok());
@@ -409,10 +511,28 @@ mod tests {
     }
 
     #[test]
-    fn parses_dpms_status() {
-        let m: Monitor =
-            serde_json::from_str(r#"{"id": 0, "name": "DP-2", "width": 3440, "height": 1440}"#)
-                .unwrap();
+    fn parses_workspaces_and_active_workspace() {
+        let ws: Vec<Workspace> = serde_json::from_str(
+            r#"[{"id": 1, "name": "1", "monitor": "DP-2", "monitorID": 0, "windows": 3},
+                {"id": -98, "name": "special:scratch", "monitor": "DP-2", "windows": 0},
+                {"id": -1337, "name": "special-mail", "monitor": "DP-2", "windows": 1}]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            (ws[0].id, ws[0].monitor.as_str(), ws[0].windows),
+            (1, "DP-2", 3)
+        );
+        assert_eq!(ws[1].id, -98);
+        assert!(ws[1].is_special());
+        assert!(!ws[0].is_special() && !ws[2].is_special());
+        assert_eq!(ws[0].selector(), "1");
+        assert_eq!(ws[2].selector(), "name:special-mail");
+        let m: Monitor = serde_json::from_str(
+            r#"{"id": 0, "name": "DP-2", "width": 3440, "height": 1440,
+                "activeWorkspace": {"id": 4, "name": "4"}}"#,
+        )
+        .unwrap();
+        assert_eq!(m.active_workspace.id, 4);
         assert!(m.dpms_status, "a monitor without the field counts as on");
         let m: Monitor = serde_json::from_str(
             r#"{"id": 1, "name": "gliff-1", "width": 1280, "height": 712, "dpmsStatus": false}"#,
