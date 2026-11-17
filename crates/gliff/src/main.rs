@@ -98,8 +98,13 @@ struct App {
     hint: gtk::Label,
     /// Bumped by every hint, so a newer one is not hidden by an older timer.
     hint_generation: Cell<u64>,
+    /// How to release captured shortcuts, or none without a release hotkey.
+    capture_hint: Option<String>,
     /// The capture hint shows once per window, not on every pointer entry.
     capture_hinted: Cell<bool>,
+    /// The picture has the keyboard. Kept by its focus controller, since the
+    /// window reports the new focus only after the enter handlers ran.
+    video_focused: Cell<bool>,
     /// A tab per machine, to the left of the address bar.
     tabs: gtk::Box,
     /// Expands into the address bar; hidden while the address bar shows.
@@ -397,6 +402,10 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         &entry,
     );
 
+    let hotkey = ReleaseHotkey::parse(&cli.release_hotkey).unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "invalid --release-hotkey; shortcut release disabled");
+        ReleaseHotkey::None
+    });
     let ui = Rc::new(App {
         window: window.clone(),
         video: video.clone(),
@@ -405,7 +414,12 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         status: status.clone(),
         hint,
         hint_generation: Cell::new(0),
+        capture_hint: match &hotkey {
+            ReleaseHotkey::None => None,
+            hk => Some(format!("Shortcuts captured — {} to release", hk.describe())),
+        },
         capture_hinted: Cell::new(false),
+        video_focused: Cell::new(false),
         tabs,
         add_btn,
         add_revealer,
@@ -424,10 +438,6 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         keymap: keymap::watch(),
     });
 
-    let hotkey = ReleaseHotkey::parse(&cli.release_hotkey).unwrap_or_else(|e| {
-        tracing::warn!(error = %e, "invalid --release-hotkey; shortcut release disabled");
-        ReleaseHotkey::None
-    });
     install_input_handlers(&ui, &video, &window, hotkey);
     install_resize_handler(&ui);
     install_address_bar(&ui, &connect_btn);
@@ -988,6 +998,7 @@ fn show_session(ui: &Rc<App>, s: &Rc<Session>) {
     request_resize(ui);
     request_zoom(ui);
     refresh_tabs(ui);
+    sync_capture(ui);
 }
 
 /// Show no session: a black screen, as on a fresh window.
@@ -1001,6 +1012,7 @@ fn show_nothing(ui: &Rc<App>) {
     ui.frame.clear();
     ui.video.set_cursor(None);
     refresh_tabs(ui);
+    sync_capture(ui);
 }
 
 /// End a machine's session. When it was the one shown, the window moves to
@@ -1105,6 +1117,7 @@ fn set_stats(ui: &App, s: &Rc<Session>, text: &str) {
 fn show_disconnected(ui: &Rc<App>, s: &Rc<Session>) {
     if s.connected.replace(false) {
         refresh_tabs(ui);
+        sync_capture(ui);
     }
     s.last_frame.borrow_mut().take();
     s.stream_size.set((0, 0));
@@ -1338,6 +1351,7 @@ fn poll_status(ui: Rc<App>, s: Rc<Session>, rx: Receiver<Status>, generation: u6
                     s.gave_up.set(false);
                     if !s.connected.replace(true) {
                         refresh_tabs(&ui);
+                        sync_capture(&ui);
                     }
                     set_status(&ui, &s, "");
                     // Visible before the first per-second stats arrive.
@@ -1749,6 +1763,26 @@ fn address_bar_in_use(window: &adw::ApplicationWindow, entry: &gtk::Entry) -> bo
             .is_some_and(|f| f == *entry || f.is_ancestor(entry))
 }
 
+/// Route system shortcuts to the remote while the picture has the keyboard
+/// and the shown session is connected. With nothing connected there is
+/// nowhere to send them, and capturing only makes the window look hung.
+fn sync_capture(ui: &Rc<App>) {
+    let Some(toplevel) = ui.window.surface().and_downcast::<gdk::Toplevel>() else {
+        return;
+    };
+    if !(ui.video_focused.get() && active(ui).is_some_and(|s| s.connected.get())) {
+        toplevel.restore_system_shortcuts();
+        return;
+    }
+    tracing::debug!("inhibiting system shortcuts");
+    toplevel.inhibit_system_shortcuts(None::<&gdk::Event>);
+    if let Some(hint) = &ui.capture_hint {
+        if !ui.capture_hinted.replace(true) {
+            show_hint(ui, hint);
+        }
+    }
+}
+
 fn release_capture(ui: &Rc<App>, window: &adw::ApplicationWindow) {
     ui.released.set(true);
     gtk::prelude::GtkWindowExt::set_focus(window, gtk::Widget::NONE);
@@ -2005,22 +2039,11 @@ fn install_input_handlers(
     });
     let focus = gtk::EventControllerFocus::new();
     {
-        let window = window.clone();
         let ui = ui.clone();
-        let hint = match &hotkey {
-            ReleaseHotkey::None => None,
-            hk => Some(format!("Shortcuts captured — {} to release", hk.describe())),
-        };
         focus.connect_enter(move |_| {
-            tracing::debug!("video focused; inhibiting system shortcuts");
-            if let Some(toplevel) = window.surface().and_downcast::<gdk::Toplevel>() {
-                toplevel.inhibit_system_shortcuts(None::<&gdk::Event>);
-            }
-            if let Some(hint) = &hint {
-                if !ui.capture_hinted.replace(true) {
-                    show_hint(&ui, hint);
-                }
-            }
+            tracing::debug!("video focused");
+            ui.video_focused.set(true);
+            sync_capture(&ui);
         });
     }
     {
@@ -2028,6 +2051,7 @@ fn install_input_handlers(
         let ui = ui.clone();
         focus.connect_leave(move |_| {
             tracing::debug!("video unfocused; restoring system shortcuts");
+            ui.video_focused.set(false);
             release_pressed_keys(&ui);
             if let Some(toplevel) = window.surface().and_downcast::<gdk::Toplevel>() {
                 toplevel.restore_system_shortcuts();
