@@ -102,10 +102,11 @@ run_pipeline() {
     local HN
     HN=$(hyprctl monitors -j | python3 -c "import sys,json;print(next((m['name'] for m in json.load(sys.stdin) if 'e2ecap' in m['name'] or m['name']=='e2ecap'),''))")
     local pipe
-    pipe=$($PROBE --instance "$NEST_SIG" --video "$video" pipeline --output "${HN:-e2ecap}" 2>/dev/null)
+    pipe=$($PROBE --instance "$NEST_SIG" --video "$video" pipeline --output "${HN:-e2ecap}" 2>&1)
     hyprctl output remove "${HN:-e2ecap}" >/dev/null 2>&1
-    echo "$pipe" | grep -q "^PASS" || fail "4:4:4 pipeline ($video)"
-    echo "$pipe" | grep -q "^FAIL" && fail "4:4:4 pipeline ($video) ($(echo "$pipe" | grep '^FAIL' | head -1))"
+    # Show the probe's output on failure, so a report carries the score.
+    echo "$pipe" | grep -q "^PASS" || { echo "$pipe" >&2; fail "4:4:4 pipeline ($video)"; }
+    echo "$pipe" | grep -q "^FAIL" && { echo "$pipe" >&2; fail "4:4:4 pipeline ($video) ($(echo "$pipe" | grep '^FAIL' | head -1))"; }
 }
 [ "$HAS_GPU" = 1 ] && run_pipeline gpu
 run_pipeline cpu
