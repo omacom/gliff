@@ -342,7 +342,6 @@ impl LoopState for State {
                 } else {
                     wl_pointer::AxisSource::Finger
                 };
-                self.pointer.axis_source(source);
                 if stop {
                     self.pointer.axis_stop(t, a);
                 } else if let Some(d) = discrete {
@@ -350,6 +349,11 @@ impl LoopState for State {
                 } else {
                     self.pointer.axis(t, a, value);
                 }
+                // After the axis, not before: Hyprland starts a fresh event
+                // (source wheel) on every `axis` and writes the source into
+                // the event of the last axis named, so a source sent first
+                // is dropped or lands on the other axis.
+                self.pointer.axis_source(source);
                 self.pointer.frame();
             }
             InputCmd::SetKeymap(text) if text == self.keys.text => {}
@@ -468,9 +472,10 @@ mod tests {
         }
     }
 
-    // Decode the actual outgoing Wayland key requests, including their device
-    // IDs. No compositor is needed: the socket peer records requests only.
-    fn key_requests(peer: &mut UnixStream) -> Vec<(u32, u32, bool)> {
+    // Decode the actual outgoing Wayland requests as (object id, opcode,
+    // argument words). No compositor is needed: the socket peer records
+    // requests only.
+    fn requests(peer: &mut UnixStream) -> Vec<(u32, u32, Vec<u32>)> {
         let mut bytes = Vec::new();
         let mut buf = [0; 4096];
         loop {
@@ -481,24 +486,31 @@ mod tests {
                 Err(e) => panic!("read Wayland requests: {e}"),
             }
         }
-        let mut keys = Vec::new();
+        let mut out = Vec::new();
         let mut at = 0;
         while at < bytes.len() {
             let word = |offset| u32::from_ne_bytes(bytes[offset..offset + 4].try_into().unwrap());
-            let id = word(at);
             let header = word(at + 4);
             let size = (header >> 16) as usize;
             assert!(size >= 8 && at + size <= bytes.len());
-            if header & 0xffff == 1 && size == 20 {
-                keys.push((id, word(at + 12), word(at + 16) != 0));
-            }
+            let args = (at + 8..at + size).step_by(4).map(word).collect();
+            out.push((word(at), header & 0xffff, args));
             at += size;
         }
-        keys
+        out
     }
 
-    #[test]
-    fn held_keys_move_to_the_replacement_keyboard() {
+    // Key requests (opcode 1) as (keyboard id, key, pressed).
+    fn key_requests(peer: &mut UnixStream) -> Vec<(u32, u32, bool)> {
+        requests(peer)
+            .into_iter()
+            .filter(|(_, op, args)| *op == 1 && args.len() == 3)
+            .map(|(id, _, args)| (id, args[1], args[2] != 0))
+            .collect()
+    }
+
+    // An input state talking to a socket peer instead of a compositor.
+    fn fake_state() -> (State, UnixStream, Connection) {
         let (socket, mut peer) = UnixStream::pair().unwrap();
         peer.set_nonblocking(true).unwrap();
         let conn = Connection::from_socket(socket).unwrap();
@@ -510,7 +522,6 @@ mod tests {
         let seat_proxy: WlSeat = registry.bind(2, 1, &qh, ());
         let ptr_mgr: ZwlrVirtualPointerManagerV1 = registry.bind(3, 2, &qh, ());
         let keyboard = kb_mgr.create_virtual_keyboard(&seat_proxy, &qh, ());
-        let old_id = keyboard.id().protocol_id();
         let mut state = State {
             sink: Box::new(|_| {}),
             conn: conn.clone(),
@@ -532,6 +543,15 @@ mod tests {
             quit: false,
         };
         state.upload_keymap().unwrap();
+        conn.flush().unwrap();
+        requests(&mut peer);
+        (state, peer, conn)
+    }
+
+    #[test]
+    fn held_keys_move_to_the_replacement_keyboard() {
+        let (mut state, mut peer, conn) = fake_state();
+        let old_id = state.keyboard.id().protocol_id();
         state.on_cmd(InputCmd::Key {
             code: 42,
             pressed: true,
@@ -575,6 +595,38 @@ mod tests {
         conn.flush().unwrap();
         assert!(key_requests(&mut peer).is_empty());
         assert!(state.retired.is_empty());
+    }
+
+    // Hyprland starts a fresh axis event on every `axis` and writes the
+    // source into the last axis named, so the source must follow the axis.
+    #[test]
+    fn axis_source_follows_the_axis() {
+        const AXIS: u32 = 3;
+        const FRAME: u32 = 4;
+        const SOURCE: u32 = 5;
+        const STOP: u32 = 6;
+        const DISCRETE: u32 = 7;
+        let (mut state, mut peer, conn) = fake_state();
+        let pointer = state.pointer.id().protocol_id();
+        for (axis, discrete, stop, first) in [
+            (Axis::Vertical, None, false, AXIS),
+            (Axis::Horizontal, Some(1), false, DISCRETE),
+            (Axis::Vertical, None, true, STOP),
+        ] {
+            state.on_cmd(InputCmd::Axis {
+                axis,
+                value: 1.0,
+                discrete,
+                stop,
+            });
+            conn.flush().unwrap();
+            let ops: Vec<u32> = requests(&mut peer)
+                .into_iter()
+                .filter(|(id, ..)| *id == pointer)
+                .map(|(_, op, _)| op)
+                .collect();
+            assert_eq!(ops, [first, SOURCE, FRAME]);
+        }
     }
 
     // 2560x1440 at scale 1.25 has a logical size of 2048x1152, which only
