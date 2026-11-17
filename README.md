@@ -76,7 +76,9 @@ gliff --headless user@host      # a private remote screen, sized and
 
 A mirrored screen keeps its own size and is fitted into the window. A private
 screen follows the window as you resize it, and is removed when you
-disconnect.
+disconnect. On a private screen the remote pointer is drawn into the picture
+and the local one is hidden; `--show-local-pointer` keeps the local pointer
+too, which moves with no delay while the remote one trails it.
 
 Every machine you connect to gets a tab in the title bar. Click a tab to
 connect to that machine, or to switch to it: each connection keeps running

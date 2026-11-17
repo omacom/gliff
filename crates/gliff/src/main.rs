@@ -65,6 +65,10 @@ struct Cli {
     /// this window, instead of mirroring the remote's focused screen.
     #[arg(long, conflicts_with = "output")]
     headless: bool,
+    /// Keep the local pointer visible on a headless screen. It moves with no
+    /// delay, and the remote pointer drawn into the picture trails it.
+    #[arg(long)]
+    show_local_pointer: bool,
     /// Mirror the named remote output (e.g. `DP-1`) instead of the focused one.
     #[arg(long)]
     output: Option<String>,
@@ -1350,7 +1354,7 @@ fn poll_status(ui: Rc<App>, s: Rc<Session>, rx: Receiver<Status>, generation: u6
                     // background session is resized when it is shown.
                     if is_active(&ui, &s) {
                         request_resize(&ui);
-                        if headless && s.cursor.borrow().is_none() {
+                        if headless && !ui.cli.show_local_pointer && s.cursor.borrow().is_none() {
                             let cursor = hidden_cursor();
                             ui.video.set_cursor(Some(&cursor));
                             *s.cursor.borrow_mut() = Some(cursor);
@@ -1464,9 +1468,11 @@ fn poll_status(ui: Rc<App>, s: Rc<Session>, rx: Receiver<Status>, generation: u6
 /// An image with no visible shape (fully transparent, or one flat colour as
 /// Hyprland sends when it has no cursor image to share) falls back to the
 /// default pointer — except on a headless session, whose frames already
-/// carry the compositor-drawn cursor and would show two pointers.
+/// carry the compositor-drawn cursor and would show two pointers, unless
+/// `--show-local-pointer` asks for both.
 fn set_remote_cursor(ui: &App, s: &Rc<Session>, image: CursorImage) {
-    let cursor = remote_cursor(image).or_else(|| s.headless.get().then(hidden_cursor));
+    let hide = s.headless.get() && !ui.cli.show_local_pointer;
+    let cursor = remote_cursor(image).or_else(|| hide.then(hidden_cursor));
     if is_active(ui, s) {
         ui.video.set_cursor(cursor.as_ref());
     }
