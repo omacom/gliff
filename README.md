@@ -78,6 +78,12 @@ A mirrored screen keeps its own size and is fitted into the window. A private
 screen follows the window as you resize it, and is removed when you
 disconnect.
 
+A private screen is one more output of the remote's Hyprland session, not a
+separate session. Unlocking the lock screen through gliff unlocks the
+remote's own monitors as well, and connecting can turn those monitors back
+on. Anyone at the remote machine can then see the desktop and use its
+keyboard and mouse while you work.
+
 Every machine you connect to gets a tab in the title bar. Click a tab to
 connect to that machine, or to switch to it: each connection keeps running
 while you look at another, so switching is instant. Hover a tab for its
