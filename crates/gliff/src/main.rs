@@ -964,6 +964,7 @@ fn show_session(ui: &Rc<App>, s: &Rc<Session>) {
     if !is_active(ui, s) {
         release_pressed_keys(ui);
         let previous = ui.active.replace(Some(s.clone()));
+        send_locks(ui, s);
         move_local_offer(
             previous.as_ref(),
             ui.cli.no_clipboard,
@@ -1339,6 +1340,7 @@ fn poll_status(ui: Rc<App>, s: Rc<Session>, rx: Receiver<Status>, generation: u6
                     if !s.connected.replace(true) {
                         refresh_tabs(&ui);
                     }
+                    send_locks(&ui, &s);
                     set_status(&ui, &s, "");
                     // Visible before the first per-second stats arrive.
                     set_stats(&ui, &s, &video);
@@ -1565,6 +1567,23 @@ fn send(ui: &App, msg: ClientMsg) {
     if let Some(s) = active(ui) {
         send_to(&s, msg);
     }
+}
+
+/// Hand the session the local Caps Lock and Num Lock, as the keyboard starts
+/// going to it. Not on every lock change: the lock key itself is forwarded
+/// and toggles both ends.
+fn send_locks(ui: &App, s: &Session) {
+    let display = gtk::prelude::WidgetExt::display(&ui.window);
+    let Some(kb) = display.default_seat().and_then(|seat| seat.keyboard()) else {
+        return;
+    };
+    send_to(
+        s,
+        ClientMsg::Locks {
+            caps: kb.is_caps_locked(),
+            num: kb.is_num_locked(),
+        },
+    );
 }
 
 fn send_to(s: &Session, msg: ClientMsg) {
@@ -2013,6 +2032,9 @@ fn install_input_handlers(
         };
         focus.connect_enter(move |_| {
             tracing::debug!("video focused; inhibiting system shortcuts");
+            if let Some(s) = active(&ui) {
+                send_locks(&ui, &s);
+            }
             if let Some(toplevel) = window.surface().and_downcast::<gdk::Toplevel>() {
                 toplevel.inhibit_system_shortcuts(None::<&gdk::Event>);
             }

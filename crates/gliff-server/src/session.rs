@@ -623,6 +623,10 @@ impl Session {
                 self.inject(InputCmd::SetKeymap(keymap))
             }
             ClientMsg::Keymap { .. } => {}
+            ClientMsg::Locks { caps, num } => {
+                tracing::debug!(caps, num, "client locks");
+                self.inject(InputCmd::SetLocks { caps, num })
+            }
             ClientMsg::Hello { .. } => anyhow::bail!("unexpected second Hello"),
         }
         Ok(ControlFlow::Continue(()))

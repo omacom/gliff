@@ -90,6 +90,11 @@ pub enum InputCmd {
         stop: bool,
     },
     SetKeymap(String),
+    /// Set Caps Lock and Num Lock to the client's.
+    SetLocks {
+        caps: bool,
+        num: bool,
+    },
     /// Extent of the output's logical space changed (resize).
     SetExtent {
         width: u32,

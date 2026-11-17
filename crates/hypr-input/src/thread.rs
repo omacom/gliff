@@ -387,6 +387,11 @@ impl LoopState for State {
                 }
                 Err(e) => self.emit(InputEvent::Error(e.to_string())),
             },
+            InputCmd::SetLocks { caps, num } => {
+                if let Some((dep, lat, lock, group)) = self.keys.set_locks(caps, num) {
+                    self.keyboard.modifiers(dep, lat, lock, group);
+                }
+            }
             InputCmd::SetExtent { width, height } => self.binding.set_extent(width, height),
             InputCmd::ReleaseAll => self.release_all(),
             InputCmd::Stop => self.stop(),

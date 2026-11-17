@@ -14,7 +14,7 @@ use bytes::Bytes;
 use gliff_proto::clipboard::CHUNK;
 use gliff_proto::{
     features, is_incompatible, version_mismatch, ChromaMode, ClientCaps, ClientMsg, ClipboardFile,
-    ClipboardMsg, Codec, ServerMsg, VideoPipeline, PROTOCOL_VERSION,
+    ClipboardMsg, Codec, ServerMsg, VideoPipeline, FEATURE_LOCK_STATE, PROTOCOL_VERSION,
 };
 use gliff_sw::VideoMode;
 use gliff_transport::clipboard::progress::Progress;
@@ -486,6 +486,7 @@ where
     // estimate is seeded ahead of the first frame ack.
     let mut got_ack = false;
     let mut headless = false;
+    let mut server_locks = false;
     let (mut cfg, pipeline) = loop {
         match reader.read_msg::<ServerMsg>().await? {
             ServerMsg::HelloAck {
@@ -500,6 +501,7 @@ where
                     );
                 }
                 tracing::debug!(?features, "server features");
+                server_locks = features.iter().any(|f| f == FEATURE_LOCK_STATE);
                 headless = session.headless;
                 got_ack = true;
             }
@@ -606,6 +608,7 @@ where
                         ClientMsg::Keymap { keymap: text }
                     }
                     cmd = input.recv() => match cmd {
+                        Some(ToWorker::Send(ClientMsg::Locks { .. })) if !server_locks => continue,
                         Some(ToWorker::Send(m)) => m,
                         Some(ToWorker::Zoom(z)) => {
                             let _ = zoom_tx.send(z);

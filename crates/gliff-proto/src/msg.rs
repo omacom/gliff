@@ -34,7 +34,10 @@ pub const PROTOCOL_VERSION: u16 = 1;
 
 /// Optional behaviours this build supports, exchanged in the handshake. A
 /// behaviour is used only when both ends list it.
-pub const FEATURES: &[&str] = &[];
+pub const FEATURES: &[&str] = &[FEATURE_LOCK_STATE];
+
+/// The client sends `ClientMsg::Locks`.
+pub const FEATURE_LOCK_STATE: &str = "lock-state";
 
 pub fn features() -> Vec<String> {
     FEATURES.iter().map(|f| f.to_string()).collect()
@@ -298,6 +301,17 @@ pub enum ClientMsg {
     Pong {
         #[n(0)]
         t: u64,
+    },
+    /// The client's Caps Lock and Num Lock, sent whenever its keyboard
+    /// starts going to this session: the remote's virtual keyboard starts
+    /// with no locks, and a lock toggled while the keyboard was elsewhere
+    /// never reached it. Only to a server that lists [`FEATURE_LOCK_STATE`].
+    #[n(17)]
+    Locks {
+        #[n(0)]
+        caps: bool,
+        #[n(1)]
+        num: bool,
     },
 }
 
@@ -612,6 +626,10 @@ mod tests {
             },
             ClientMsg::Keymap {
                 keymap: "xkb".into(),
+            },
+            ClientMsg::Locks {
+                caps: false,
+                num: true,
             },
         ];
         for m in msgs {

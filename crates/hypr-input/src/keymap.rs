@@ -140,6 +140,39 @@ impl KeyState {
         self.last_mods
     }
 
+    /// Lock or unlock Caps Lock and Num Lock, leaving the other modifiers
+    /// and the layout alone. Returns the new `(depressed, latched, locked,
+    /// group)` when it changed.
+    pub fn set_locks(&mut self, caps: bool, num: bool) -> Option<(u32, u32, u32, u32)> {
+        let mut locked = self.state.serialize_mods(xkb::STATE_MODS_LOCKED);
+        for (name, on) in [(xkb::MOD_NAME_CAPS, caps), (xkb::MOD_NAME_NUM, num)] {
+            let index = self.keymap.mod_get_index(name);
+            if index == xkb::MOD_INVALID {
+                continue;
+            }
+            if on {
+                locked |= 1 << index;
+            } else {
+                locked &= !(1 << index);
+            }
+        }
+        self.state.update_mask(
+            self.state.serialize_mods(xkb::STATE_MODS_DEPRESSED),
+            self.state.serialize_mods(xkb::STATE_MODS_LATCHED),
+            locked,
+            self.state.serialize_layout(xkb::STATE_LAYOUT_DEPRESSED),
+            self.state.serialize_layout(xkb::STATE_LAYOUT_LATCHED),
+            self.state.serialize_layout(xkb::STATE_LAYOUT_LOCKED),
+        );
+        let mods = self.mods();
+        if mods != self.last_mods {
+            self.last_mods = mods;
+            Some(mods)
+        } else {
+            None
+        }
+    }
+
     fn mods(&self) -> (u32, u32, u32, u32) {
         (
             self.state.serialize_mods(xkb::STATE_MODS_DEPRESSED),
@@ -202,6 +235,43 @@ mod tests {
             .expect("caps press changes mods");
         assert_eq!(mods.0, control);
         assert_eq!(mods.2, 0);
+    }
+
+    #[test]
+    fn set_locks_sets_num_lock_and_a_lock_key_still_toggles_it() {
+        const KEY_NUMLOCK: u32 = 69;
+        const KEY_LEFTCTRL: u32 = 29;
+        let mut ks = KeyState::default_us().unwrap();
+        let num = 1 << ks.keymap.mod_get_index(xkb::MOD_NAME_NUM);
+        let control = 1 << ks.keymap.mod_get_index(xkb::MOD_NAME_CTRL);
+        ks.update(KEY_LEFTCTRL, true);
+        let mods = ks.set_locks(false, true).expect("num lock changes mods");
+        assert_eq!((mods.0, mods.2), (control, num));
+        assert_eq!(ks.set_locks(false, true), None);
+        ks.update(KEY_NUMLOCK, true);
+        let mods = ks.update(KEY_NUMLOCK, false).expect("num lock release");
+        assert_eq!(mods.2, 0);
+    }
+
+    #[test]
+    fn set_locks_clears_and_leaves_other_locks_and_the_layout() {
+        let text = keymap_from_names(&KeymapNames {
+            layout: "us,de".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        let mut ks = KeyState::from_text(&text).unwrap();
+        let bit = |ks: &KeyState, name| 1 << ks.keymap.mod_get_index(name);
+        let (caps, num, mod5) = (
+            bit(&ks, xkb::MOD_NAME_CAPS),
+            bit(&ks, xkb::MOD_NAME_NUM),
+            bit(&ks, "Mod5"),
+        );
+        ks.state.update_mask(0, 0, mod5, 0, 0, 1);
+        let mods = ks.set_locks(true, true).expect("both locks change mods");
+        assert_eq!((mods.2, mods.3), (caps | num | mod5, 1));
+        let mods = ks.set_locks(false, false).expect("clearing changes mods");
+        assert_eq!((mods.2, mods.3), (mod5, 1));
     }
 
     #[test]
