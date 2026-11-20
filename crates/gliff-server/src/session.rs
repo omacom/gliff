@@ -15,7 +15,7 @@ use gliff_proto::clipboard::CHUNK;
 use gliff_proto::{
     features, version_mismatch, ChromaMode, ClientCaps, ClientMsg, ClipboardMsg, Codec, Greeting,
     OutputInfo as ProtoOutput, Rect, ServerMsg, SessionInfo, VideoPipeline, ERROR_NO_CHROMA,
-    ERROR_NO_CODEC, ERROR_SETUP, ERROR_VERSION, PROTOCOL_VERSION,
+    ERROR_NO_CODEC, ERROR_SETUP, ERROR_VERSION, FEATURE_CURSOR_IN_VIDEO, PROTOCOL_VERSION,
 };
 use gliff_sw::VideoMode;
 use gliff_transport::clipboard::progress::Jobs;
@@ -123,7 +123,10 @@ where
                 height: output.height,
                 scale_milli: (output.scale * 1000.0).round() as u32,
             }],
-            features: features(),
+            features: features()
+                .into_iter()
+                .chain([FEATURE_CURSOR_IN_VIDEO.to_string()])
+                .collect(),
         })
         .await?;
     let ladder = Ladder::new(START_LEVEL);
@@ -176,6 +179,7 @@ where
             allow_shm,
             output.is_headless(),
             cap_tx,
+            caps.features.iter().any(|f| f == FEATURE_CURSOR_IN_VIDEO),
         ),
     )
     .await?;
@@ -1809,6 +1813,7 @@ fn capture_config(
     cc
 }
 
+#[allow(clippy::too_many_arguments)]
 fn start_capture(
     target: &Target,
     output: &str,
@@ -1817,8 +1822,11 @@ fn start_capture(
     allow_shm: bool,
     headless: bool,
     tx: UnboundedSender<Incoming>,
+    cursor_in_video: bool,
 ) -> Result<Capturer> {
-    let cc = capture_config(target, output, render_node, capture, allow_shm, headless);
+    let mut cc = capture_config(target, output, render_node, capture, allow_shm, headless);
+    // Embedded cursors avoid the separate cursorshare path for Mac clients.
+    cc.cursor_in_video = cursor_in_video;
     let sink = Box::new(move |ev: CaptureEvent| {
         let msg = match ev {
             CaptureEvent::Frame(frame) => Incoming::Frame(frame),
