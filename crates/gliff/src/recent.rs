@@ -11,6 +11,10 @@ use serde::{Deserialize, Serialize};
 pub struct Config {
     #[serde(default, alias = "recent_machines")]
     pub machines: Vec<String>,
+    /// Where each machine's screen stands, for using it as a screen of this
+    /// one.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub monitors: std::collections::BTreeMap<String, crate::monitor::Settings>,
     /// The machines with a running session, in tab order of opening.
     #[serde(default)]
     pub open: Vec<String>,
@@ -80,6 +84,7 @@ impl Config {
     }
 
     pub fn forget(&mut self, machine: &str) {
+        self.monitors.remove(machine);
         self.machines.retain(|m| m != machine);
         self.set_open(machine, false);
         if self.shown.as_deref() == Some(machine) {
