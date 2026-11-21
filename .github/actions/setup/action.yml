@@ -14,7 +14,7 @@ runs:
       run: |
         pacman -Syu --noconfirm --needed \
           rust pkgconf \
-          wayland libxkbcommon libdrm mesa gtk4 libadwaita dbus
+          wayland libxkbcommon libdrm mesa gtk4 libadwaita dbus libvpx
     - name: Set up build cache
       if: inputs.cache == 'true'
       uses: jdx/mr-boxington-action@v1

@@ -38,6 +38,7 @@ use crate::net::Status;
 /// What the UI thread sends the worker.
 pub enum ToWorker {
     Send(ClientMsg),
+    SelectRustDeskDisplay(i32),
     /// Display pixels per stream pixel the decoder should write, so the
     /// picture is drawn 1:1 at an integer scale (see `paintable::layout`).
     Zoom(u32),
@@ -200,7 +201,7 @@ impl Bridge {
     /// A clipboard command from the UI; `Send` is handled by the caller.
     pub fn on_ui(&self, cmd: ToWorker) {
         match cmd {
-            ToWorker::Send(_) | ToWorker::Zoom(_) => {}
+            ToWorker::Send(_) | ToWorker::Zoom(_) | ToWorker::SelectRustDeskDisplay(_) => {}
             ToWorker::RevokeLocal => {
                 self.local_serial.set(None);
                 self.local_mimes.borrow_mut().clear();

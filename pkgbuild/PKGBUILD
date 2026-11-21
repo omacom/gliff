@@ -17,6 +17,7 @@ depends=(
   'libadwaita>=1.5'
   'libdrm'
   'libva>=2.20'
+  'libvpx'
   'libxkbcommon'
   'mesa'
   'openssh'

@@ -7,17 +7,28 @@
 
 mod clipboard;
 mod clipboard_ui;
+mod control;
+mod display;
+mod foreign_ui;
 mod keymap;
+mod monitor;
 mod net;
 mod paintable;
+mod protocol_badge;
 mod recent;
+mod remote_install;
+mod rustdesk_displays;
+mod secrets;
+mod sound;
 mod theme;
+mod tray;
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, sync_channel, Receiver};
 use std::time::{Duration, Instant};
 
@@ -58,9 +69,24 @@ struct Cli {
     /// to open a tab for each.
     #[arg(long)]
     connect: Vec<String>,
+    /// Show the gliff-server whose protocol arrives on stdin and leaves on
+    /// stdout. The machine running that server starts this over ssh to use
+    /// this screen as one of its own; the window closes when it stops.
+    #[arg(long, conflicts_with_all = ["host", "connect"])]
+    stdio: bool,
+    /// Open the window fullscreen.
+    #[arg(long)]
+    fullscreen: bool,
+    /// Put a --stdio receiver on this local display connector (e.g. DP-1).
+    #[arg(long, requires = "stdio")]
+    fullscreen_output: Option<String>,
     /// Remote gliff-server path.
     #[arg(long, default_value = "gliff-server")]
     server_bin: String,
+    /// The other machine's gliff, for using its screen as one of this
+    /// machine's.
+    #[arg(long, default_value = "gliff")]
+    remote_gliff: String,
     /// Create a private headless output on the remote, sized and scaled to
     /// this window, instead of mirroring the remote's focused screen.
     #[arg(long, conflicts_with = "output")]
@@ -72,7 +98,8 @@ struct Cli {
     /// the local compositor. Forms: a chord like `shift+escape`, `ctrl+alt+q`
     /// or `super+escape`; `double-<key>` for a double-tap (e.g.
     /// `double-escape`); or `none` to disable. The screen recaptures when you
-    /// click it again.
+    /// click it again. With `--control` it returns the pointer, and takes a
+    /// chord or `none`.
     #[arg(long, default_value = "shift+escape")]
     release_hotkey: String,
     /// Video pipeline: `gpu` (Vulkan compute + VA-API, falling back to the
@@ -80,16 +107,27 @@ struct Cli {
     /// the GLIFF_VIDEO environment variable.
     #[arg(long, value_parser = ["gpu", "cpu"])]
     video: Option<String>,
+    /// Drive another machine with this pointer and keyboard, with no window:
+    /// `SIDE:HOST`, where SIDE (`left`, `right`, `above` or `below`) is where
+    /// it sits beside this machine's screens. Push the pointer past that edge
+    /// to move onto it; cross back, or press the release hotkey, to return.
+    /// Repeat it for a machine on each side.
+    #[arg(long, value_parser = control::parse, conflicts_with_all = ["host", "connect", "headless", "output", "stdio"])]
+    control: Vec<control::Control>,
 }
 
 /// Everything the UI shares with its callbacks.
 struct App {
     window: adw::ApplicationWindow,
+    detached_display: Option<i32>,
+    screen_in_use: Rc<Cell<bool>>,
     /// The picture, upcast; input controllers attach to it and we measure it.
     video: gtk::Widget,
     /// What the picture shows: the latest frame fitted to the window.
     frame: paintable::FramePaintable,
     stats: gtk::Label,
+    rustdesk_display_button: gtk::MenuButton,
+    rustdesk_display_number: gtk::Label,
     /// Centred over the picture while the shown session is not streaming:
     /// connecting, reconnecting, an error, or no session at all.
     status: gtk::Label,
@@ -109,6 +147,8 @@ struct App {
     add_revealer: gtk::Revealer,
     /// The address bar: Enter connects to the machine typed.
     entry: gtk::Entry,
+    /// At the start of the address bar: the protocol it connects by.
+    protocol: Rc<protocol_badge::ProtocolBadge>,
     transfers: Rc<clipboard_ui::TransferBars>,
     /// The last number given to a worker. Paste bars are keyed by it, so
     /// jobs of different connections never share a row.
@@ -130,6 +170,8 @@ struct App {
     /// keyboard stays local until the pointer leaves, or the picture is
     /// clicked.
     released: Cell<bool>,
+    /// The header's screen buttons; set once the window is built.
+    monitor: RefCell<Option<Rc<monitor::Controller>>>,
     config_path: PathBuf,
     cli: Cli,
     keymap: keymap::Keymap,
@@ -143,6 +185,7 @@ struct Session {
     name: String,
     endpoint: Endpoint,
     input_tx: RefCell<Option<OutSender>>,
+    rustdesk_displays: RefCell<rustdesk_displays::State>,
     /// Bumped by every `start_session` and by `stop_session`, so pollers and
     /// delayed reconnects of an earlier worker can tell they are stale.
     generation: Cell<u64>,
@@ -154,6 +197,9 @@ struct Session {
     last_error: RefCell<Option<String>>,
     /// Automatic reconnects have given up; selecting the tab tries again.
     gave_up: Cell<bool>,
+    /// gliff is being installed on the machine; selecting the tab waits for
+    /// it instead of connecting into a half-written install.
+    installing: Cell<bool>,
     /// Recorded in the config on the first successful connect.
     remembered: Cell<bool>,
     /// The server is streaming: set by its Connected status, cleared when
@@ -185,6 +231,14 @@ struct Session {
     cursor: RefCell<Option<gdk::Cursor>>,
     status: RefCell<String>,
     stats: RefCell<String>,
+    /// An RDP or RustDesk machine's login, once given.
+    credentials: RefCell<Option<gliff_foreign::Credentials>>,
+    /// The login is being asked for; a second ask waits for it.
+    asking: Cell<bool>,
+    /// The login was typed with "Remember" on: keep it once it works.
+    remember_login: Cell<bool>,
+    /// An ssh machine that did not answer was checked for RDP and RustDesk.
+    probed: Cell<bool>,
 }
 
 impl Session {
@@ -198,11 +252,13 @@ impl Session {
             name: machine_name(&endpoint).to_string(),
             endpoint,
             input_tx: RefCell::new(None),
+            rustdesk_displays: RefCell::new(Default::default()),
             generation: Cell::new(0),
             conn: Cell::new(0),
             retries: Cell::new(0),
             last_error: RefCell::new(None),
             gave_up: Cell::new(false),
+            installing: Cell::new(false),
             remembered: Cell::new(false),
             connected: Cell::new(false),
             headless: Cell::new(false),
@@ -218,15 +274,45 @@ impl Session {
             cursor: RefCell::new(None),
             status: RefCell::new(String::new()),
             stats: RefCell::new(String::new()),
+            credentials: RefCell::new(None),
+            asking: Cell::new(false),
+            remember_login: Cell::new(false),
+            probed: Cell::new(false),
         }
     }
 }
 
 fn main() -> glib::ExitCode {
+    let cli = Cli::parse();
+    if !cli.control.is_empty() {
+        // With no window, the log is how it says what it is doing.
+        let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+        tracing_subscriber::fmt().with_env_filter(filter).init();
+        return match control::run(
+            &cli.control,
+            &cli.server_bin,
+            &cli.release_hotkey,
+            !cli.no_clipboard,
+        ) {
+            Ok(()) => glib::ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("gliff: {e:#}");
+                glib::ExitCode::FAILURE
+            }
+        };
+    }
+    // Before anything can print or start a thread: with --stdio, stdout
+    // carries the protocol, and ssh started us outside the desktop session.
+    if cli.stdio {
+        if let Err(e) = net::take_stdio().and_then(|()| find_desktop_session()) {
+            eprintln!("gliff: {e:#}");
+            return glib::ExitCode::FAILURE;
+        }
+    }
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
-    let cli = Cli::parse();
     // GTK uses the program name as the Wayland app ID.
     glib::set_prgname(Some(APP_NAME));
     let app = adw::Application::builder().build();
@@ -238,21 +324,87 @@ fn main() -> glib::ExitCode {
         gtk::Window::set_default_icon_name(APP_NAME);
         *theme_monitor.borrow_mut() = theme::follow_omarchy_theme();
     });
-    app.connect_activate(move |app| build_ui(app, &cli));
+    let screen_in_use = Rc::new(Cell::new(false));
+    app.connect_activate(move |app| build_ui(app, &cli, None, screen_in_use.clone()));
     // GTK owns argv parsing; we already parsed with clap, so pass none.
     let empty: Vec<String> = vec![];
-    app.run_with_args(&empty)
+    let code = app.run_with_args(&empty);
+    if STDIO_FAILED.load(Ordering::Relaxed) {
+        return glib::ExitCode::FAILURE;
+    }
+    code
+}
+
+/// A --stdio stream ended on an error rather than by either side closing
+/// it: the process exits unsuccessfully, so the machine that started it
+/// can tell the user why.
+static STDIO_FAILED: AtomicBool = AtomicBool::new(false);
+
+/// End a --stdio window on `error`, already logged. Its last stderr line
+/// is the reason the other machine shows.
+fn fail_stdio(ui: &App, error: &str) {
+    eprintln!("{error}");
+    STDIO_FAILED.store(true, Ordering::Relaxed);
+    ui.window.close();
+}
+
+/// A command run over ssh has no `WAYLAND_DISPLAY`: show the window on the
+/// user's running Hyprland session, the way gliff-server finds it.
+fn find_desktop_session() -> anyhow::Result<()> {
+    if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        return Ok(());
+    }
+    let runtime_dir = hypr_ipc::runtime_dir()?;
+    let instance = hypr_ipc::Instance::discover(None)?;
+    let display = instance.wayland_display()?;
+    // Single-threaded still: nothing else reads the environment yet.
+    std::env::set_var("XDG_RUNTIME_DIR", runtime_dir);
+    std::env::set_var("WAYLAND_DISPLAY", display);
+    std::env::set_var("HYPRLAND_INSTANCE_SIGNATURE", &instance.signature);
+    Ok(())
 }
 
 /// The endpoints named on the command line, if any.
 fn endpoints_from_cli(cli: &Cli) -> Vec<Endpoint> {
+    if cli.stdio {
+        let peer = stdio_peer(std::env::var("SSH_CONNECTION").ok().as_deref());
+        return vec![Endpoint::Stdio(peer)];
+    }
     if !cli.connect.is_empty() {
         return cli.connect.iter().cloned().map(Endpoint::Tcp).collect();
     }
     cli.host
         .iter()
-        .map(|host| ssh_endpoint(cli, host))
+        .filter_map(|host| match endpoint_for(cli, host) {
+            Ok(endpoint) => Some(endpoint),
+            Err(why) => {
+                tracing::error!(%host, %why, "cannot connect");
+                None
+            }
+        })
         .collect()
+}
+
+/// The endpoint for a machine by the name it is typed or listed under:
+/// `rdp://…` and `rustdesk://…` are foreign machines, anything else an ssh
+/// host. `None`, with the reason, for a foreign address that does not parse.
+fn endpoint_for(cli: &Cli, name: &str) -> Result<Endpoint, String> {
+    match gliff_foreign::Target::parse(name) {
+        Some(Ok(target)) => Ok(Endpoint::Foreign {
+            name: name.to_string(),
+            target,
+        }),
+        Some(Err(why)) => Err(why),
+        None => Ok(ssh_endpoint(cli, name)),
+    }
+}
+
+/// Open a session for `name`, or say why its address is unusable.
+fn open_machine(ui: &Rc<App>, name: &str) {
+    match endpoint_for(&ui.cli, name) {
+        Ok(endpoint) => open_session(ui, endpoint),
+        Err(why) => show_hint(ui, &format!("Cannot connect to {name}: {why}")),
+    }
 }
 
 fn ssh_endpoint(cli: &Cli, host: &str) -> Endpoint {
@@ -266,11 +418,21 @@ fn ssh_endpoint(cli: &Cli, host: &str) -> Endpoint {
     Endpoint::Ssh(t)
 }
 
+/// The machine at the other end of a --stdio session: the client address
+/// in ssh's `SSH_CONNECTION`, when there is one.
+fn stdio_peer(ssh_connection: Option<&str>) -> String {
+    ssh_connection
+        .and_then(|c| c.split_whitespace().next())
+        .unwrap_or("stdio")
+        .to_owned()
+}
+
 /// The tab name for an endpoint.
 fn machine_name(endpoint: &Endpoint) -> &str {
     match endpoint {
         Endpoint::Ssh(t) => t.host.as_str(),
-        Endpoint::Tcp(addr) => addr.as_str(),
+        Endpoint::Tcp(addr) | Endpoint::Stdio(addr) => addr.as_str(),
+        Endpoint::Foreign { name, .. } => name.as_str(),
     }
 }
 
@@ -282,7 +444,31 @@ fn window_title(endpoint: &Endpoint) -> String {
 
 /// The one window: a header with a tab per machine and the address bar, the
 /// remote screen (black until connected) with any status over it.
-fn build_ui(app: &adw::Application, cli: &Cli) {
+fn build_ui(
+    app: &adw::Application,
+    cli: &Cli,
+    detached: Option<(Rc<Session>, i32)>,
+    screen_in_use: Rc<Cell<bool>>,
+) {
+    let fullscreen_monitor = if let Some(output) = &cli.fullscreen_output {
+        let monitor = gdk::Display::default().and_then(|display| {
+            display
+                .monitors()
+                .iter::<gdk::Monitor>()
+                .filter_map(Result::ok)
+                .find(|monitor| monitor.connector().as_deref() == Some(output.as_str()))
+        });
+        let Some(monitor) = monitor else {
+            eprintln!("gliff: no display connector named {output:?} on this machine");
+            STDIO_FAILED.store(true, Ordering::Relaxed);
+            app.quit();
+            return;
+        };
+        Some(monitor)
+    } else {
+        None
+    };
+    let detached_display = detached.as_ref().map(|(_, display)| *display);
     let window = adw::ApplicationWindow::builder()
         .application(app)
         .title("Gliff")
@@ -294,7 +480,11 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         .show_title(false)
         // No window buttons: closing is the compositor's job, and a stray
         // click on an X in the middle of a remote session is a bad surprise.
-        .decoration_layout("")
+        .decoration_layout(if detached_display.is_some() {
+            ":close"
+        } else {
+            ""
+        })
         .build();
     let entry = gtk::Entry::builder()
         .placeholder_text("user@host")
@@ -305,6 +495,8 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         .tooltip_text("Connect")
         .build();
     let address_bar = gtk::Box::builder().css_classes(["linked"]).build();
+    let protocol = protocol_badge::ProtocolBadge::new(&entry, &address_bar);
+    address_bar.append(protocol.widget());
     address_bar.append(&entry);
     address_bar.append(&connect_btn);
     let add_revealer = gtk::Revealer::builder()
@@ -335,6 +527,52 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
     header.pack_start(&add_revealer);
     header.pack_end(&fullscreen_btn);
     header.pack_end(&stats_btn);
+    let rustdesk_display_label = gtk::Box::new(gtk::Orientation::Horizontal, 3);
+    rustdesk_display_label.append(&gtk::Image::from_icon_name(
+        "video-joined-displays-symbolic",
+    ));
+    let rustdesk_display_number = gtk::Label::new(None);
+    rustdesk_display_number.add_css_class("remote-display-badge");
+    rustdesk_display_number.set_valign(gtk::Align::Center);
+    rustdesk_display_number.set_visible(false);
+    rustdesk_display_label.append(&rustdesk_display_number);
+    let rustdesk_display_button = gtk::MenuButton::builder()
+        .child(&rustdesk_display_label)
+        .tooltip_text("Choose RustDesk monitor")
+        .visible(false)
+        .build();
+    header.pack_end(&rustdesk_display_button);
+    let monitor_btn = gtk::Button::builder()
+        .icon_name("video-display-symbolic")
+        .build();
+    let monitor_settings_btn = gtk::Button::builder()
+        .icon_name("emblem-system-symbolic")
+        .tooltip_text("Where the other machine's screen stands")
+        .build();
+    let control_btn = gtk::Button::builder()
+        .icon_name("input-mouse-symbolic")
+        .build();
+    let sound_btn = gtk::ToggleButton::builder()
+        .icon_name("audio-volume-muted-symbolic")
+        .visible(false)
+        .build();
+    let hide_btn = gtk::Button::builder()
+        .icon_name("go-bottom-symbolic")
+        .tooltip_text("Hide this window in the bar while it works in the background")
+        .visible(false)
+        .build();
+    // A --stdio window is itself the other machine's screen.
+    if !cli.stdio {
+        header.pack_end(&monitor_btn);
+        if detached_display.is_none() {
+            header.pack_end(&sound_btn);
+            header.pack_end(&control_btn);
+        }
+        header.pack_end(&monitor_settings_btn);
+        if detached_display.is_none() {
+            header.pack_end(&hide_btn);
+        }
+    }
 
     let stats = gtk::Label::builder()
         .halign(gtk::Align::Start)
@@ -399,9 +637,13 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
 
     let ui = Rc::new(App {
         window: window.clone(),
+        detached_display,
+        screen_in_use,
         video: video.clone(),
         frame,
         stats: stats.clone(),
+        rustdesk_display_button,
+        rustdesk_display_number,
         status: status.clone(),
         hint,
         hint_generation: Cell::new(0),
@@ -410,6 +652,7 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         add_btn,
         add_revealer,
         entry: entry.clone(),
+        protocol,
         transfers,
         connections: Cell::new(0),
         sessions: RefCell::new(Vec::new()),
@@ -419,6 +662,7 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         view_scale: Cell::new(1.0),
         pressed_keys: RefCell::new(BTreeSet::new()),
         released: Cell::new(false),
+        monitor: RefCell::new(None),
         config_path: Config::default_path(),
         cli: cli.clone(),
         keymap: keymap::watch(),
@@ -429,14 +673,31 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         ReleaseHotkey::None
     });
     install_input_handlers(&ui, &video, &window, hotkey);
-    install_resize_handler(&ui);
-    install_address_bar(&ui, &connect_btn);
+    let resize_timer = RefCell::new(Some(install_resize_handler(&ui)));
+    if detached_display.is_none() {
+        install_address_bar(&ui, &connect_btn);
+    }
+    if !ui.cli.stdio {
+        *ui.monitor.borrow_mut() = Some(monitor::Controller::install(
+            &ui,
+            &monitor_btn,
+            &monitor_settings_btn,
+            &control_btn,
+            &hide_btn,
+            &sound_btn,
+        ));
+    }
     refresh_tabs(&ui);
 
     // Fullscreen toggle.
     {
         let window = window.clone();
         fullscreen_btn.connect_toggled(move |b| {
+            // The window also syncs this button when its state changes.
+            // Reissuing fullscreen there would discard the requested monitor.
+            if b.is_active() == window.is_fullscreen() {
+                return;
+            }
             if b.is_active() {
                 window.fullscreen();
             } else {
@@ -464,13 +725,55 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         ".machine-tab > button.tab-action:hover { color: currentColor; }",
         ".status-dot { min-width: 6px; min-height: 6px; border-radius: 50%; border: 1.5px solid alpha(currentColor, 0.6); }",
         ".status-dot.connected { background: var(--success-color); border-color: var(--success-color); }",
+        ".remote-display-badge { background: alpha(currentColor, 0.16); border-radius: 999px; font-size: 0.8em; font-weight: bold; min-width: 1em; padding: 0 3px; }",
     ));
-    if let Some(display) = gdk::Display::default() {
+    if let Some(display) = gdk::Display::default().filter(|_| detached_display.is_none()) {
         gtk::style_context_add_provider_for_display(
             &display,
             &css,
             gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
+    }
+
+    // Another window can keep the application running after this one closes.
+    // Shut down this window's workers without forgetting its usual tabs.
+    let weak_ui = Rc::downgrade(&ui);
+    window.connect_close_request(move |_| {
+        if let Some(timer) = resize_timer.borrow_mut().take() {
+            timer.remove();
+        }
+        if let Some(ui) = weak_ui.upgrade() {
+            release_pressed_keys(&ui);
+            for session in ui.sessions.borrow_mut().drain(..) {
+                session.generation.set(session.generation.get() + 1);
+                session.input_tx.borrow_mut().take();
+                session.last_frame.borrow_mut().take();
+                session.credentials.borrow_mut().take();
+            }
+            ui.active.borrow_mut().take();
+            ui.frame.clear();
+            if ui.detached_display.is_some() {
+                while let Some(tab) = ui.tabs.first_child() {
+                    ui.tabs.remove(&tab);
+                }
+                let controllers = ui.video.observe_controllers();
+                while let Some(controller) =
+                    controllers.item(0).and_downcast::<gtk::EventController>()
+                {
+                    ui.video.remove_controller(&controller);
+                }
+            }
+        }
+        glib::Propagation::Proceed
+    });
+
+    if let Some((session, _)) = detached {
+        show_address_bar(&ui, false);
+        ui.sessions.borrow_mut().push(session.clone());
+        start_session(ui.clone(), session.clone());
+        show_session(&ui, &session);
+        window.present();
+        return;
     }
 
     // Offer every local clipboard change to the shown server; our own proxy
@@ -501,13 +804,23 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         *ui.local_clipboard.borrow_mut() = watch;
     }
 
+    if let Some(monitor) = fullscreen_monitor {
+        window.fullscreen_on_monitor(&monitor);
+    } else if cli.fullscreen {
+        window.fullscreen();
+    }
     window.present();
     // Reconnect the machines that were connected when the window last
     // closed, then any named on the command line, which is shown first.
-    let config = Config::load(&ui.config_path);
+    // A --stdio window shows only the machine that started it.
+    let config = if cli.stdio {
+        Config::default()
+    } else {
+        Config::load(&ui.config_path)
+    };
     let from_cli = endpoints_from_cli(cli);
     for machine in &config.open {
-        open_session(&ui, ssh_endpoint(cli, machine));
+        open_machine(&ui, machine);
     }
     for endpoint in from_cli.iter().cloned() {
         if find_session(&ui, machine_name(&endpoint)).is_none() {
@@ -590,11 +903,14 @@ fn install_address_bar(ui: &Rc<App>, connect_btn: &gtk::Button) {
 }
 
 /// Show the address bar in place of the +, or fold it back. With no tabs
-/// the address bar is all there is, so it stays.
+/// the address bar is all there is, so it stays. A --stdio window has
+/// neither: it closes with its one stream, and would take any other
+/// machine opened in it along.
 fn show_address_bar(ui: &App, show: bool) {
-    let show = show || ui.tabs.first_child().is_none();
+    let can_add = !ui.cli.stdio && ui.detached_display.is_none();
+    let show = can_add && (show || ui.tabs.first_child().is_none());
     ui.add_revealer.set_reveal_child(show);
-    ui.add_btn.set_visible(!show);
+    ui.add_btn.set_visible(!show && can_add);
     // A folded address bar must not keep the focus GTK gave it when the
     // window opened, or hovering the picture would never capture.
     if !show && address_bar_in_use(&ui.window, &ui.entry) {
@@ -605,14 +921,15 @@ fn show_address_bar(ui: &App, show: bool) {
 /// Connect to the machine in the address bar, or switch to its tab when it
 /// is already connected.
 fn connect_from_address_bar(ui: &Rc<App>) {
-    let machine = ui.entry.text().trim().to_string();
-    if machine.is_empty() {
+    if ui.entry.text().trim().is_empty() || ui.cli.stdio || ui.detached_display.is_some() {
         return;
     }
+    let machine = ui.protocol.address();
     ui.entry.set_text("");
+    ui.protocol.reset();
     match find_session(ui, &machine) {
         Some(s) => show_session(ui, &s),
-        None => open_session(ui, ssh_endpoint(&ui.cli, &machine)),
+        None => open_machine(ui, &machine),
     }
     show_address_bar(ui, false);
     if active(ui).is_some() {
@@ -624,6 +941,7 @@ fn connect_from_address_bar(ui: &Rc<App>) {
 /// hand focus back to the remote screen when there is one.
 fn cancel_address_edit(ui: &App) {
     ui.entry.set_text("");
+    ui.protocol.reset();
     show_address_bar(ui, false);
     if active(ui).is_some() {
         ui.video.grab_focus();
@@ -767,7 +1085,11 @@ fn find_session(ui: &App, name: &str) -> Option<Rc<Session>> {
 /// not remembered yet (a first connect still in progress, or a dev
 /// `--connect`).
 fn tab_names(ui: &App) -> Vec<String> {
-    let mut names = Config::load(&ui.config_path).machines;
+    let mut names = if ui.cli.stdio || ui.detached_display.is_some() {
+        Vec::new()
+    } else {
+        Config::load(&ui.config_path).machines
+    };
     for s in ui.sessions.borrow().iter() {
         if !names.contains(&s.name) {
             names.push(s.name.clone());
@@ -793,6 +1115,9 @@ fn refresh_tabs(ui: &Rc<App>) {
     if !has_tabs {
         show_address_bar(ui, true);
     }
+    if let Some(m) = ui.monitor.borrow().as_ref() {
+        m.update_control_button();
+    }
 }
 
 /// A machine's tab: its name, which shows that machine, and a button that
@@ -800,11 +1125,17 @@ fn refresh_tabs(ui: &Rc<App>) {
 /// can be dragged into a new order.
 fn machine_tab(ui: &Rc<App>, name: &str) -> gtk::Box {
     let session = find_session(ui, name);
-    let running = session.is_some();
+    let screen_in_use = ui.monitor.borrow().as_ref().is_some_and(|m| m.owns(name));
+    let driven = ui.monitor.borrow().as_ref().is_some_and(|m| m.drives(name));
+    let running = session.is_some() || screen_in_use || driven;
     // The name is a plain label and the whole tab takes the click, so no
     // part of a tab takes keyboard focus and grows a focus ring.
+    let tab_title = ui.detached_display.map_or_else(
+        || name.to_string(),
+        |index| format!("{name} · Monitor {}", i64::from(index) + 1),
+    );
     let label = gtk::Label::builder()
-        .label(name)
+        .label(&tab_title)
         .css_classes(["tab-label"])
         .build();
     if !running {
@@ -812,7 +1143,12 @@ fn machine_tab(ui: &Rc<App>, name: &str) -> gtk::Box {
     }
     // The slot on the right shows whether the machine is connected, and
     // turns into its button while the pointer is on it.
-    let connected = session.as_ref().is_some_and(|s| s.connected.get());
+    let connected = session.as_ref().is_some_and(|s| s.connected.get())
+        || ui
+            .monitor
+            .borrow()
+            .as_ref()
+            .is_some_and(|m| m.drives_connected(name));
     let status_tip = if connected {
         "Connected"
     } else {
@@ -841,7 +1177,15 @@ fn machine_tab(ui: &Rc<App>, name: &str) -> gtk::Box {
         .focusable(false)
         .build();
     let tab = gtk::Box::builder().css_classes(["machine-tab"]).build();
-    if session.as_ref().is_some_and(|s| is_active(ui, s)) {
+    let chosen = || {
+        active(ui).is_none()
+            && ui
+                .monitor
+                .borrow()
+                .as_ref()
+                .is_some_and(|m| m.chosen().as_deref() == Some(name))
+    };
+    if session.as_ref().is_some_and(|s| is_active(ui, s)) || chosen() {
         tab.add_css_class("active");
     }
     tab.append(&label);
@@ -889,13 +1233,25 @@ fn machine_tab(ui: &Rc<App>, name: &str) -> gtk::Box {
         action.connect_clicked(move |_| {
             let (ui, name) = (ui.clone(), name.clone());
             glib::idle_add_local_once(move || {
-                if running {
+                if screen_in_use {
+                    if let Some(m) = ui.monitor.borrow().clone() {
+                        m.stop();
+                    }
+                } else if driven && find_session(&ui, &name).is_none() {
+                    if let Some(m) = ui.monitor.borrow().clone() {
+                        m.stop_control(&name);
+                    }
+                } else if running {
                     stop_session(&ui, &name);
                 } else {
                     forget_machine(&ui, &name);
                 }
             });
         });
+    }
+
+    if ui.detached_display.is_some() {
+        return tab;
     }
 
     // Drag to reorder. The source runs in the capture phase so a drag
@@ -938,17 +1294,63 @@ fn machine_tab(ui: &Rc<App>, name: &str) -> gtk::Box {
 /// Show a machine's tab: switch to its running session, retrying one whose
 /// reconnects gave up, or connect to it.
 fn select_tab(ui: &Rc<App>, name: &str) {
+    // A machine lending its screen is not also shown here unless asked
+    // for: connecting to it would show this screen inside itself.
+    let lending = ui.monitor.borrow().as_ref().is_some_and(|m| m.owns(name));
+    if lending && ui.detached_display.is_some() {
+        return;
+    }
+    if lending && find_session(ui, name).is_none() {
+        show_lending(ui, name);
+        return;
+    }
+    let driven = ui.monitor.borrow().as_ref().is_some_and(|m| m.drives(name));
+    if driven && find_session(ui, name).is_none() {
+        show_controlling(ui, name);
+        return;
+    }
     match find_session(ui, name) {
         Some(s) => {
-            if s.gave_up.get() {
+            if s.gave_up.get() && !s.installing.get() {
                 s.retries.set(0);
                 s.gave_up.set(false);
                 start_session(ui.clone(), s.clone());
             }
             show_session(ui, &s);
         }
-        None => open_session(ui, ssh_endpoint(&ui.cli, name)),
+        None => open_machine(ui, name),
     }
+}
+
+/// Select `name`'s tab while its screen is in use here, without its
+/// session, which would show this screen inside itself.
+fn show_lending(ui: &Rc<App>, name: &str) {
+    // Its tab is the selected one, also after the screen stops.
+    if let Some(m) = ui.monitor.borrow().as_ref() {
+        m.choose(name);
+    }
+    show_nothing(ui);
+    stop_session(ui, name);
+    show_status(
+        ui,
+        &format!("{name}'s screen is in use as a screen of this computer."),
+    );
+}
+
+/// Select `name`'s tab while it is driven from this computer's edge,
+/// without its session: its picture here would only take the pointer away
+/// from that edge.
+fn show_controlling(ui: &Rc<App>, name: &str) {
+    let monitor = ui.monitor.borrow().clone();
+    if let Some(m) = &monitor {
+        m.choose(name);
+    }
+    show_nothing(ui);
+    stop_session(ui, name);
+    if let Some(m) = &monitor {
+        show_status(ui, &m.control_status(name));
+    }
+    refresh_tabs(ui);
 }
 
 /// Connect to `endpoint` in a new session and show it.
@@ -959,8 +1361,38 @@ fn open_session(ui: &Rc<App>, endpoint: Endpoint) {
     show_session(ui, &s);
 }
 
+/// Open a second connection to the same machine while the source tab keeps streaming.
+fn open_rustdesk_display_window(ui: &Rc<App>, source: &Session, display: i32) {
+    let Some(app) = ui.window.application().and_downcast::<adw::Application>() else {
+        return;
+    };
+    let Some(credentials) = source.credentials.borrow().clone() else {
+        return;
+    };
+    release_pressed_keys(ui);
+    let session = Rc::new(Session::new(source.endpoint.clone()));
+    *session.credentials.borrow_mut() = Some(credentials);
+    build_ui(
+        &app,
+        &ui.cli,
+        Some((session, display)),
+        ui.screen_in_use.clone(),
+    );
+}
+
+fn pause_detached_view(ui: &Rc<App>, session: &Session) {
+    show_nothing(ui);
+    session.generation.set(session.generation.get() + 1);
+    session.input_tx.borrow_mut().take();
+    session.last_frame.borrow_mut().take();
+    session.connected.set(false);
+}
+
 /// Make `s` the session the window shows and sends input to.
 fn show_session(ui: &Rc<App>, s: &Rc<Session>) {
+    if let Some(m) = ui.monitor.borrow().as_ref() {
+        m.unchoose();
+    }
     if !is_active(ui, s) {
         release_pressed_keys(ui);
         let previous = ui.active.replace(Some(s.clone()));
@@ -969,13 +1401,16 @@ fn show_session(ui: &Rc<App>, s: &Rc<Session>) {
             ui.cli.no_clipboard,
             ui.local_clipboard.borrow().as_ref(),
         );
-        if matches!(s.endpoint, Endpoint::Ssh(_)) {
-            let mut config = Config::load(&ui.config_path);
-            config.shown = Some(s.name.clone());
-            save_config(ui, &config);
+        if s.endpoint.is_listed() && ui.detached_display.is_none() {
+            update_config(ui, |c| c.shown = Some(s.name.clone()));
         }
     }
-    ui.window.set_title(Some(&window_title(&s.endpoint)));
+    let title = window_title(&s.endpoint);
+    let title = match ui.detached_display {
+        Some(index) => format!("{title} · Monitor {}", i64::from(index) + 1),
+        None => title,
+    };
+    ui.window.set_title(Some(&title));
     show_status(ui, &s.status.borrow());
     ui.stats.set_text(&s.stats.borrow());
     match &*s.last_frame.borrow() {
@@ -987,6 +1422,7 @@ fn show_session(ui: &Rc<App>, s: &Rc<Session>) {
     // shown.
     request_resize(ui);
     request_zoom(ui);
+    rustdesk_displays::refresh(ui);
     refresh_tabs(ui);
 }
 
@@ -1000,15 +1436,24 @@ fn show_nothing(ui: &Rc<App>) {
     ui.stats.set_text("");
     ui.frame.clear();
     ui.video.set_cursor(None);
+    rustdesk_displays::refresh(ui);
     refresh_tabs(ui);
 }
 
 /// End a machine's session. When it was the one shown, the window moves to
 /// the nearest running tab, to the right first.
 fn stop_session(ui: &Rc<App>, name: &str) {
+    if let Some(controller) = ui.monitor.borrow().as_ref() {
+        controller.cancel_check(name);
+    }
     let Some(s) = find_session(ui, name) else {
         return;
     };
+    // A --stdio window exists for its one session.
+    if matches!(s.endpoint, Endpoint::Stdio(_)) || ui.detached_display.is_some() {
+        ui.window.close();
+        return;
+    }
     let was_active = is_active(ui, &s);
     if was_active {
         release_pressed_keys(ui);
@@ -1020,10 +1465,8 @@ fn stop_session(ui: &Rc<App>, name: &str) {
     ui.transfers.clear_connection(s.conn.get());
     s.last_frame.borrow_mut().take();
     // A machine stopped by hand stays stopped when the window reopens.
-    if matches!(s.endpoint, Endpoint::Ssh(_)) {
-        let mut config = Config::load(&ui.config_path);
-        config.set_open(&s.name, false);
-        save_config(ui, &config);
+    if s.endpoint.is_listed() {
+        update_config(ui, |c| c.set_open(&s.name, false));
     }
     let names = tab_names(ui);
     ui.sessions.borrow_mut().retain(|o| !Rc::ptr_eq(o, &s));
@@ -1044,26 +1487,31 @@ fn stop_session(ui: &Rc<App>, name: &str) {
 
 /// Drop a machine that is not running from the remembered list.
 fn forget_machine(ui: &Rc<App>, name: &str) {
-    let mut config = Config::load(&ui.config_path);
-    config.forget(name);
-    save_config(ui, &config);
+    if let Some(controller) = ui.monitor.borrow().as_ref() {
+        controller.cancel_check(name);
+    }
+    update_config(ui, |c| c.forget(name));
+    if gliff_foreign::Target::parse(name).is_some() {
+        foreign_ui::forget(name);
+    }
     refresh_tabs(ui);
 }
 
 /// Move the dragged tab next to the one it was dropped on. Only remembered
 /// machines have a place to keep.
 fn move_tab(ui: &Rc<App>, dragged: &str, target: &str, after: bool) {
-    let mut config = Config::load(&ui.config_path);
-    if config.move_machine(dragged, target, after) {
-        save_config(ui, &config);
+    if update_config(ui, |c| c.move_machine(dragged, target, after)) == Some(true) {
         refresh_tabs(ui);
     }
 }
 
-fn save_config(ui: &App, config: &Config) {
-    if let Err(e) = config.save(&ui.config_path) {
-        tracing::warn!(path = %ui.config_path.display(), error = %e, "cannot save config");
-    }
+/// Change the saved config with `change`; `None` when it cannot be saved.
+fn update_config<R>(ui: &App, change: impl FnOnce(&mut Config) -> R) -> Option<R> {
+    Config::update(&ui.config_path, change)
+        .inspect_err(|e| {
+            tracing::warn!(path = %ui.config_path.display(), error = %e, "cannot save config");
+        })
+        .ok()
 }
 
 /// Set a session's status, showing it when the session is. A streaming
@@ -1103,6 +1551,10 @@ fn set_stats(ui: &App, s: &Rc<Session>, text: &str) {
 
 /// Go back to a black screen with no stream geometry.
 fn show_disconnected(ui: &Rc<App>, s: &Rc<Session>) {
+    *s.rustdesk_displays.borrow_mut() = Default::default();
+    if is_active(ui, s) {
+        rustdesk_displays::refresh(ui);
+    }
     if s.connected.replace(false) {
         refresh_tabs(ui);
     }
@@ -1122,9 +1574,32 @@ fn show_disconnected(ui: &Rc<App>, s: &Rc<Session>) {
 /// Start a worker for the session. Each call is a new generation; pollers
 /// and reconnects from an older one stop themselves.
 fn start_session(ui: Rc<App>, s: Rc<Session>) {
+    let login = match &s.endpoint {
+        Endpoint::Foreign { .. } => {
+            let Some(credentials) = s.credentials.borrow().clone() else {
+                ask_login(ui, s, None);
+                return;
+            };
+            let config = Config::load(&ui.config_path);
+            let (w, h) = ui.view_size.get();
+            Some(net::Login {
+                credentials,
+                known_certificate: config.certificates.get(&s.name).cloned(),
+                size: (
+                    u16::try_from(w).unwrap_or(1920).max(640),
+                    u16::try_from(h).unwrap_or(1080).max(480),
+                ),
+            })
+        }
+        _ => None,
+    };
     let (frame_tx, frame_rx) = sync_channel::<Picture>(2);
     let (status_tx, status_rx) = channel::<Status>();
     let (input_tx, input_rx) = unbounded_channel::<clipboard::ToWorker>();
+    if let Some(index) = ui.detached_display {
+        s.rustdesk_displays.borrow_mut().expect_display(index);
+        let _ = input_tx.send(clipboard::ToWorker::SelectRustDeskDisplay(index));
+    }
     // Replacing the sender closes the old worker's input, which ends it.
     *s.input_tx.borrow_mut() = Some(input_tx);
     s.zoom.set(1);
@@ -1154,6 +1629,7 @@ fn start_session(ui: Rc<App>, s: Rc<Session>) {
                 status: status_tx,
                 input: input_rx,
                 keymap,
+                login,
             }
             .run();
         })
@@ -1169,13 +1645,13 @@ const MAX_RETRIES: u32 = 5;
 /// reconnect when the window opens again, once per session. The connected
 /// status repeats on every stream reconfigure, such as a resize.
 fn remember_machine(ui: &Rc<App>, s: &Session) {
-    if !matches!(s.endpoint, Endpoint::Ssh(_)) || s.remembered.replace(true) {
+    if ui.detached_display.is_some() || !s.endpoint.is_listed() || s.remembered.replace(true) {
         return;
     }
-    let mut config = Config::load(&ui.config_path);
-    config.remember(&s.name);
-    config.set_open(&s.name, true);
-    save_config(ui, &config);
+    update_config(ui, |c| {
+        c.remember(&s.name);
+        c.set_open(&s.name, true);
+    });
     refresh_tabs(ui);
 }
 
@@ -1183,6 +1659,15 @@ fn remember_machine(ui: &Rc<App>, s: &Session) {
 /// The status keeps the error that ended the connection, if any, so it stays
 /// on screen while the reconnects run.
 fn schedule_reconnect(ui: Rc<App>, s: Rc<Session>, generation: u64, error: Option<&str>) {
+    // Only the machine at the other end can start a --stdio session again;
+    // a window left open would keep its screen.
+    if matches!(s.endpoint, Endpoint::Stdio(_)) {
+        match error {
+            Some(error) => fail_stdio(&ui, error),
+            None => ui.window.close(),
+        }
+        return;
+    }
     let n = s.retries.get() + 1;
     s.retries.set(n);
     if let Some(error) = error {
@@ -1200,6 +1685,154 @@ fn schedule_reconnect(ui: Rc<App>, s: Rc<Session>, generation: u64, error: Optio
     glib::timeout_add_local_once(Duration::from_millis(1500), move || {
         if s.generation.get() == generation {
             start_session(ui, s);
+        }
+    });
+}
+
+/// Get the login for a foreign session's machine, from the keyring or the
+/// user, then connect. `refused` says why the last one was turned down.
+fn ask_login(ui: Rc<App>, s: Rc<Session>, refused: Option<String>) {
+    let Endpoint::Foreign { target, .. } = &s.endpoint else {
+        return;
+    };
+    if s.asking.replace(true) {
+        return;
+    }
+    let target = target.clone();
+    let generation = s.generation.get();
+    set_status(&ui, &s, &format!("Logging in to {}…", s.name));
+    glib::spawn_future_local(async move {
+        let credentials =
+            foreign_ui::credentials(&ui.window, &s.name, &target, refused.as_deref()).await;
+        s.asking.set(false);
+        // Closed or restarted meanwhile.
+        let current = s.generation.get() == generation
+            && find_session(&ui, &s.name).is_some_and(|open| Rc::ptr_eq(&open, &s));
+        if !current {
+            return;
+        }
+        match credentials {
+            Some(login) => {
+                *s.credentials.borrow_mut() = Some(login.credentials);
+                s.remember_login.set(login.remember);
+                start_session(ui, s);
+            }
+            None => {
+                s.gave_up.set(true);
+                set_status(
+                    &ui,
+                    &s,
+                    &format!("Not logged in to {} — click the tab to try again", s.name),
+                );
+            }
+        }
+    });
+}
+
+/// After an ssh machine failed to let ssh in, look for RDP and RustDesk on
+/// it, once, and offer to use what answers.
+fn probe_foreign(ui: Rc<App>, s: Rc<Session>) {
+    let Endpoint::Ssh(target) = &s.endpoint else {
+        return;
+    };
+    if s.probed.replace(true) || s.connected.get() {
+        return;
+    }
+    // One that worked over ssh before is only down for now.
+    if Config::load(&ui.config_path)
+        .machines
+        .iter()
+        .any(|m| *m == s.name)
+    {
+        return;
+    }
+    let host = target.host.clone();
+    glib::spawn_future_local(async move {
+        let Some(kind) = foreign_ui::probe(&host).await else {
+            return;
+        };
+        tracing::info!(machine = %s.name, kind = kind.label(), "found instead of ssh");
+        // It connected meanwhile, or the tab was closed.
+        if s.connected.get() || find_session(&ui, &s.name).is_none_or(|o| !Rc::ptr_eq(&o, &s)) {
+            return;
+        }
+        if !foreign_ui::confirm_switch(&ui.window, &s.name, kind).await {
+            return;
+        }
+        let target = match gliff_foreign::Target::from_ssh_host(kind, &host) {
+            Ok(target) => target,
+            Err(why) => {
+                set_status(&ui, &s, &why);
+                return;
+            }
+        };
+        let new_name = target.to_string();
+        update_config(&ui, |c| c.rename(&s.name, &new_name));
+        stop_session(&ui, &s.name);
+        match find_session(&ui, &new_name) {
+            Some(open) => show_session(&ui, &open),
+            None => open_session(
+                &ui,
+                Endpoint::Foreign {
+                    name: new_name,
+                    target,
+                },
+            ),
+        }
+        // Closing the only tab opened the address bar; the machine has one
+        // again.
+        show_address_bar(&ui, false);
+    });
+}
+
+/// Offer to install gliff on a session's machine, then connect again. Only
+/// for the default server: a custom `--server-bin` is the user's own setup.
+fn offer_install(ui: Rc<App>, s: Rc<Session>, generation: u64) {
+    let Endpoint::Ssh(target) = &s.endpoint else {
+        return;
+    };
+    if target.server_bin != SshTarget::new("").server_bin {
+        return;
+    }
+    let (host, ssh_args) = (target.host.clone(), target.ssh_args.clone());
+    glib::spawn_future_local(async move {
+        if !remote_install::confirm(&ui.window, &host).await {
+            return;
+        }
+        // Closing the tab or reconnecting meanwhile makes this attempt stale.
+        let current = || {
+            s.generation.get() == generation
+                && find_session(&ui, &s.name).is_some_and(|open| Rc::ptr_eq(&open, &s))
+        };
+        if !current() {
+            return;
+        }
+        set_status(&ui, &s, &format!("Installing gliff on {host}…"));
+        s.installing.set(true);
+        let outcome = remote_install::install(&host, &ssh_args).await;
+        s.installing.set(false);
+        match outcome {
+            remote_install::Outcome::Ready(note) => {
+                tracing::info!(machine = %s.name, %note, "remote install");
+                if current() {
+                    s.last_error.borrow_mut().take();
+                    s.retries.set(0);
+                    s.gave_up.set(false);
+                    start_session(ui.clone(), s.clone());
+                }
+            }
+            remote_install::Outcome::Shadowed(why) => {
+                tracing::warn!(machine = %s.name, %why, "remote install hidden");
+                if current() {
+                    set_status(&ui, &s, &why);
+                }
+            }
+            remote_install::Outcome::Failed(why) => {
+                tracing::error!(machine = %s.name, error = %why, "remote install failed");
+                if current() {
+                    set_status(&ui, &s, &format!("Could not install gliff: {why}"));
+                }
+            }
         }
     });
 }
@@ -1246,6 +1879,13 @@ fn poll_frames(ui: Rc<App>, s: Rc<Session>, rx: Receiver<Picture>, generation: u
             }
         }
         if let Some(p) = latest {
+            if ui
+                .detached_display
+                .is_some_and(|index| p.rustdesk_display != Some(index))
+                || !s.rustdesk_displays.borrow().accepts(p.rustdesk_display)
+            {
+                return glib::ControlFlow::Continue;
+            }
             match frame_texture(p.frame) {
                 Ok(texture) => {
                     // Geometry follows the frame that really paints, so the
@@ -1259,6 +1899,12 @@ fn poll_frames(ui: Rc<App>, s: Rc<Session>, rx: Receiver<Picture>, generation: u
                             .set_frame(texture.clone(), device_scale(&ui), p.view);
                     }
                     *s.last_frame.borrow_mut() = Some((texture, p.view));
+                    if s.rustdesk_displays.borrow_mut().painted(p.rustdesk_display) {
+                        set_status(&ui, &s, "");
+                        if is_active(&ui, &s) {
+                            rustdesk_displays::refresh(&ui);
+                        }
+                    }
                 }
                 Err(e) => tracing::warn!(error = %e, "frame texture import failed"),
             }
@@ -1319,6 +1965,21 @@ fn poll_status(ui: Rc<App>, s: Rc<Session>, rx: Receiver<Status>, generation: u6
         }
         while let Ok(status) = rx.try_recv() {
             match status {
+                Status::RustDeskDisplays {
+                    displays,
+                    active,
+                    switch_failed,
+                } => {
+                    s.rustdesk_displays
+                        .borrow_mut()
+                        .update(displays, active, switch_failed);
+                    if switch_failed {
+                        set_status(&ui, &s, "RustDesk no longer offers that monitor");
+                    }
+                    if is_active(&ui, &s) {
+                        rustdesk_displays::refresh(&ui);
+                    }
+                }
                 // Pointer-mapping geometry (stream_size/view/scale) is not
                 // read from the config: it follows each decoded frame, so a
                 // new config never remaps clicks against the old picture.
@@ -1329,6 +1990,12 @@ fn poll_status(ui: Rc<App>, s: Rc<Session>, rx: Receiver<Status>, generation: u6
                     fps_cap,
                     headless,
                 } => {
+                    // A foreign machine took the login typed for it.
+                    if s.remember_login.replace(false) {
+                        if let Some(c) = s.credentials.borrow().as_ref() {
+                            foreign_ui::remember(&s.name, c);
+                        }
+                    }
                     s.server_view.set((view_width, view_height));
                     s.fps_cap.set(fps_cap);
                     s.headless.set(headless);
@@ -1339,7 +2006,9 @@ fn poll_status(ui: Rc<App>, s: Rc<Session>, rx: Receiver<Status>, generation: u6
                     if !s.connected.replace(true) {
                         refresh_tabs(&ui);
                     }
-                    set_status(&ui, &s, "");
+                    if !s.rustdesk_displays.borrow().switching() {
+                        set_status(&ui, &s, "");
+                    }
                     // Visible before the first per-second stats arrive.
                     set_stats(&ui, &s, &video);
                     remember_machine(&ui, &s);
@@ -1436,7 +2105,13 @@ fn poll_status(ui: Rc<App>, s: Rc<Session>, rx: Receiver<Status>, generation: u6
                 }
                 Status::Error(e) => {
                     tracing::error!(machine = %s.name, error = %e, "connection failed");
+                    // A machine that never connected may run RDP or
+                    // RustDesk instead; ssh's own reason does not reach here.
+                    let never_connected = !s.connected.get();
                     show_disconnected(&ui, &s);
+                    if never_connected {
+                        probe_foreign(ui.clone(), s.clone());
+                    }
                     schedule_reconnect(ui.clone(), s.clone(), generation, Some(&e));
                     return glib::ControlFlow::Break;
                 }
@@ -1446,7 +2121,31 @@ fn poll_status(ui: Rc<App>, s: Rc<Session>, rx: Receiver<Status>, generation: u6
                     set_status(&ui, &s, &message);
                     show_disconnected(&ui, &s);
                     s.gave_up.set(true);
+                    if matches!(s.endpoint, Endpoint::Stdio(_)) {
+                        fail_stdio(&ui, &message);
+                    }
                     return glib::ControlFlow::Break;
+                }
+                Status::ServerMissing => {
+                    let message = "gliff is not installed on this machine";
+                    *s.last_error.borrow_mut() = Some(message.into());
+                    tracing::error!(machine = %s.name, "gliff-server not found");
+                    set_status(&ui, &s, message);
+                    show_disconnected(&ui, &s);
+                    s.gave_up.set(true);
+                    offer_install(ui.clone(), s.clone(), generation);
+                    return glib::ControlFlow::Break;
+                }
+                Status::AuthFailed(why) => {
+                    tracing::warn!(machine = %s.name, %why, "login refused");
+                    show_disconnected(&ui, &s);
+                    s.credentials.borrow_mut().take();
+                    ask_login(ui.clone(), s.clone(), Some(why));
+                    return glib::ControlFlow::Break;
+                }
+                Status::NewCertificate(fingerprint) => {
+                    tracing::info!(machine = %s.name, %fingerprint, "keeping the RDP certificate");
+                    update_config(&ui, |c| c.certificates.insert(s.name.clone(), fingerprint));
                 }
                 Status::Closed => {
                     show_disconnected(&ui, &s);
@@ -1568,6 +2267,17 @@ fn send(ui: &App, msg: ClientMsg) {
 }
 
 fn send_to(s: &Session, msg: ClientMsg) {
+    if s.rustdesk_displays.borrow().blocks_input()
+        && matches!(
+            msg,
+            ClientMsg::PointerMotion { .. }
+                | ClientMsg::PointerAxis { .. }
+                | ClientMsg::PointerButton { pressed: true, .. }
+                | ClientMsg::Key { pressed: true, .. }
+        )
+    {
+        return;
+    }
     if let Some(tx) = s.input_tx.borrow().as_ref() {
         let _ = tx.send(clipboard::ToWorker::Send(msg));
     }
@@ -1934,6 +2644,19 @@ fn install_input_handlers(
             if pressed {
                 ui.released.set(false);
                 video.grab_focus();
+                // A new monitor may have painted under a stationary pointer.
+                // Send its actual click position before the button down.
+                if active(&ui).is_some_and(|s| s.rustdesk_displays.borrow().has_display()) {
+                    if let Some((x, y)) = event.position() {
+                        if let Some(point) = ui
+                            .window
+                            .compute_point(&video, &gtk::graphene::Point::new(x as f32, y as f32))
+                        {
+                            let (x, y) = to_remote(&ui, f64::from(point.x()), f64::from(point.y()));
+                            send(&ui, ClientMsg::PointerMotion { x, y });
+                        }
+                    }
+                }
             }
             send(&ui, ClientMsg::PointerButton { button, pressed });
             glib::Propagation::Proceed
@@ -2066,10 +2789,13 @@ fn install_fullscreen_bars(
             if fullscreen_btn.is_active() != full {
                 fullscreen_btn.set_active(full);
             }
-            if full {
+            // The notify can repeat a state, as when the window starts
+            // fullscreen: move the header only when it is not there yet.
+            let in_content = header.parent().as_ref() == Some(content.upcast_ref());
+            if full && in_content {
                 content.remove(&header);
                 top.set_child(Some(&header));
-            } else {
+            } else if !full && !in_content {
                 top.set_reveal_child(false);
                 top.set_child(None::<&gtk::Widget>);
                 content.prepend(&header);
@@ -2134,7 +2860,7 @@ fn install_fullscreen_bars(
 /// no settling delay: on the GPU tier the change costs only a reallocation
 /// of the display images and a redraw, and the CPU tier picks it up with
 /// its next frame.
-fn install_resize_handler(ui: &Rc<App>) {
+fn install_resize_handler(ui: &Rc<App>) -> glib::SourceId {
     // A Picture has no resize signal, so poll its allocation; the one-shot
     // timer sends only once the size has held for 200 ms.
     let ui = ui.clone();
@@ -2161,7 +2887,7 @@ fn install_resize_handler(ui: &Rc<App>) {
             });
         }
         glib::ControlFlow::Continue
-    });
+    })
 }
 
 /// Ask the decoder for the integer zoom the current window allows, when it
@@ -2240,6 +2966,14 @@ fn device_scale(ui: &App) -> f64 {
 mod tests {
     use super::*;
     use std::cell::RefCell;
+
+    #[test]
+    fn a_stdio_window_is_named_after_the_ssh_client() {
+        let connection = "192.168.1.31 51234 192.168.1.70 22";
+        assert_eq!(stdio_peer(Some(connection)), "192.168.1.31");
+        assert_eq!(stdio_peer(Some("")), "stdio");
+        assert_eq!(stdio_peer(None), "stdio");
+    }
 
     type Input = tokio::sync::mpsc::UnboundedReceiver<clipboard::ToWorker>;
 
