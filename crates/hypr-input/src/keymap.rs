@@ -140,6 +140,39 @@ impl KeyState {
         self.last_mods
     }
 
+    /// Lock `layout` and the modifiers named in `locked`; names this keymap
+    /// lacks are ignored, and a layout it lacks is the first. Returns the new
+    /// `(depressed, latched, locked, group)` when it changed.
+    pub fn set_locks(&mut self, layout: u32, locked: &[String]) -> Option<(u32, u32, u32, u32)> {
+        let layout = if layout < self.keymap.num_layouts() {
+            layout
+        } else {
+            0
+        };
+        let mut mask = 0;
+        for name in locked {
+            let index = self.keymap.mod_get_index(name);
+            if index != xkb::MOD_INVALID {
+                mask |= 1 << index;
+            }
+        }
+        self.state.update_mask(
+            self.state.serialize_mods(xkb::STATE_MODS_DEPRESSED),
+            self.state.serialize_mods(xkb::STATE_MODS_LATCHED),
+            mask,
+            self.state.serialize_layout(xkb::STATE_LAYOUT_DEPRESSED),
+            self.state.serialize_layout(xkb::STATE_LAYOUT_LATCHED),
+            layout,
+        );
+        let mods = self.mods();
+        if mods != self.last_mods {
+            self.last_mods = mods;
+            Some(mods)
+        } else {
+            None
+        }
+    }
+
     fn mods(&self) -> (u32, u32, u32, u32) {
         (
             self.state.serialize_mods(xkb::STATE_MODS_DEPRESSED),
@@ -168,6 +201,28 @@ mod tests {
         .unwrap();
         assert!(text.contains("xkb_keymap"));
         assert!(text.contains("xkb_symbols"));
+    }
+
+    #[test]
+    fn takes_locks_by_name() {
+        let text = keymap_from_names(&KeymapNames {
+            layout: "us,es".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        let mut ks = KeyState::from_text(&text).unwrap();
+        let lock = 1 << ks.keymap.mod_get_index(xkb::MOD_NAME_CAPS);
+        let (_, _, locked, group) = ks
+            .set_locks(1, &[xkb::MOD_NAME_CAPS.into(), "NoSuchMod".into()])
+            .unwrap();
+        assert_eq!((locked, group), (lock, 1));
+        assert_eq!(
+            ks.set_locks(1, &[xkb::MOD_NAME_CAPS.into()]),
+            None,
+            "no change"
+        );
+        // A layout the keymap lacks is the first; no names unlock.
+        assert_eq!(ks.set_locks(7, &[]).map(|m| (m.2, m.3)), Some((0, 0)));
     }
 
     #[test]

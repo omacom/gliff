@@ -22,7 +22,7 @@ use minicbor::{Decode, Encode};
 use std::io::IoSlice;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub use ssh::{spawn_ssh, SshTarget};
+pub use ssh::{spawn_ssh, SshStream, SshTarget};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
