@@ -90,6 +90,12 @@ pub enum InputCmd {
         stop: bool,
     },
     SetKeymap(String),
+    /// Lock the keymap's layout `layout` and exactly the modifiers named in
+    /// `locked`, leaving held ones as they are.
+    SetLocks {
+        layout: u32,
+        locked: Vec<String>,
+    },
     /// Extent of the output's logical space changed (resize).
     SetExtent {
         width: u32,

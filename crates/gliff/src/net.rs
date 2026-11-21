@@ -108,12 +108,23 @@ pub enum Status {
     /// The two ends speak different protocol versions, so retrying cannot
     /// help.
     Incompatible(String),
+    /// ssh worked but the remote has no `gliff-server`, so retrying cannot
+    /// help until gliff is installed there.
+    ServerMissing,
     Closed,
 }
 
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
 struct Incompatible(String);
+
+/// The remote shell could not find the server binary.
+#[derive(Debug, thiserror::Error)]
+#[error("gliff-server is not installed on the remote machine")]
+struct ServerMissing;
+
+/// The exit status a POSIX shell gives a command it cannot find.
+const COMMAND_NOT_FOUND: i32 = 127;
 
 /// A remote cursor image: `argb` holds `width` x `height` BGRA pixels.
 pub struct CursorShape {
@@ -291,6 +302,28 @@ impl Zoom {
 pub enum Endpoint {
     Tcp(String),
     Ssh(SshTarget),
+    /// The protocol on this process's stdin and stdout (`--stdio`), named
+    /// after the machine at the other end.
+    Stdio(String),
+}
+
+/// The protocol's half of stdout, kept by [`take_stdio`] until the one
+/// --stdio session takes it.
+static STDIO_OUT: Mutex<Option<std::os::fd::OwnedFd>> = Mutex::new(None);
+
+/// Keep stdout for the protocol and point fd 1 at stderr, so nothing that
+/// prints (GTK, a driver) can write into the stream.
+pub fn take_stdio() -> anyhow::Result<()> {
+    use std::io::IsTerminal;
+    use std::os::fd::AsFd;
+    anyhow::ensure!(
+        !std::io::stdin().is_terminal() && !std::io::stdout().is_terminal(),
+        "--stdio carries the protocol on stdin and stdout, which are a terminal"
+    );
+    let out = std::io::stdout().as_fd().try_clone_to_owned()?;
+    rustix::stdio::dup2_stdout(std::io::stderr().as_fd())?;
+    *STDIO_OUT.lock().unwrap() = Some(out);
+    Ok(())
 }
 
 /// A decoded frame for the GTK thread: a dmabuf from the GPU tier, or plain
@@ -343,11 +376,15 @@ impl Worker {
                     )
                     .await
                 }
-                Endpoint::Ssh(ref target) => {
-                    let ssh = spawn_ssh(target)?;
+                Endpoint::Stdio(_) => {
+                    let out = STDIO_OUT
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .context("the --stdio stream was already used")?;
                     session(
-                        ssh.stdout,
-                        ssh.stdin,
+                        tokio::io::stdin(),
+                        tokio::fs::File::from_std(std::fs::File::from(out)),
                         self.video,
                         self.frames,
                         self.status,
@@ -356,12 +393,44 @@ impl Worker {
                     )
                     .await
                 }
+                Endpoint::Ssh(ref target) => {
+                    let mut ssh = spawn_ssh(target)?;
+                    let result = session(
+                        ssh.stdout,
+                        ssh.stdin,
+                        self.video,
+                        self.frames,
+                        self.status,
+                        self.input,
+                        self.keymap,
+                    )
+                    .await;
+                    if result.is_err() {
+                        // ssh passes on the remote exit status; it has
+                        // usually exited by the time the stream ended.
+                        let exited = tokio::time::timeout(
+                            std::time::Duration::from_secs(1),
+                            ssh.child.wait(),
+                        )
+                        .await;
+                        if let Ok(Ok(status)) = exited {
+                            if status.code() == Some(COMMAND_NOT_FOUND) {
+                                return Err(ServerMissing.into());
+                            }
+                        }
+                    }
+                    result
+                }
             }
         });
         if let Err(e) = result {
-            let _ = status.send(match e.downcast::<Incompatible>() {
-                Ok(Incompatible(message)) => Status::Incompatible(message),
-                Err(e) => Status::Error(e.to_string()),
+            let _ = status.send(if e.is::<ServerMissing>() {
+                Status::ServerMissing
+            } else {
+                match e.downcast::<Incompatible>() {
+                    Ok(Incompatible(message)) => Status::Incompatible(message),
+                    Err(e) => Status::Error(e.to_string()),
+                }
             });
         } else {
             let _ = status.send(Status::Closed);
