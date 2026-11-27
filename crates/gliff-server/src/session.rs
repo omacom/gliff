@@ -2,7 +2,7 @@
 
 use std::ops::{ControlFlow, Deref, DerefMut};
 use std::os::fd::AsFd;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -1585,6 +1585,8 @@ struct SessionOutput {
     scale: f32,
     headless: Option<hypr_ipc::Instance>,
     awake: Option<KeepAwake>,
+    /// Keeps other sessions off a headless output's name until it is gone.
+    _claim: Option<std::fs::File>,
 }
 
 impl SessionOutput {
@@ -1686,14 +1688,15 @@ fn setup_output(
             scale: m.scale,
             headless: None,
             awake: None,
+            _claim: None,
         });
     }
-    let present = instance
+    let present: Vec<String> = instance
         .monitors()
         .map(|mons| mons.into_iter().map(|m| m.name).collect())
         .unwrap_or_default();
-    let (requested, created) = create_output(present, |name| instance.create_headless_output(name));
-    let (wait, timed_out) = match created {
+    let (requested, claim) = claim_output_name(&instance.dir, &present)?;
+    let (wait, timed_out) = match instance.create_headless_output(&requested) {
         Ok(()) => (Duration::from_secs(1), None),
         Err(e) if creation_may_complete(&e) => {
             tracing::warn!(error = %e, "headless request timed out; waiting for its named output");
@@ -1710,6 +1713,7 @@ fn setup_output(
         scale: 1.0,
         headless: Some(instance.clone()),
         awake: None,
+        _claim: Some(claim),
     };
     wait_for_output(&output.name, wait, || {
         instance
@@ -1751,35 +1755,30 @@ fn setup_output(
     Ok(output)
 }
 
-/// The lowest `gliff-N` no screen uses. A session started alone always gets
-/// the same name, so a monitor rule can name the output, and a desktop that
-/// remembers screens by name, such as Omarchy giving each one its own
-/// workspaces, sees the same screen come back rather than a new one each time.
-fn free_output_name(taken: &[String]) -> String {
-    (1..)
-        .map(|n| format!("gliff-{n}"))
-        .find(|name| !taken.contains(name))
-        .unwrap()
-}
-
-/// Create the output under a free name. Hyprland refuses a name another
-/// screen already has, which a session starting at the same moment may have
-/// just taken, so try the next one.
-fn create_output(
-    mut taken: Vec<String>,
-    mut create: impl FnMut(&str) -> hypr_ipc::Result<()>,
-) -> (String, hypr_ipc::Result<()>) {
-    loop {
-        let name = free_output_name(&taken);
-        match create(&name) {
-            Err(hypr_ipc::Error::Command { response, .. })
-                if response.contains("already") && taken.len() < 64 =>
-            {
-                taken.push(name)
-            }
-            result => return (name, result),
+/// The lowest `gliff-N` no screen uses and no other session holds. A session
+/// started alone always gets the same name, so a monitor rule can name the
+/// output, and a desktop that remembers screens by name, such as Omarchy
+/// giving each one its own workspaces, sees the same screen come back rather
+/// than a new one each time. The lock on `gliff-N.lock` in the instance's
+/// directory holds the name until the session ends, even one that crashes, so
+/// a session whose request times out can only ever find its own output.
+fn claim_output_name(dir: &Path, present: &[String]) -> Result<(String, std::fs::File)> {
+    for n in 1..=256 {
+        let name = format!("gliff-{n}");
+        if present.contains(&name) {
+            continue;
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(dir.join(format!("{name}.lock")))
+            .with_context(|| format!("claim headless output name {name}"))?;
+        if rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive).is_ok() {
+            return Ok((name, file));
         }
     }
+    anyhow::bail!("no free headless output name")
 }
 
 /// A timed-out request may still finish in the compositor. An explicit
@@ -1996,37 +1995,24 @@ mod tests {
     }
 
     #[test]
-    fn the_output_takes_the_lowest_free_name() {
-        assert_eq!(free_output_name(&[]), "gliff-1");
-        let taken = ["eDP-1".into(), "gliff-1".into(), "gliff-3".into()];
-        assert_eq!(free_output_name(&taken), "gliff-2");
-    }
-
-    #[test]
-    fn a_name_taken_meanwhile_moves_on_to_the_next() {
-        let mut asked = Vec::new();
-        let (name, result) = create_output(vec!["DP-1".into()], |name| {
-            asked.push(name.to_owned());
-            if name == "gliff-1" {
-                Err(hypr_ipc::Error::Command {
-                    command: "output create headless gliff-1".into(),
-                    response: "Name already taken".into(),
-                })
-            } else {
-                Ok(())
-            }
-        });
-        assert_eq!((name.as_str(), result.is_ok()), ("gliff-2", true));
-        assert_eq!(asked, ["gliff-1", "gliff-2"]);
-
-        let (name, result) = create_output(vec![], |_| {
-            Err(hypr_ipc::Error::Command {
-                command: "output create".into(),
-                response: "no backend replied to the request".into(),
-            })
-        });
-        assert_eq!(name, "gliff-1");
-        assert!(result.is_err());
+    fn each_session_claims_the_lowest_name_no_one_holds() {
+        let dir = std::env::temp_dir().join(format!("gliff-claim-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (first, held) = claim_output_name(&dir, &["eDP-1".into()]).unwrap();
+        assert_eq!(first, "gliff-1");
+        // Held by a session whose output is not up yet.
+        let (second, _second) = claim_output_name(&dir, &[]).unwrap();
+        assert_eq!(second, "gliff-2");
+        // Left behind by a session that crashed: in use, though no one holds it.
+        drop(held);
+        let (third, _third) = claim_output_name(&dir, &["gliff-1".into()]).unwrap();
+        assert_eq!(third, "gliff-3");
+        // Free again once both its output and its session are gone.
+        assert_eq!(claim_output_name(&dir, &[]).unwrap().0, "gliff-1");
+        for n in 1..=3 {
+            std::fs::remove_file(dir.join(format!("gliff-{n}.lock"))).unwrap();
+        }
+        std::fs::remove_dir(&dir).unwrap();
     }
 
     #[test]
