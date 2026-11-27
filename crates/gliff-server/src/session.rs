@@ -1688,8 +1688,12 @@ fn setup_output(
             awake: None,
         });
     }
-    let requested = format!("gliff-{}", std::process::id());
-    let (wait, timed_out) = match instance.create_headless_output(&requested) {
+    let present = instance
+        .monitors()
+        .map(|mons| mons.into_iter().map(|m| m.name).collect())
+        .unwrap_or_default();
+    let (requested, created) = create_output(present, |name| instance.create_headless_output(name));
+    let (wait, timed_out) = match created {
         Ok(()) => (Duration::from_secs(1), None),
         Err(e) if creation_may_complete(&e) => {
             tracing::warn!(error = %e, "headless request timed out; waiting for its named output");
@@ -1745,6 +1749,37 @@ fn setup_output(
     // An output added while the remote sleeps comes up switched off.
     output.awake = Some(KeepAwake::start(instance.clone(), output.name.clone())?);
     Ok(output)
+}
+
+/// The lowest `gliff-N` no screen uses. A session started alone always gets
+/// the same name, so a monitor rule can name the output, and a desktop that
+/// remembers screens by name, such as Omarchy giving each one its own
+/// workspaces, sees the same screen come back rather than a new one each time.
+fn free_output_name(taken: &[String]) -> String {
+    (1..)
+        .map(|n| format!("gliff-{n}"))
+        .find(|name| !taken.contains(name))
+        .unwrap()
+}
+
+/// Create the output under a free name. Hyprland refuses a name another
+/// screen already has, which a session starting at the same moment may have
+/// just taken, so try the next one.
+fn create_output(
+    mut taken: Vec<String>,
+    mut create: impl FnMut(&str) -> hypr_ipc::Result<()>,
+) -> (String, hypr_ipc::Result<()>) {
+    loop {
+        let name = free_output_name(&taken);
+        match create(&name) {
+            Err(hypr_ipc::Error::Command { response, .. })
+                if response.contains("already") && taken.len() < 64 =>
+            {
+                taken.push(name)
+            }
+            result => return (name, result),
+        }
+    }
 }
 
 /// A timed-out request may still finish in the compositor. An explicit
@@ -1958,6 +1993,40 @@ mod tests {
             command: "output create".into(),
             response: "refused".into()
         }));
+    }
+
+    #[test]
+    fn the_output_takes_the_lowest_free_name() {
+        assert_eq!(free_output_name(&[]), "gliff-1");
+        let taken = ["eDP-1".into(), "gliff-1".into(), "gliff-3".into()];
+        assert_eq!(free_output_name(&taken), "gliff-2");
+    }
+
+    #[test]
+    fn a_name_taken_meanwhile_moves_on_to_the_next() {
+        let mut asked = Vec::new();
+        let (name, result) = create_output(vec!["DP-1".into()], |name| {
+            asked.push(name.to_owned());
+            if name == "gliff-1" {
+                Err(hypr_ipc::Error::Command {
+                    command: "output create headless gliff-1".into(),
+                    response: "Name already taken".into(),
+                })
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!((name.as_str(), result.is_ok()), ("gliff-2", true));
+        assert_eq!(asked, ["gliff-1", "gliff-2"]);
+
+        let (name, result) = create_output(vec![], |_| {
+            Err(hypr_ipc::Error::Command {
+                command: "output create".into(),
+                response: "no backend replied to the request".into(),
+            })
+        });
+        assert_eq!(name, "gliff-1");
+        assert!(result.is_err());
     }
 
     #[test]
