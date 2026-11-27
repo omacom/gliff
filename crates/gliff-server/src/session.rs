@@ -2,7 +2,7 @@
 
 use std::ops::{ControlFlow, Deref, DerefMut};
 use std::os::fd::AsFd;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -1585,6 +1585,8 @@ struct SessionOutput {
     scale: f32,
     headless: Option<hypr_ipc::Instance>,
     awake: Option<KeepAwake>,
+    /// Keeps other sessions off a headless output's name until it is gone.
+    _claim: Option<std::fs::File>,
 }
 
 impl SessionOutput {
@@ -1686,9 +1688,14 @@ fn setup_output(
             scale: m.scale,
             headless: None,
             awake: None,
+            _claim: None,
         });
     }
-    let requested = format!("gliff-{}", std::process::id());
+    let present: Vec<String> = instance
+        .monitors()
+        .map(|mons| mons.into_iter().map(|m| m.name).collect())
+        .unwrap_or_default();
+    let (requested, claim) = claim_output_name(&instance.dir, &present)?;
     let (wait, timed_out) = match instance.create_headless_output(&requested) {
         Ok(()) => (Duration::from_secs(1), None),
         Err(e) if creation_may_complete(&e) => {
@@ -1706,6 +1713,7 @@ fn setup_output(
         scale: 1.0,
         headless: Some(instance.clone()),
         awake: None,
+        _claim: Some(claim),
     };
     wait_for_output(&output.name, wait, || {
         instance
@@ -1745,6 +1753,32 @@ fn setup_output(
     // An output added while the remote sleeps comes up switched off.
     output.awake = Some(KeepAwake::start(instance.clone(), output.name.clone())?);
     Ok(output)
+}
+
+/// The lowest `gliff-N` no screen uses and no other session holds. A session
+/// started alone always gets the same name, so a monitor rule can name the
+/// output, and a desktop that remembers screens by name, such as Omarchy
+/// giving each one its own workspaces, sees the same screen come back rather
+/// than a new one each time. The lock on `gliff-N.lock` in the instance's
+/// directory holds the name until the session ends, even one that crashes, so
+/// a session whose request times out can only ever find its own output.
+fn claim_output_name(dir: &Path, present: &[String]) -> Result<(String, std::fs::File)> {
+    for n in 1..=256 {
+        let name = format!("gliff-{n}");
+        if present.contains(&name) {
+            continue;
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(dir.join(format!("{name}.lock")))
+            .with_context(|| format!("claim headless output name {name}"))?;
+        if rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive).is_ok() {
+            return Ok((name, file));
+        }
+    }
+    anyhow::bail!("no free headless output name")
 }
 
 /// A timed-out request may still finish in the compositor. An explicit
@@ -1958,6 +1992,27 @@ mod tests {
             command: "output create".into(),
             response: "refused".into()
         }));
+    }
+
+    #[test]
+    fn each_session_claims_the_lowest_name_no_one_holds() {
+        let dir = std::env::temp_dir().join(format!("gliff-claim-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (first, held) = claim_output_name(&dir, &["eDP-1".into()]).unwrap();
+        assert_eq!(first, "gliff-1");
+        // Held by a session whose output is not up yet.
+        let (second, _second) = claim_output_name(&dir, &[]).unwrap();
+        assert_eq!(second, "gliff-2");
+        // Left behind by a session that crashed: in use, though no one holds it.
+        drop(held);
+        let (third, _third) = claim_output_name(&dir, &["gliff-1".into()]).unwrap();
+        assert_eq!(third, "gliff-3");
+        // Free again once both its output and its session are gone.
+        assert_eq!(claim_output_name(&dir, &[]).unwrap().0, "gliff-1");
+        for n in 1..=3 {
+            std::fs::remove_file(dir.join(format!("gliff-{n}.lock"))).unwrap();
+        }
+        std::fs::remove_dir(&dir).unwrap();
     }
 
     #[test]
